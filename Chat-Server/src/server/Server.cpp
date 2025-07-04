@@ -16,7 +16,7 @@ bool Server::start(quint16 port)
         qDebug() << "Listen" << port;
         return true;
     }
-    qDebug() << "Failed to listen" << port;
+    qDebug() << "Failed to listen" << port << tcpServer->errorString();
     return false;
 }
 
@@ -25,8 +25,8 @@ void Server::onNewConnection()
     QTcpSocket *clientSocket = tcpServer->nextPendingConnection();
     if (clientSocket)
     {
-        RequestHandler *handler = new RequestHandler(clientSocket, this);
-        connect(clientSocket, &QTcpSocket::disconnected, handler, &RequestHandler::deleteLater);
+        RequestHandler *handler = new RequestHandler(clientSocket->socketDescriptor(), this);
+        connect(handler, &RequestHandler::finished, handler, &RequestHandler::deleteLater);
         handler->start();
     }
 }

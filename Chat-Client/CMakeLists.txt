@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.18)
 
 project(Chat-Client VERSION 1.0 LANGUAGES CXX)
 
@@ -19,14 +19,6 @@ endif()
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
 find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Widgets Network REQUIRED)
 find_package(OpenSSL REQUIRED)
-
-# 包含目录
-target_include_directories(Chat-Client PRIVATE
-    src
-    src/views
-    src/core
-    src/ui
-)
 
 # 源文件列表
 set(SOURCES
@@ -56,6 +48,14 @@ set(CMAKE_AUTOUIC_SEARCH_PATHS src/ui)
 
 # 生成可执行文件
 add_executable(Chat-Client ${SOURCES} ${HEADERS} ${UIS})
+
+# 包含目录
+target_include_directories(Chat-Client PRIVATE
+    src
+    src/views
+    src/core
+    src/ui
+)
 
 # 链接 Qt 和 OpenSSL 库
 target_link_libraries(Chat-Client PUBLIC

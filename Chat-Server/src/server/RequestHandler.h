@@ -1,19 +1,27 @@
 #pragma once
 
-#include <QObject>
+#include <QThread>
 #include <QTcpSocket>
+#include <QJsonObject>
 
-class RequestHandler : public QObject
+class RequestHandler : public QThread
 {
     Q_OBJECT
 
 public:
-    explicit RequestHandler(QTcpSocket *socket, QObject *parent = nullptr);
-    void start();
+    explicit RequestHandler(qintptr socketDescriptor, QObject *parent = nullptr);
+    void run() override;
+
+signals:
+    void finished();
 
 private slots:
     void onReadyRead();
 
 private:
-    QTcpSocket *clientSocket;
+    void processRequest(const QJsonObject &request);
+
+private:
+    QTcpSocket *m_socket = nullptr;
+    qintptr m_socketDescriptor;
 };

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.18)
 
 project(Chat-Server VERSION 1.0 LANGUAGES CXX)
 
@@ -20,14 +20,6 @@ find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
 find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Core Network Sql REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# 包含目录
-target_include_directories(Chat-Server PRIVATE
-    src
-    src/server
-    src/database
-    src/encryption
-)
-
 # 源文件列表
 set(SOURCES
     src/main.cpp
@@ -47,6 +39,14 @@ set(HEADERS
 
 # 生成可执行文件
 add_executable(Chat-Server ${SOURCES} ${HEADERS})
+
+# 包含目录
+target_include_directories(Chat-Server PRIVATE
+    src
+    src/server
+    src/database
+    src/encryption
+)
 
 # 链接 Qt 和 OpenSSL 库
 target_link_libraries(Chat-Server PUBLIC

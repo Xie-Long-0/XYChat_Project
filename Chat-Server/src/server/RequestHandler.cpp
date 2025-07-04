@@ -4,42 +4,64 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
-RequestHandler::RequestHandler(QTcpSocket *socket, QObject *parent)
-    : QObject(parent)
-    , clientSocket(socket)
+RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
+    : QThread(parent)
+    , m_socketDescriptor(socketDescriptor)
 {
-    connect(clientSocket, &QTcpSocket::readyRead, this, &RequestHandler::onReadyRead);
 }
 
-void RequestHandler::start()
+void RequestHandler::run()
 {
-    // handle request
+    m_socket = new QTcpSocket(this);
+    if (!m_socket->setSocketDescriptor(m_socketDescriptor)) {
+        qDebug() << "Failed to set socket descriptor";
+        emit finished();
+        return;
+    }
+
+    connect(m_socket, &QTcpSocket::readyRead, this, &RequestHandler::onReadyRead);
+    exec();
 }
 
 void RequestHandler::onReadyRead()
 {
-    QByteArray requestData = clientSocket->readAll();
+    QByteArray requestData = m_socket->readAll();
     QJsonDocument jsonDoc = QJsonDocument::fromJson(requestData);
     QJsonObject json = jsonDoc.object();
+    processRequest(json);
+}
 
-    qDebug() << clientSocket->peerAddress().toString() << "request" << json["type"].toString();
+void RequestHandler::processRequest(const QJsonObject &json)
+{
+    QString type = json["type"].toString();
+    qDebug() << m_socket->peerAddress().toString() << "request" << type;
 
-    QString username = json["username"].toString();
-    QString encryptedPassword = json["password"].toString();
-
-    DatabaseManager dbManager;
-    if (dbManager.verifyUser(username, encryptedPassword))
+    QJsonObject response;
+    if (type == "login")
     {
-        QJsonObject response;
-        response["status"] = "success";
-        clientSocket->write(QJsonDocument(response).toJson());
-        qDebug() << username << "login successful";
+        QString username = json["username"].toString();
+        QString encryptedPassword = json["password"].toString();
+
+        DatabaseManager dbManager;
+        if (dbManager.verifyUser(username, encryptedPassword))
+        {
+            response["status"] = "success";
+            qDebug() << username << "login successful";
+        }
+        else
+        {
+            response["status"] = "failure";
+            response["message"] = "Invalid username or password";
+            qDebug() << username << "login failed";
+        }
     }
     else
     {
-        QJsonObject response;
         response["status"] = "failure";
-        clientSocket->write(QJsonDocument(response).toJson());
-        qDebug() << username << "login failed";
+        response["message"] = "Invalid request type";
+        qDebug() << "Invalid request type";
     }
+
+    m_socket->write(QJsonDocument(response).toJson());
+    m_socket->flush();
 }

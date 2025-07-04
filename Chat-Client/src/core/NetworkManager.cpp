@@ -7,6 +7,7 @@ NetworkManager::NetworkManager(QObject *parent) :
     tcpSocket(new QTcpSocket(this))
 {
     connect(tcpSocket, &QTcpSocket::readyRead, this, &NetworkManager::onReadyRead);
+    tcpSocket->connectToHost("127.0.0.1", 12345);
 }
 
 void NetworkManager::login(const QString &username, const QString &encryptedPassword)
@@ -16,7 +17,6 @@ void NetworkManager::login(const QString &username, const QString &encryptedPass
     json["username"] = username;
     json["password"] = encryptedPassword;
 
-    tcpSocket->connectToHost("127.0.0.1", 12345);
     if (tcpSocket->waitForConnected())
     {
         tcpSocket->write(QJsonDocument(json).toJson());
@@ -41,6 +41,10 @@ void NetworkManager::onReadyRead()
     }
     else
     {
-        emit loginFailed("Invalid username or password");
+        auto msg = response["message"].toString();
+        if (!msg.isEmpty())
+            emit loginFailed(msg);
+        else
+            emit loginFailed("Unknown error");
     }
 }
