@@ -13,9 +13,13 @@ set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} ${PROJECT_SOURCE_DIR}/3rdparty)
 add_library(XYChatCommon STATIC
     CommonModule/encryption/EncryptionManager.cpp
     CommonModule/encryption/EncryptionManager.h
+    CommonModule/protocol/Packet.h
+    CommonModule/protocol/PacketCodec.cpp
+    CommonModule/protocol/PacketCodec.h
 )
 
 target_include_directories(XYChatCommon PUBLIC
+    ${PROJECT_SOURCE_DIR}/CommonModule
     ${PROJECT_SOURCE_DIR}/CommonModule/encryption
 )
 

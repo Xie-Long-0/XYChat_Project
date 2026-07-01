@@ -3,6 +3,20 @@
 #include <QObject>
 #include <QTcpServer>
 
+class ConnectionServer : public QTcpServer
+{
+    Q_OBJECT
+
+public:
+    using QTcpServer::QTcpServer;
+
+signals:
+    void socketAccepted(qintptr socketDescriptor);
+
+protected:
+    void incomingConnection(qintptr socketDescriptor) override;
+};
+
 class Server : public QObject
 {
     Q_OBJECT
@@ -12,8 +26,8 @@ public:
     bool start(quint16 port);
 
 private slots:
-    void onNewConnection();
+    void onSocketAccepted(qintptr socketDescriptor);
 
 private:
-    QTcpServer *tcpServer;
+    ConnectionServer *tcpServer;
 };

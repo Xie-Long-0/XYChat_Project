@@ -15,7 +15,7 @@ private slots:
 void TestEncryptionManager::sha256DigestIsStable()
 {
     QCOMPARE(EncryptionManager::encryptPassword("passwd"),
-             QStringLiteral("0d0061a9553d6e34eac7b2af18a6c65b9e78dd953662c574dc3c6719ed598c9b"));
+             QStringLiteral("0d6be69b264717f2dd33652e212b173104b4a647b7c11ae72e9885f11cd312fb"));
 }
 
 void TestEncryptionManager::sha256DigestLengthIsHexEncoded()

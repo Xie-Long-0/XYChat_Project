@@ -1,12 +1,16 @@
 #include "Server.h"
 #include "RequestHandler.h"
-#include <QTcpSocket>
+
+void ConnectionServer::incomingConnection(qintptr socketDescriptor)
+{
+    emit socketAccepted(socketDescriptor);
+}
 
 Server::Server(QObject *parent)
     : QObject(parent)
-    , tcpServer(new QTcpServer(this))
+    , tcpServer(new ConnectionServer(this))
 {
-    connect(tcpServer, &QTcpServer::newConnection, this, &Server::onNewConnection);
+    connect(tcpServer, &ConnectionServer::socketAccepted, this, &Server::onSocketAccepted);
 }
 
 bool Server::start(quint16 port)
@@ -20,13 +24,9 @@ bool Server::start(quint16 port)
     return false;
 }
 
-void Server::onNewConnection()
+void Server::onSocketAccepted(qintptr socketDescriptor)
 {
-    QTcpSocket *clientSocket = tcpServer->nextPendingConnection();
-    if (clientSocket)
-    {
-        RequestHandler *handler = new RequestHandler(clientSocket->socketDescriptor(), this);
-        connect(handler, &RequestHandler::finished, handler, &RequestHandler::deleteLater);
-        handler->start();
-    }
+    RequestHandler *handler = new RequestHandler(socketDescriptor, this);
+    connect(handler, &RequestHandler::finished, handler, &RequestHandler::deleteLater);
+    handler->start();
 }

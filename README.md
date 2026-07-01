@@ -77,6 +77,7 @@ ctest --test-dir build --output-on-failure
 ## 开发约定
 
 - C++ 标准统一为 C++20。
+- 文件编码统一为 UTF-8，换行符统一为 CRLF。
 - CMake 目标按客户端、服务端、公共模块、测试分层组织。
 - 新协议或安全行为变更需要同步更新 `docs/PROTOCOL.md`、`docs/SECURITY.md` 与 `docs/ROADMAP.md`。
 - 不要提交构建目录、SQLite 数据库、临时日志、IDE 用户文件或本地 CMake preset。
