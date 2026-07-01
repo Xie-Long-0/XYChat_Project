@@ -69,25 +69,27 @@ common/
 
 ## M0：工程基线与可维护性（1-2 周）
 
+**当前状态（2026-07-01）：已完成工程基线补强，可进入 M1 协议层重构。**
+
 ### 目标
 
 让项目能被稳定构建、运行、调试和测试，为后续重构提供安全网。
 
 ### 任务
 
-- 修复 README 编码，补充构建方式、运行方式、依赖版本、目录说明。
-- 明确 Qt 版本、OpenSSL 版本、CMake 版本和目标平台。
-- 增加 `docs/` 目录，放置架构图、协议文档、安全文档和迭代计划。
-- 增加 `.gitignore`，排除构建目录、数据库文件、临时日志、IDE 文件。
-- 建立基础 CI：至少运行 CMake configure/build。
-- 引入单元测试框架，例如 Qt Test 或 GoogleTest。
-- 统一代码风格：命名、错误处理、日志、头文件包含顺序。
+- [x] 修复 README 编码，补充构建方式、运行方式、依赖版本、目录说明。
+- [x] 明确 Qt 版本、OpenSSL 版本、CMake 版本和目标平台。
+- [x] 增加 `docs/` 目录，放置架构、协议、安全文档和迭代计划。
+- [x] 增加 `.gitignore`，排除构建目录、数据库文件、临时日志、IDE 文件。
+- [x] 建立基础 CI：GitHub Actions 执行 CMake configure/build/test。
+- [x] 引入 Qt Test 单元测试框架，并覆盖公共密码摘要模块。
+- [x] 统一 CMake 工程基线：顶层公共模块、C++20、编译警告选项、测试开关。
 
 ### 验收标准
 
-- 新开发者按 README 可在本机启动服务端和客户端。
-- CI 能完成一次干净构建。
-- 有最少一组客户端/服务端基础单元测试。
+- [x] 新开发者按 README 可在本机配置、构建并启动服务端和客户端。
+- [x] CI 能完成一次干净 configure/build/test 流程。
+- [x] 有最少一组基础单元测试（`TestEncryptionManager`）。
 
 ## M1：网络协议层重构（2-4 周）
 
@@ -367,8 +369,8 @@ XLChat_Project/
 
 如果只看接下来 4-6 周，建议按以下顺序执行：
 
-1. 修 README、`.gitignore`、构建说明和基础 CI。
-2. 新增 `docs/PROTOCOL.md`，定义长度前缀帧协议和统一错误码。
+1. ~~修 README、`.gitignore`、构建说明和基础 CI。~~（M0 已完成）
+2. 完善 `docs/PROTOCOL.md` 中的长度前缀帧协议、统一错误码和兼容策略。
 3. 实现 `PacketCodec`，替换 Client/Server 直接 JSON 读写。
 4. 重构登录接口，加入 `requestId` 和标准响应结构。
 5. 增加注册接口和安全密码存储。
@@ -411,9 +413,9 @@ XLChat_Project/
 
 ### Sprint 1：工程与协议基础
 
-- [ ] 修复 README 并补充环境说明。
-- [ ] 增加 `.gitignore`。
-- [ ] 编写 `docs/PROTOCOL.md`。
+- [x] 修复 README 并补充环境说明。
+- [x] 增加 `.gitignore`。
+- [x] 编写 `docs/PROTOCOL.md`。
 - [ ] 增加 `Packet`/`PacketCodec`。
 - [ ] 改造登录请求为帧协议。
 - [ ] 增加协议解析单元测试。

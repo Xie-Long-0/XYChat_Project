@@ -4,7 +4,7 @@
 #include <QSqlError>
 #include <QVariant>
 #include <QDebug>
-#include "../CommonModule/encryption/EncryptionManager.h"
+#include "EncryptionManager.h"
 
 DatabaseManager::DatabaseManager()
 {

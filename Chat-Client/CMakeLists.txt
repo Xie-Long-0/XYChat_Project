@@ -13,7 +13,7 @@ set(CMAKE_AUTOUIC ON)
 if (MSVC)
     add_compile_options(/W3 /utf-8)
 else()
-    add_compile_options(-Wall -utf-8)
+    add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 find_package(Qt6 COMPONENTS Widgets Network REQUIRED)
@@ -25,7 +25,6 @@ set(SOURCES
     views/LoginWindow.cpp
     views/MainWindow.cpp
     core/NetworkManager.cpp
-    ../CommonModule/encryption/EncryptionManager.cpp
 )
 
 # 头文件列表
@@ -33,7 +32,6 @@ set(HEADERS
     views/LoginWindow.h
     views/MainWindow.h
     core/NetworkManager.h
-    ../CommonModule/encryption/EncryptionManager.h
 )
 
 # UI 文件列表
@@ -55,20 +53,18 @@ target_include_directories(Chat-Client PRIVATE
     views/
     core/
     ui/
-    ../CommonModule/encryption/
 )
 
 # 链接 Qt 和 OpenSSL 库
 target_link_libraries(Chat-Client PUBLIC
     Qt6::Widgets
     Qt6::Network
-    OpenSSL::Crypto
     OpenSSL::SSL
+    XYChatCommon
 )
 
 # 添加Widgets, Network 模块的头文件路径
 target_include_directories(Chat-Client SYSTEM PUBLIC
     ${Qt6Widgets_INCLUDE_DIRS}
     ${Qt6Network_INCLUDE_DIRS}
-    ${OpenSSL_INCLUDE_DIR}
 )

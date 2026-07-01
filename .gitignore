@@ -366,3 +366,21 @@ out/
 build/
 CMakePresets.json
 CMakeUserPresets.json
+
+# XYChat runtime artifacts
+resources/db/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# CMake generated directories and local presets
+cmake-build-*/
+Testing/
+install/
+
+# IDE/editor local state
+.idea/
+.vscode/*.user
