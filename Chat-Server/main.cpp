@@ -1,5 +1,5 @@
 #include <QCoreApplication>
-#include "server/Server.h"
+#include "core/Server.h"
 
 int main(int argc, char *argv[])
 {

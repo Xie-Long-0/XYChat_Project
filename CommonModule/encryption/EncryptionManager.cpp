@@ -1,5 +1,4 @@
 #include "EncryptionManager.h"
-#include <openssl/evp.h>
 #include <openssl/sha.h>
 
 QString EncryptionManager::encryptPassword(const QString &password)

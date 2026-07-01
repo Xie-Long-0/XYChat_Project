@@ -4,7 +4,7 @@
 #include <QSqlError>
 #include <QVariant>
 #include <QDebug>
-#include "encryption/EncryptionManager.h"
+#include "../CommonModule/encryption/EncryptionManager.h"
 
 DatabaseManager::DatabaseManager()
 {
@@ -30,7 +30,7 @@ bool DatabaseManager::openDatabase()
     }
     query.prepare("INSERT INTO users (username, password) VALUES (:username, :passwd)");
     query.bindValue(":username", "admin");
-    query.bindValue(":passwd", EncryptionManager::hashPassword("passwd"));
+    query.bindValue(":passwd", EncryptionManager::encryptPassword("passwd"));
     query.exec();
     return true;
 }

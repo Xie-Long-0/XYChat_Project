@@ -3,7 +3,7 @@
 #include "MainWindow.h"
 #include <QMessageBox>
 #include "core/NetworkManager.h"
-#include "core/EncryptionManager.h"
+#include "../CommonModule/encryption/EncryptionManager.h"
 
 LoginWindow::LoginWindow(QWidget *parent) :
     QMainWindow(parent)

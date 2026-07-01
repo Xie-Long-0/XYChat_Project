@@ -1,6 +1,5 @@
 #include "RequestHandler.h"
 #include "database/DatabaseManager.h"
-#include "encryption/EncryptionManager.h"
 #include <QJsonDocument>
 #include <QJsonObject>
 

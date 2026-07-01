@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.21)
 
 project(Chat-Server VERSION 1.0 LANGUAGES CXX)
 
@@ -16,25 +16,24 @@ else()
     add_compile_options(-Wall -utf-8)
 endif()
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
-find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Core Network Sql REQUIRED)
+find_package(Qt6 COMPONENTS Core Network Sql REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 # 源文件列表
 set(SOURCES
-    src/main.cpp
-    src/server/Server.cpp
-    src/server/RequestHandler.cpp
-    src/database/DatabaseManager.cpp
-    src/encryption/EncryptionManager.cpp
+    main.cpp
+    core/Server.cpp
+    core/RequestHandler.cpp
+    database/DatabaseManager.cpp
+    ../CommonModule/encryption/EncryptionManager.cpp
 )
 
 # 头文件列表
 set(HEADERS
-    src/server/Server.h
-    src/server/RequestHandler.h
-    src/database/DatabaseManager.h
-    src/encryption/EncryptionManager.h
+    core/Server.h
+    core/RequestHandler.h
+    database/DatabaseManager.h
+    ../CommonModule/encryption/EncryptionManager.h
 )
 
 # 生成可执行文件
@@ -42,25 +41,24 @@ add_executable(Chat-Server ${SOURCES} ${HEADERS})
 
 # 包含目录
 target_include_directories(Chat-Server PRIVATE
-    src
-    src/server
-    src/database
-    src/encryption
+    core/
+    database/
+    ../CommonModule/encryption/
 )
 
 # 链接 Qt 和 OpenSSL 库
 target_link_libraries(Chat-Server PUBLIC
-    Qt${QT_VERSION_MAJOR}::Core
-    Qt${QT_VERSION_MAJOR}::Network
-    Qt${QT_VERSION_MAJOR}::Sql
+    Qt6::Core
+    Qt6::Network
+    Qt6::Sql
     OpenSSL::SSL
     OpenSSL::Crypto
 )
 
 # 添加Widgets, Network 模块的头文件路径
 target_include_directories(Chat-Server SYSTEM PUBLIC
-    ${Qt${QT_VERSION_MAJOR}Widgets_INCLUDE_DIRS}
-    ${Qt${QT_VERSION_MAJOR}Network_INCLUDE_DIRS}
-    ${Qt${QT_VERSION_MAJOR}Sql_INCLUDE_DIRS}
+    ${Qt6Widgets_INCLUDE_DIRS}
+    ${Qt6Network_INCLUDE_DIRS}
+    ${Qt6Sql_INCLUDE_DIRS}
     ${OpenSSL_INCLUDE_DIR}
 )
