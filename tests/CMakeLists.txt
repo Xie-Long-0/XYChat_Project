@@ -1,5 +1,7 @@
 find_package(Qt6 COMPONENTS Test REQUIRED)
 
+set(CMAKE_AUTOMOC ON)
+
 add_executable(TestEncryptionManager
     unit/TestEncryptionManager.cpp
 )
