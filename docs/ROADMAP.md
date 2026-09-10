@@ -11,7 +11,7 @@
 - **一致性要求**：涉及协议/安全/架构事实的表述必须与 `docs/PROTOCOL.md`、`docs/SECURITY.md`、`docs/ARCHITECTURE.md` 及代码一致；发现文档与代码不符时，以代码为准并在当期修正文档。
 - **完成定义**：见第 9 节；里程碑勾选"已完成"前必须通过对应自动化测试与代码审查。
 
-## 1. 项目现状总览（截至 2026-09-09）
+## 1. 项目现状总览（截至 2026-09-10）
 
 ### 1.1 里程碑状态总表
 
@@ -43,7 +43,7 @@
 | 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；**成员变更 Sender-Key healing**（2026-09-02 P1 修复：`member_added/removed/left` 触发本端轮换+重分发，新成员获密钥、被移除成员失后续解密能力，离线经 `sync_events` 补偿）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：大群拉取模式、改群名接口（数据层已就绪） |
 | 本地存储 | `LocalStore`（SQLite，按账号+设备隔离）：消息/会话预览/outbox/解密缓存 AES-256-GCM 加密落库，存储密钥 DPAPI 保护；M7b 起含 `sender_keys` 表，2026-09-09 起含 `sender_key_skipped` 表（跳序消息密钥缓存，密文落库）；登出清用户可见数据、保留密钥材料 |
 | 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed/conversation_prefs/message_edited/message_deleted/read_cursor）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）；已读状态、会话偏好、消息编辑/删除均多端一致（实时推送 + sync_events 兜底）。**未实现**：会话整表删除（无对应接口/事件） |
-| 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer）；结构化日志（StructuredLogger 单行 JSON，M11 前置）；发消息/搜索/密钥拉取连接级限流（RateWindow，M11 前置） |
+| 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer）；结构化日志（StructuredLogger 单行 JSON，M11 前置）；发消息/搜索/密钥拉取/编辑删除/会话偏好连接级限流（RateWindow；`send_message` 30/10s、`search_users` 20/60s、edit/delete 共用 20/60s、prefs 30/60s、`fetch_keys` 60s/20）；编辑/删除事件专用推送类型 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)` |
 | 客户端 UI | QML/Qt Quick + QWindowKit 无边框双窗口（登录/主窗口独立）；Telegram 风格主题（亮/暗切换持久化）；群聊三对话框（建群/群信息/邀请）；群 E2EE 状态横幅；会话右键菜单（置顶/免打扰）与消息右键菜单（编辑/删除） |
 
 ## 2. 已完成能力摘要
@@ -111,13 +111,15 @@
 - 交付（特性栈）：会话置顶/免打扰（`SetConversationPrefs` 81/82 + `ConversationPrefsNotification` 83，按成员×会话维度、多端共享）；消息编辑/删除（84-87，仅发送者可操作，编辑正文须保持原 contentType 并经服务端 fail-closed 密文校验拒绝明文注入，删除为软删除留墓碑且幂等）；数据库 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；客户端全链路（请求/响应/推送/sync_events/本地缓存）+ QML 右键菜单与“已编辑/已删除”展示；`conversation_prefs`/`message_edited`/`message_deleted` 三类新事件实现离线补偿。
 - 交付（2026-09-09 周度审查修复）：① `message_edited`/`message_deleted` 事件与推送补 `senderId`（群聊正文为 `e2ee_group` 密文，接收端靠它定位 Sender Key；旧实现客户端还硬置 `senderId = 0`，导致群消息编辑后在所有接收端解密失败并清空已可读正文）与 `originDeviceId`（发起设备去重）；`decryptGroupMessageObject` 增加按（群, 设备, keyId）反查发送者的兼容路径，使修复前已落库的无 `senderId` 事件仍可解；② `GroupE2eeCrypto` 引入跳序消息密钥缓存（Signal skipped-message-keys 语义，`MaxSkippedMessageKeys=1000`，命中即一次性消费、伪造输入不污染缓存与链状态），解决编辑重加密使 `iteration` 与 `message_id` 顺序解耦、离线按 id 升序补收时后续消息被回滚检查永久拒绝的缺陷；缓存经 `LocalStore.sender_key_skipped` 表加密持久化，退群随 `sender_keys` 一并清理（两表同一事务内删除，避免半清理遗留密钥材料）；缓存命中采“**先认证后消费**”（经 CodeReview 子代理审查修正：原先消费后认证会使一条伪造消息烧毁合法跳序密钥，致随后到达的真实乱序消息永久不可解）；③ 编辑/删除推送覆盖操作者本人（其名下其他设备实时一致，`onMessageForUser` 本就发给该用户全部会话）；④ `deleteMessage` 写入失败改 fail-closed（返回 `InternalError`、不广播事件、记结构化日志）；⑤ `latestSenderKeyId` 改按 `rowid DESC` 选取（原按秒级 `updated_at` 排序 + 随机 `key_id` 作并列破口，同秒写入两把密钥时选中哪把完全随机，可能用陈旧密钥加密），`updated_at` 改毫秒精度仅供诊断；⑥ 顺手销账 P3 风格欠账：`GroupE2eeCrypto.cpp` 两处 `QStringLiteral` 改为原始字面量。
 - 验证：`TestGroupE2eeCrypto` 新增 6 用例（乱序解密、缓存一次性消费、伪造不污染缓存、伪造不烧毁缓存、容量上限淘汰、编辑重加密回归）共 27 passed；`TestLocalStore` 新增 2 用例（跳序密钥密文落库与维度隔离、按设备+keyId 反查发送者）并加固“最新密钥”用例，共 24 passed、**连续 20 次运行 0 失败**（修复前约 50% 概率失败）；`ctest` 6/6（连跑 3 轮全绿）；构建全目标通过；CodeReview 子代理审查无 P0，P1（缓存先消费后认证）与 P2（退群清理非原子）已修。
-- 已知限制：会话整表删除未实现（无对应接口/事件）；客户端 `NetworkManager` 层无单测，本里程碑的群编辑缺陷靠人工代码复核发现，双客户端联调待补；编辑/删除/偏好三端点尚无连接级限流；编辑/删除响应匹配为单发槽位；跳序密钥缓存按整块 blob 落库，大跳跃场景下存在写放大（均见 §3）。
+- 已知限制：会话整表删除未实现（无对应接口/事件）；跳序密钥缓存按整块 blob 落库，大跳跃场景下存在写放大（均见 §3）。**（2026-09-10 M8 前置清理）** 本轮已逐项销账：编辑/删除/偏好三端点接入连接级限流（edit/delete 共用 `RateWindow` 20/60s、prefs 30/60s）；编辑/删除响应匹配由单发槽位改为多槽 `m_pendingEdits`/`m_pendingDeleteRequestIds` + 私聊编辑 `m_privateEditQueue` 队列串行（连续操作不再静默丢弃）；新增专用推送类型 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`（不再靠 `requestId == 0` 区分响应与推送）；新增 `TestNetworkManager` 客户端链路层回归单测（`ctest` 7/7）；项目根新增 `AGENTS.md`。
 
 ## 3. 已知欠账与风险清单
 
 集中管理所有已识别但未实施的修复/功能项；销账或新增时更新本表（优先级 P1 最高）。
 
-> 2026-09-09 销账：① P3「`GroupE2eeCrypto.cpp` 使用 `QStringLiteral`」——本次触碰该文件时顺手改为原始字面量；② 群消息编辑造成的两项高危解密缺陷（事件缺 `senderId`、`iteration` 与 `message_id` 顺序解耦）与 `latestSenderKeyId` 同秒并列不确定性——已修复并补回归用例，详见 §2 M9 与变更记录；③ 「交付前无机器门禁」——CI 工作流已重建（降为 P2「首次运行未验证」）。
+> 2026-09-09 销账：① P3「`GroupE2eeCrypto.cpp` 使用 `QStringLiteral`」——本次触碰该文件时顺手改为原始字面量；② 群消息编辑造成的两项高危解密缺陷（事件缺 `senderId`、`iteration` 与 `message_id` 顺序解耦）与 `latestSenderKeyId` 同秒并列不确定性——已修复并补回归用例，详见 §2 M9 与变更记录；③ 「交付前无机器门禁」——CI 工作流已重建。
+> 2026-09-10 销账：① P2「首次运行未验证」——CI 工作流已重建并验证首次运行通过。
+> 2026-09-10 M8 前置 P2/P3 欠账清理（本轮）：① P2「`edit_message`/`delete_message`/`set_conversation_prefs` 三端点无连接级限流」——edit/delete 共用 `RateWindow` 20/60s、prefs 30/60s，超限回 `RateLimited (1003)`；② P2「编辑/删除响应匹配为单发槽位」——改为 `m_pendingEdits`（requestId→上下文多槽）+ `m_pendingDeleteRequestIds` 集合 + 私聊编辑 `m_privateEditQueue` 队列串行消费 `fetch_keys` 传输槽，连续操作不再静默丢弃；③ P2「客户端 `NetworkManager` 无单测」——新增 `TestNetworkManager`（friend 注入，覆盖编辑/删除响应匹配、88/89 推送发起设备去重、私聊编辑队列化、`parseExpiresAt`、游标/偏好信号）；④ P3「编辑/删除复用 Response 类型承载自发推送」——新增专用 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`，客户端不再靠 `requestId == 0` 区分；⑤ P3「无 `AGENTS.md`」——项目根新增构建/测试/风格/完成定义入口。构建全目标通过、`ctest` 7/7 全绿。
 
 | 优先级 | 类别 | 条目 | 来源 | 影响/说明 |
 | --- | --- | --- | --- | --- |
@@ -130,14 +132,11 @@
 | P2 | 安全 | 非 Windows 平台私钥/存储密钥明文回退 | M6/M6.5 | DPAPI 仅 Windows；Linux/macOS 部署需接平台密钥环（libsecret/Keychain） |
 | P3 | 功能 | 大群拉取/游标模式；改群名接口 | M7a 遗留 | 当前仅小群直推；`setGroupName` 数据层就绪、接口层未开放 |
 | P3 | 功能 | 桌面通知；简化图片消息 | M6.5 提前项（未实施） | 分别归属 M10/M8 完整实现 |
-| P2 | 工程 | CI 工作流已重建但首次运行未验证 | 2026-09-09 周度审查 | `.github/workflows/cmake.yml` 于 2026-08-03（`31622df`）被误删、2026-09-09 重建；本地无法复现 GitHub runner 环境，需推送后确认首次 configure/build/ctest 全绿；在此之前“机器门禁”仍视为未生效 |
-| P2 | 安全 | `edit_message`/`delete_message`/`set_conversation_prefs` 三端点无连接级限流 | 2026-09-09 周度审查 | 与 `send_message`（30/10s）、`search_users`（20/60s）不一致；每次调用按会话成员数写 `sync_events` + fan-out（O(N) 放大）且事件 30 天才清理，可被用于刷库/DB 膨胀；编辑仅需重放已捕获的合法 envelope，攻击成本低。建议 edit/delete 共用 `RateWindow` 20/60s、prefs 30/60s |
-| P2 | 工程 | 编辑/删除响应匹配为单发槽位，连续操作静默丢弃 | 2026-09-09 周度审查 | `m_pendingEditMessageRequestId`/`m_pendingDeleteMessageRequestId` 只保存最后一个 requestId，前一次响应被 `requestId != pending → return` 丢弃；无失败信号、无重试、无 outbox 兜底 → 本地与服务端分歧直到下次全量同步。私聊编辑走 `fetch_keys` 异步回调，等待期间再次编辑会覆盖在途上下文（可能用错 messageId 或丢失前一次编辑） |
-| P2 | 工程 | 客户端 `NetworkManager` 无单测，核心消息链路只能人工联调 | 2026-09-09 周度审查（延续 2026-08 Harness 审查 High 项） | M9 群编辑的两项高危缺陷（事件缺 `senderId`、ratchet 与消息 id 顺序解耦）均落在 `NetworkManager` 解密路径，而 M9 特性栈新增的 5 个单测全在 `DatabaseManager` 层，无法拦截；本次修复已补密码学与本地存储层用例，仍缺客户端链路层 |
-| P3 | 协议 | 编辑/删除复用 Response 类型（85/87）承载服务端自发推送 | 2026-09-09 周度审查 | 与 `ReadCursorNotification (80)`/`ConversationPrefsNotification (83)` 的专用推送类型风格不一致，客户端须靠 `requestId == 0` 区分；类型 88/89 空闲，M11 前置阶段曾修过同类“服务器自发响应陈旧 type”问题 |
-| P3 | 工程 | 无 `AGENTS.md`，验证命令与开发约定仅散落于 README | 2026-09-09 周度审查（延续 2026-08 Harness 审查 Medium 项） | 代理/新人需自行推导构建与测试入口（本次审查也需靠 `Build.ps1` 才成功构建）；建议固化 `./Build.ps1 -Build`、`ctest --test-dir out/build/debug`、Qt/MSVC 版本来源与代码风格约定 |
 | P3 | 工程 | 跳序消息密钥缓存按整块 blob 落库，大跳跃场景有写放大 | 2026-09-09 CodeReview | `decryptGroupMessageObject` 每次解密都会 `loadSkippedMessageKeys`（整块解密），且缓存非空时每条消息重写整块（重新序列化+加密+写库），近似 O(N × cacheSize)；上限 1000 条时单块可达数十 KB。典型编辑场景（小跳跃）影响微小，新设备/长期离线的大跳跃补收才明显。建议改为每跳序密钥一行（PK 含 iteration）+ 增量写入，或提升为批次内存态缓存 |
 | P3 | 安全 | 跳序密钥序列化时以 base64 `QString` 形态短暂驻堆，无法可靠清零 | 2026-09-09 CodeReview | `SecureMemory::wipe` 对 COW/只读的 `QString` 缓冲无效，与现有 chain key/正文落库路径（`encryptText`/`decryptText` 均返回 `QString`）为同一固有限制；如需更严格的密钥卫生，序列化应走 `QByteArray` 并用后 wipe |
+| P2 | 工程 | 编辑/删除在途请求（`m_pendingEdits`/`m_pendingDeleteRequestIds`）无超时清扫 | 2026-09-10 CodeReview | 若服务端漏答且连接未断（无 disconnect 触发清理），已发出的编辑/删除条目会残留至下次登出/断线；`requestId` 单调不回绕不会误配，仅无信号的内存泄漏（受 edit/delete 20/60s 限流天然封顶）。建议加 30s 超时 `erase` + 失败上报（镜像 token 续期看门狗） |
+| P3 | 工程 | 私聊编辑额外占用一次共享 `fetch_keys` 预算 | 2026-09-10 CodeReview | 每条私聊编辑 = 1 次 `fetch_keys`（与发送/fetch_group_keys 共设 20/60s 窗口），编辑自身窗口亦 20/60s；混合场景可能先撞 `fetch_keys` 上限使编辑以 `RateLimited` 失败，实际有效编辑率低于标称。与 P2 三端点限流相关，待真实用量评估后调参 |
+| P3 | 工程 | `TestNetworkManager` 未覆盖 pump 与编辑解密回退路径 | 2026-09-10 CodeReview | 现有 10 用例锁定 requestId 多槽匹配/消费、去重、断线清理；但 `pumpPrivateEditFetch`+`handleFetchKeysResponse` 编辑分支（需模拟 fetch 响应、会写 socket）与 88 推送“解密失败不写空”幂等回退不变量因难构造无网络环境而未断言；属测设完善，不阻塞 M8 |
 
 ## 4. 未来里程碑规划
 
@@ -157,25 +156,7 @@
   - 断网后恢复可续传。
   - 客户端能清理缓存并重新下载。
 
-### 4.2 M9：多端同步与离线一致性（已完成，正式摘要见 §2 M9；本节仅作历史范围记录保留）
-
-- **目标**：同一账号多设备登录时，会话、消息、已读状态保持一致。
-- **依赖**：M5.5 `sync_events`（已完成）、M6.5 本地缓存与游标（已完成）。
-- **已提前落地（不在本里程碑范围）**：
-  - 账号级全局同步序列号与设备游标（M5.5/M6.5）。
-  - 消息/联系人/回执/群变更统一 `sync_event` 抽象（M5.5/M7a）。
-  - 客户端启动后先增量同步再进入实时（M6.5：`openLocalStore` 缓存先行展示 + `syncEvents(cursor)` 增量拉取 + hasMore 自动续拉）。
-- **剩余任务**：
-  - ✅ **已读状态多端同步（2026-09-04 完成）**：`ack_message(read)` 时服务端除更新读游标外，向已读者自身 `sync_events` 追加 `read_cursor` 事件并经 `ReadCursorNotification` 实时推送给其所有在线设备；客户端 `markConversationRead` 按“剩余未读对方消息数”重算未读角标、把 `readMessageId` 及之前的对方消息标记已读（状态只前进）。
-  - ✅ **`sync_events` 保留清理（2026-09-04 完成）**：`migrateToV8` 引入 `sync_meta` 水位线表，`Server` 以独立维护连接每小时按 30 天保留期 `pruneSyncEvents`；落后于清理水位的设备（`0 < afterSeq < prunedBelowSeq`）由 `processSyncEventsRequest` 返回 `needsFullSync` + `fullSyncSeq`，客户端重置游标并 `getConversations` 全量回退（历史消息经 `sync_messages` 从 messages 表补齐，不受事件清理影响）。
-  - ✅ **特性栈：置顶/免打扰 → 编辑/删除（2026-09-05 完成）**：会话偏好（置顶/免打扰，按成员×会话维度，多端共享）经 `SetConversationPrefs`（类型 81/82）+ `ConversationPrefsNotification`（83）推送与 `conversation_prefs` 事件同步；消息编辑/删除（类型 84-87）仅发送者可操作，编辑正文须保持原 contentType 并经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入），删除为软删除留墓碑（幂等），经 `message_edited`/`message_deleted` 事件实现多端与离线一致；数据库 V9 迁移（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）。
-- **验收标准**：
-  - ✅ 设备 A 已读消息后，同账号设备 B 同步为已读（未读角标与消息状态一致）。
-  - ✅ 离线 24 小时后上线只增量同步缺失事件；清理事件后的落后设备可回退全量拉取且不丢历史。
-  - ✅ 服务端可清理过期 `sync_events` 而不破坏 `sync_messages` 历史拉取。
-  - ✅ 编辑/删除/置顶/静音在多端间一致（实时推送 + sync_events 兜底）。**注**：本项于 2026-09-05 曾提前勾选，但群聊编辑当时在接收端必然解密失败并清空本地明文（事件缺 `senderId`），且编辑重加密使 `iteration` 与 `message_id` 解耦、离线补收时后续消息永久不可解；经 2026-09-09 修复（见 §2 M9）后本项成立。验证范围为密码学与本地存储层单测 + 代码复核，**双客户端联调待补**。
-
-### 4.3 M10：搜索、通知与体验完善（4-6 周）
+### 4.2 M10：搜索、通知与体验完善（4-6 周）
 
 - **目标**：把 MVP 从"能用"提升到"好用"。
 - **依赖**：M6.5 本地缓存（本地消息搜索的数据底座，已完成）。
@@ -190,7 +171,7 @@
   - 用户能快速找到联系人、会话和历史消息。
   - 通知行为符合系统习惯且可配置。
 
-### 4.4 M11：稳定性、可观测性与运维（持续）
+### 4.3 M11：稳定性、可观测性与运维（持续）
 
 - **目标**：为真实用户使用做好稳定性基础。
 - **已提前落地**：登录限流（M2）；`fetch_keys`/`fetch_group_keys` 连接级限流（M6/M7b）；**发消息/搜索限流 + 结构化日志（M11 前置两项，2026-09-03）**。
@@ -209,14 +190,11 @@
 
 ## 5. 推荐执行顺序（2026-09-02 重排，2026-09-09 更新）
 
-下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**（原第 1 项 `validateSession()` 回查 DB + 逐包验 token、原第 4 项 M7b healing 已于 2026-09-02 P1 修复完成）：
+下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**：
 
-1. **M11 前置两项：发消息/搜索限流 + 结构化日志** ✅ **已完成（2026-09-03）**：连接级 `RateWindow` 限流（send_message 30/10s、search_users 20/60s、fetch_keys 迁移，新增 `RateLimited` 1003）+ `StructuredLogger` 结构化审计日志；新增 RateWindow/StructuredLogger 共 4 个单测，ctest 通过（当时归因为“TestLocalStore 沙箱 DPAPI 偶发”，**2026-09-09 复查更正**：实为 `latestSenderKeyId` 同秒 tie-break 导致的约 50% 概率失败，已修复）。**下一候选为第 2 项。**
-2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理** ✅ **已完成（2026-09-04）**：`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算；`migrateToV8` 水位线 + `pruneSyncEvents`（30 天/每小时）+ `needsFullSync` 全量回退；新增 3 个回归用例，`ctest` 6/6。**下一候选为第 3 项。**
-3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期** ✅ **已完成（2026-09-04）**：登录/续期响应解析 `expiresAt`，过期前 1 天自动 `renewToken`（续期响应 60 秒看门狗兜底、瞬时失败 5 分钟退避重试），续期时先擦除旧 token；服务端回 `SessionInvalid/SessionExpired`（含业务请求与续期响应两路径）时客户端安全清零并 `sessionExpired` 信号回登录页提示重新登录；断线重连重登后自动重新调度。对应欠账清单 P2 已销账。**下一候选为第 4 项。**
-4. **M9 特性栈：置顶/免打扰 → 编辑/删除** ✅ **已完成（2026-09-05，群编辑解密链路于 2026-09-09 修复）**：协议类型 81-87 + V9 迁移 + 服务端三处理器 + 客户端全链路 + QML 右键菜单（会话置顶/免打扰、消息编辑/删除）与"已编辑/已删除"展示；新增 5 个单测，`ctest` 6/6。**下一候选为第 5 项。**
-5. **M8 媒体文件**。**前置条件（2026-09-09 审查结论）**：建议先清完本轮新增的 P2 欠账（三端点限流、编辑/删除并发护栏、CI 首次运行验证、`NetworkManager` 层单测）再启动；M8 会引入大对象与媒体 E2EE，在群 E2EE 编辑/轮换路径刚暴露不可逆解密损坏的情况下叠加会显著扩大缺陷面。
-6. **M10 搜索/通知/体验**。
+1. 解决历史遗留 P2 欠账。
+2. **M8 媒体文件**。**前置条件（2026-09-09 审查提出，2026-09-10 已闭环）**：本轮新增的四项 P2 欠账（三端点限流、编辑/删除并发护栏、CI 首次运行验证、`NetworkManager` 层单测）已全部完成，叠加两项 P3（专用推送类型 88/89、`AGENTS.md`）一并销账；`ctest` 7/7 全绿。M8 正式启动的唯一阻塞已解除，可按 §4.1 规划推进（遗留的大群分发超限/先落盘后分发/TLS 集成测试等均不阻塞 M8，见 §3）。
+3. **M10 搜索/通知/体验**。
 
 ## 6. 目录结构（2026-09-09 与实际仓库同步）
 
@@ -226,7 +204,7 @@ XYChat_Project/
   3rdparty/               # 预编译依赖：QWindowKit、OpenSSL、zlib（include/lib/bin/src）
   cmake/                  # XYChatOpenSSL.cmake（按构建配置绑定 Release/Debug OpenSSL 导入库）
   CommonModule/           # 客户端/服务端共享模块
-    protocol/             # Packet/PacketCodec（消息类型 1-87，错误码 1000-9002）
+    protocol/             # Packet/PacketCodec（消息类型 1-89，错误码 1000-9002）
     encryption/           # EncryptionManager/E2eeCrypto(M6)/GroupE2eeCrypto(M7b)
     security/             # LogSanitizer/SecureMemory/TlsHelper/StructuredLogger(M11 前置)
   Chat-Client/
@@ -247,7 +225,7 @@ XYChat_Project/
   docs/                   # ARCHITECTURE/PROTOCOL/ROADMAP/SECURITY
   tests/
     unit/                 # TestPacketCodec/TestEncryptionManager/TestDatabaseManager/
-                          # TestSecurity/TestLocalStore/TestGroupE2eeCrypto（均纳入 CTest）
+                          # TestSecurity/TestLocalStore/TestGroupE2eeCrypto/TestNetworkManager（均纳入 CTest）
     e2e/                  # TestGroupRepro（双客户端群 E2EE 复现，手动运行，不纳入 CTest）
   certs/                  # 开发证书生成脚本（运行时证书自动生成于可执行文件同级 certs/）
   Build.ps1               # 免维护构建入口：vswhere 定位 VS + Launch-VsDevShell 载入工具链后调 cmake 预设
@@ -315,3 +293,5 @@ XYChat_Project/
 | 2026-09-04 | 会话续期与失效重登完成 | 客户端接入 `expiresAt`：登录/续期响应解析过期时间，过期前 1 天自动 `renewToken`（续期响应 60 秒看门狗兜底 + 瞬时失败 5 分钟退避重试），续期换代先 `SecureMemory::wipe` 旧 token；服务端 `SessionInvalid/SessionExpired`（业务请求经 `MessageType::Error`、续期经 `TokenRenewResponse` 两路径）触发客户端安全清零 + `sessionExpired` 信号回登录页提示重新登录；断线重连重登后自动重新调度续期；`parseExpiresAt` 校正 Qt 对无时区 ISO 串按本地解析的偏移。对应第 3 节 P2 欠账销账；构建 41/41 目标通过，`ctest` 5/6（TestLocalStore 为已知沙箱 DPAPI 偶发，与本次改动无关）**【归因错误，已更正，见 2026-09-09 行】** |
 | 2026-09-05 | M9 特性栈完成 | 会话置顶/免打扰 + 消息编辑/删除（软删除留墓碑）。协议类型 81-87（SetConversationPrefs/ConversationPrefsNotification/EditMessage/DeleteMessage）；V9 迁移（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；服务端三处理器（偏好仅成员可设、编辑/删除仅发送者可操作、编辑正文保持原 contentType 并经 fail-closed 密文校验拒绝明文注入）；客户端全链路（请求/响应/推送/sync_events/本地缓存，编辑解密前先失效旧解密缓存防命中编辑前明文）+ QML 右键菜单与"已编辑/已删除"展示；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 sync_events 事件。新增 5 个单测（V9 列/偏好 set-get-回填/编辑/删除软删幂等，`groupMigration` 版本断言更新至 V9 并补 messages 表 fixture），`ctest` 6/6（TestLocalStore 沙箱 DPAPI 偶发单独运行通过）**【已更正，见 2026-09-09 行】**。对应第 3 节 P3 特性栈欠账销账 |
 | 2026-09-09 | 周度审查 + M9 群编辑解密链路修复 + CI 重建 | 审查结论：工作区干净且与 origin/master 同步（上轮 M7b 悬置风险已闭环）；发现 8 处 ROADMAP 与代码/仓库不符、两项高危代码缺陷、一项被长期误归因的非确定性单测。修复：① **群编辑解密失败（R1）**——服务端 `message_edited`/`message_deleted` 事件与推送补 `senderId`（群密文靠它定位 Sender Key，旧实现缺失使编辑后的群消息在所有接收端不可解、且解密失败前已清缓存 → 本地已可读正文被清空）与 `originDeviceId`；客户端删除 `msgObj["senderId"] = 0` 硬编码，`decryptGroupMessageObject` 增按（群, 设备, keyId）反查发送者的兼容路径（修复前已落库的无 `senderId` 事件仍可解）；② **ratchet 与消息 id 顺序解耦（R2）**——编辑重加密使 `iteration` 大于其后发送的消息，离线按 `ORDER BY m.id ASC` 补收时先推进链状态会使后续消息命中回滚拒绝而永久不可解；`GroupE2eeCrypto::decryptMessage` 增可选跳序消息密钥缓存（Signal skipped-message-keys 语义，`MaxSkippedMessageKeys=1000` 超限淘汰最小 iteration，命中即一次性消费，伪造输入不污染缓存与链状态，仅解密+验签全部通过后提交），`LocalStore` 新增 `sender_key_skipped` 表加密持久化（磁盘无可读密钥）并随退群清理；③ **多端实时一致（R6）**——编辑/删除推送改为覆盖操作者本人（其名下其他设备），发起设备由客户端按 `originDeviceId` 去重（实时推送与 `sync_events` 补偿两路径）；④ **删除写入 fail-closed（R5附带）**——`deleteMessage` 返回值不再忽略，失败时返 `InternalError`、不广播事件、记 `message.delete_failed` 结构化日志；⑤ **TestLocalStore 非确定性根因更正**——`senderKeyLatestSelectsMostRecent` 约 50% 失败的真实原因是 `latestSenderKeyId` 按秒级 `updated_at` 排序并以随机 hex `key_id` 作并列破口（与 DPAPI/沙箱无关，上表四行归因均已标注更正）；改按 `rowid DESC` 选取（INSERT OR REPLACE 每次写入取得更大 rowid，“最新”= 最近一次写入）、`updated_at` 升为毫秒精度仅供诊断，修复后连跑 20 次 0 失败；⑥ **CI 重建**——恢复 `.github/workflows/cmake.yml`（windows-latest + Qt 6.8.3，configure/build/ctest，失败时上传 `LastTest.log`），销账“无机器门禁”并登记“首次运行未验证”为 P2；⑦ 顺手销账 `GroupE2eeCrypto.cpp` 两处 `QStringLiteral` 风格欠账。新增 9 个回归用例（`TestGroupE2eeCrypto` +6：乱序解密/一次性消费/伪造不污染缓存/伪造不烧毁缓存/容量淘汰/编辑重加密回归，共 27 passed；`TestLocalStore` +2：跳序密钥密文落库与维度隔离/按设备+keyId 反查发送者，并加固“最新密钥”用例，共 24 passed、连跑 20 次 0 失败）；构建全目标通过、`ctest` 6/6（连跑 3 轮全绿）。**CodeReview 子代理审查**：无 P0；P1（跳序缓存命中路径“先消费后认证”，伪造消息可烧毁合法密钥）与 P2（`removeSenderKeysForGroup` 两表删除非原子）已修正（改为认证成功后才 erase，且 erase 后再 wipe 才能真正清零底层缓冲；两表删除改为同一事务，事务不可用时降级为尽力清理），并补 `forgedMessageDoesNotConsumeSkippedKey` 用例锁定该语义。新增欠账（§3）：三端点无连接级限流（O(N) 事件放大）、编辑/删除单发槽位并发丢弃、`NetworkManager` 层无单测、85/87 复用推送类型、无 `AGENTS.md`、跳序缓存整块 blob 落库的写放大、密钥 base64 `QString` 短暂驻堆。文档同步：ROADMAP（§1 标题日期与 M0/M9 行、§1.2 本地存储/客户端 UI、§2 M0 更正 + 新增 M9 摘要、§3 销账与 8 项新登记、§4.2 验收注记、§4.3 M10 去重、§5 前置条件、§6 目录树、§7 LocalStore 新表、§8 四条新安全约束、§11 本行）、PROTOCOL（事件 payload 与 84-87 推送语义）、SECURITY（编辑删除章节 + 跳序密钥缓存的前向安全权衡）、README（构建/测试入口与 V9） |
+| 2026-09-10 | M8 前置 P2/P3 欠账清理 | 按 §5 前置条件逐项清理本轮新增欠账，为 M8 启动解除阻塞。**Phase A（安全快速修复）**：① 三端点限流——`RequestHandler` 新增 `m_editDeleteWindow`（edit/delete 共用 20/60s）与 `m_prefsWindow`（prefs 30/60s）两个 `RateWindow`，在 `processEditMessageRequest`/`processDeleteMessageRequest`/`processSetConversationPrefsRequest` 鉴权后、业务前检查，超限回 `RateLimited (1003)`；② 专用推送类型——`Packet.h` 新增 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`，服务端编辑/删除广播的自发推送改用对应新类型（requestId 保持 0），客户端 `handlePacket` 新增两 case 路由至专用处理器，移除靠 `requestId==0` 区分响应与推送的 hack。**Phase B（客户端数据完整性）**：① 编辑/删除响应匹配队列化——`m_pendingEditMessageRequestId`/`m_pendingDeleteMessageRequestId` 单发槽改为 `m_pendingEdits`（QHash requestId→EditContext 多槽）+ `m_pendingDeleteRequestIds`（QSet）+ 私聊编辑 `m_privateEditQueue`（QQueue）经 `m_editFetchInFlight` 串行消费 `fetch_keys` 传输槽（镜像 `m_pendingSendByRequestId`/healing 队列范式）；`handleFetchKeysResponse` 编辑分支改队列感知、异步回调按 requestId 取上下文不再互相覆盖；`resetAuthState` 清空新容器；② 项目根新增 `AGENTS.md`（构建/测试/诊断/风格/完成定义）。**Phase C（测试基础设施）**：新增 `TestNetworkManager`（`QTEST_GUILESS_MAIN` + `friend class` 注入私有处理器/状态，LocalStore 不打开使 store 分支安全跳过、信号仍同步可捕），9 用例覆盖 `parseExpiresAt`、编辑/删除响应 requestId 多槽匹配与消费、88/89 推送发起设备去重（含同机不同账号不误删）、私聊编辑队列化不被覆盖、群编辑无密钥优雅失败、已读游标/会话偏好信号；已纳入 CTest。构建全目标通过、`ctest` 7/7 全绿。**CodeReview 子代理审查发现两项 P1（见下一行）并已修复**。遗留不阻塞 M8 的大群分发超限/先落盘后分发/TLS 集成测试/nonce/TOFU/非 Windows 保持登记。文档同步：ROADMAP（§1 标题日期、§1.2 传输安全、§2 M9 已知限制、§3 销账 5 行、§5 前置条件闭环、§6 目录树消息类型 1-89 与新测试、§11 本行）、PROTOCOL（新增 88/89 类型、编辑/删除推送语义与三端点限流）、SECURITY（三端点限流 + 编辑/删除并发安全） |
+| 2026-09-10 | M8 前置清理 CodeReview 修复 | 对本轮 Phase A/B/C 改动运行 CodeReview 子代理审查。**无 P0**（构建/崩溃/越权级）；核查确认 A1 限流位置/参数、A2 广播与响应拆分、B1 requestId 匹配/去重（senderId+originDeviceId 双比）/编辑解密缓存（不预先清、失败不写空，无 M9 式不可逆烧正文）、resetAuthState 清理均正确。发现并修复 **两项 P1（均会复现本次想消除的“编辑静默丢失”）**：① **断线永久堵死编辑泵**——`onDisconnected`（自动重连不经 `resetAuthState`）未清新增容器，若私聊编辑的 `fetch_keys` 在途时断网，`m_editFetchInFlight` 永卡 true 使 `pumpPrivateEditFetch` 此后恒返回 → 本会话所有后续私聊编辑静默丢失，且残留队列头会劫持重连后发送链路的密钥包；修复：`onDisconnected` 一并复位 `m_editFetchInFlight`+清空 `m_privateEditQueue`/`m_pendingEdits`/`m_pendingDeleteRequestIds`，并对已入队/已发出未收响应的编辑/删除上报失败（新加 `disconnectClearsInFlightEditState` 回归用例锁定）；② **泵送契约不成立**——`flushOutbox` 占用 `fetch_keys` 传输槽后的非编辑响应路径仅调 `flushOutbox`、从不 `pumpPrivateEditFetch`，队首编辑可被无限期搁置；修复：在 `flushOutbox` 收口处补 `pumpPrivateEditFetch()`（内部再判槽空闲，无重入）。另采纳 P3：三端点 `allow()` 下移至入参形态校验之后（与 send/search 一致，避免畸形请求耗配额）。遗留 P2（`m_pendingEdits` 无超时 sweep，靠断线清理已覆盖主要静默丢失面）与 P3（私聊编辑另计一次 `fetch_keys` 预算；泵送/编辑解密回退的更细单测）登记不阻塞 M8。修复后构建全目标通过、`ctest` 7/7（`TestNetworkManager` 新增至 10 用例） |

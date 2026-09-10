@@ -117,6 +117,37 @@ add_test(NAME TestGroupE2eeCrypto COMMAND TestGroupE2eeCrypto)
 
 xychat_copy_runtime_dlls(TestGroupE2eeCrypto)
 
+# ── TestNetworkManager (M9 欠账修复：客户端链路层编辑/删除回归单测) ──
+add_executable(TestNetworkManager
+    unit/TestNetworkManager.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/KeyStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/KeyStorage.h
+)
+
+target_include_directories(TestNetworkManager PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core
+)
+
+target_link_libraries(TestNetworkManager PRIVATE
+    Qt6::Test
+    Qt6::Sql
+    Qt6::Network
+    XYChatCommon
+)
+
+# NetworkManager/KeyStorage 依赖 DPAPI 保护本地密钥
+if (WIN32)
+    target_link_libraries(TestNetworkManager PRIVATE crypt32)
+endif()
+
+add_test(NAME TestNetworkManager COMMAND TestNetworkManager)
+
+xychat_copy_runtime_dlls(TestNetworkManager)
+
 # ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
 add_executable(TestGroupRepro
     "e2e/TestGroupRepro.cpp"

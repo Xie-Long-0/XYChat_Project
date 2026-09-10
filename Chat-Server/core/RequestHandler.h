@@ -140,6 +140,10 @@ private:
     // M11 前置: 发消息与搜索限流（连接级固定窗口，防刷消息/用户名枚举）
     XYChat::Server::RateWindow m_sendWindow;
     XYChat::Server::RateWindow m_searchWindow;
+    // M9 欠账修复: 编辑/删除共用窗口与偏好设置窗口（每次调用按成员数写 sync_events
+    // + fan-out，O(N) 放大且事件 30 天才清理，需与 send/search 一致限流防刷库）
+    XYChat::Server::RateWindow m_editDeleteWindow;
+    XYChat::Server::RateWindow m_prefsWindow;
 
     // M11 前置: 结构化日志的每请求上下文（起始计时/请求类型/请求 ID）
     QElapsedTimer m_requestTimer;
@@ -168,6 +172,12 @@ private:
     // M11 前置：用户搜索限流（连接级固定窗口，抑制用户名枚举/刷库）
     static constexpr int MaxSearchesPerWindow = 20; // 窗口内搜索上限
     static constexpr int SearchWindowSeconds = 60;  // 窗口长度（秒）
+    // M9 欠账修复：编辑/删除共用限流（连接级固定窗口，抑制刷库/O(N) 事件放大）
+    static constexpr int MaxEditDeletePerWindow = 20; // 窗口内编辑+删除总上限
+    static constexpr int EditDeleteWindowSeconds = 60; // 窗口长度（秒）
+    // M9 欠账修复：会话偏好设置限流（置顶/免打扰高频切换无意义，放宽上限）
+    static constexpr int MaxPrefsPerWindow = 30;      // 窗口内偏好设置上限
+    static constexpr int PrefsWindowSeconds = 60;     // 窗口长度（秒）
 
     // M7a: 群消息明文长度上限（单条 UTF-8 字符数；M7b E2EE / M8 媒体另行调整）
     static constexpr int MaxGroupMessageLength = 16384;

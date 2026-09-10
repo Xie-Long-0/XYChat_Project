@@ -9,6 +9,7 @@
 #include <QVariant>
 #include <QHash>
 #include <QSet>
+#include <QQueue>
 
 #include "protocol/PacketCodec.h"
 #include "encryption/E2eeCrypto.h"
@@ -137,6 +138,9 @@ private slots:
     void sendHeartbeat();
 
 private:
+    // M9 欠账修复：为客户端链路层单测开放私有处理器/状态（tests/unit/TestNetworkManager）
+    friend class TestNetworkManager;
+
     void connectToServer();
     void initTls();
     void sendLoginRequest();
@@ -179,11 +183,16 @@ private:
     void handleConversationPrefsNotification(const XYChat::Protocol::Packet &packet);
     void handleEditMessageResponse(const XYChat::Protocol::Packet &packet);
     void handleDeleteMessageResponse(const XYChat::Protocol::Packet &packet);
+    // M9 欠账修复：编辑/删除事件专用推送（88/89），与响应路径分离，不再靠 requestId==0 区分
+    void handleMessageEditedNotification(const XYChat::Protocol::Packet &packet);
+    void handleMessageDeletedNotification(const XYChat::Protocol::Packet &packet);
     // M9 特性栈：会话偏好本地应用（响应/推送/事件共用）
     void applyConversationPrefs(qint64 conversationId, bool pinned, bool muted);
-    void sendEditMessageRequest(qint64 messageId, qint64 conversationId,
-                                const QString &content, const QString &contentType);
-    void clearPendingEdit();
+    quint64 sendEditMessageRequest(qint64 messageId, qint64 conversationId,
+                                   const QString &content, const QString &contentType,
+                                   const QString &plaintext);
+    // M9 欠账修复：泵送等待 fetch_keys 的私聊编辑队列（fetch 单槽串行）
+    void pumpPrivateEditFetch();
     // M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）
     static QString systemMessageSummary(const QString &content);
     void sendPacket(const XYChat::Protocol::Packet &packet);
@@ -292,12 +301,23 @@ private:
 
     // M9 特性栈：会话偏好与消息编辑/删除
     quint64 m_pendingSetPrefsRequestId = 0;
-    quint64 m_pendingEditMessageRequestId = 0;
-    qint64 m_pendingEditMessageId = 0;      // 在途编辑目标消息（响应匹配与本地更新用）
-    qint64 m_pendingEditConversationId = 0;
-    qint64 m_pendingEditPeerUserId = 0;     // 私聊编辑的目标用户（群聊为 0）
-    QString m_pendingEditContent;           // 待编辑的新明文（加密前的）
-    quint64 m_pendingDeleteMessageRequestId = 0;
+    // M9 欠账修复：编辑/删除响应匹配改为多槽（镜像 m_pendingSendByRequestId），
+    // 连续操作不再静默丢弃；私聊编辑经队列串行消费 fetch_keys 传输槽
+    struct EditContext {
+        qint64 messageId = 0;
+        qint64 conversationId = 0;
+        QString plaintext;   // 编辑后明文（本端乐观回填）
+    };
+    struct PrivateEditWait {
+        qint64 messageId = 0;
+        qint64 conversationId = 0;
+        qint64 peerUserId = 0;
+        QString plaintext;
+    };
+    QHash<quint64, EditContext> m_pendingEdits;   // 已发编辑请求：requestId → 上下文
+    QQueue<PrivateEditWait> m_privateEditQueue;    // 等待 fetch_keys 的私聊编辑
+    bool m_editFetchInFlight = false;              // 是否为编辑占用了 fetch_keys 传输槽
+    QSet<quint64> m_pendingDeleteRequestIds;       // 已发删除请求的 requestId 集合
 
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem

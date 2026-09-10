@@ -51,6 +51,7 @@
 - **事件寻址字段完整性（2026-09-09 修复的高危缺陷）**：群聊正文为 `e2ee_group` 密文，接收端必须凭（群, 发送者 userId, 发送者 deviceId, keyId）四元组定位 Sender Key；旧实现的 `message_edited` 事件与推送 payload **不带 `senderId`**（客户端甚至硬置 `senderId = 0`），而 `LocalStore::loadSenderKey` 对 `senderUserId <= 0` 直接 fail-closed → 群消息一旦被编辑，**所有接收端解密失败**；更严重的是解密失败前已执行 `m_decryptCache.remove` + `clearDecryptedContent`，随后以空正文回写 → 接收端**原本可读的正文被清成“无法解密”**。修复：服务端事件/推送补 `senderId`；客户端去除硬编码，并在 `senderId` 缺失时按（群, 设备, keyId）反查发送者（兼容修复前已落库的旧事件；keyId 为签名公钥指纹，全局唯一，同机双用户共用 deviceId 也不会误匹配）。**教训**：新增会改动已有密文的事件时，必须先确认 payload 携带解密所需的全部寻址字段。
 - **解密缓存一致性（客户端）**：编辑/删除事件与响应处理时，先失效该 messageId 的旧解密缓存（内存 `m_decryptCache` + LocalStore `clearDecryptedContent`）再解密新密文或标记删除，避免编辑后仍显示编辑前明文；本端编辑以乐观明文落库并覆盖解密缓存。
 - **多端与离线一致性**：`conversation_prefs`/`message_edited`/`message_deleted` 事件经 `sync_events` 与实时推送双通道投递，离线设备上线经 `ingestSyncEvents` 补偿；编辑正文仍为密文传输，服务端不接触明文。**推送覆盖操作者本人（2026-09-09）**：旧实现在服务端按 `memberId != 操作者` 排除整个用户，使操作者名下其他设备得不到实时推送（仅能等下次增量同步），与已读游标/会话偏好的推送策略不一致；现改为推送给全体成员，由客户端按 `originDeviceId` 去重（实时推送与 `sync_events` 补偿两路径均去重），既保障多端实时一致又避免发起设备回显自身操作（群聊下回显会用已推进的 ratchet 状态重试解密并误清正文）。
+- **并发响应匹配完整性（M9 欠账修复，2026-09-10）**：旧客户端实现用单发槽位 `m_pendingEditMessageRequestId`/`m_pendingDeleteMessageRequestId` 只保存最后一个 requestId，连续编辑/删除时前一条响应因 `requestId != pending` 被静默丢弃（无失败信号/重试/outbox 兜底 → 本地与服务端分歧直到下次全量同步）；私聊编辑走 `fetch_keys` 异步回调，等待期间再次编辑会覆盖在途上下文（可能用错 messageId 或丢失前一次编辑）。现改为多槽 `m_pendingEdits`（requestId→上下文，镜像已验证的 `m_pendingSendByRequestId`）+ `m_pendingDeleteRequestIds` 集合，私聊编辑经 `m_privateEditQueue` 队列串行消费 `fetch_keys` 传输槽（`m_editFetchInFlight` 占位，与 healing 队列同范式），异步回调按 requestId 取对应上下文不再互相覆盖；登出经 `resetAuthState`、断线经 `onDisconnected` 两路径均清空这些容器并复位 `m_editFetchInFlight`（自动重连不经过 `resetAuthState`，故断线路径必须单独清理，否则在途标记恒真会永久堵死编辑泵），并对已入队/已发出但未收到响应的编辑/删除上报失败以便 UI 回退乐观态。同时新增专用推送类型 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`，响应与推送彻底分离，消除靠 `requestId==0` 区分带来的误处理风险。
 
 ### 会话与认证加固（2026-09-02）
 
@@ -112,6 +113,8 @@
 - **发消息**（M11 前置）：`send_message`（私聊/群聊同一入口）每连接 10 秒内最多 30 条，超限返回 `RateLimited (1003)`；客户端视为瞬时失败保留 outbox 并短退避重刷，不丢消息。抑制刷消息/DoS。
 - **搜索**（M11 前置）：`search_users` 每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`，抑制用户名枚举/刷库。
 - **密钥拉取**：`fetch_keys` 与 `fetch_group_keys` 共享窗口，每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`（原用 `LoginRateLimited`，M11 迁至通用码），防预密钥池耗尽。
+- **消息编辑/删除**（M9 欠账修复）：`edit_message` 与 `delete_message` 共享窗口，每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`。此类操作每次按会话成员数写 `sync_events` + fan-out（O(N) 放大）且事件 30 天才清理，未限流前可被用于刷库/DB 膨胀；编辑仅需重放已捕获的合法 envelope，攻击成本低，故必须限流。
+- **会话偏好**（M9 欠账修复）：`set_conversation_prefs` 每连接 60 秒内最多 30 次，超限返回 `RateLimited (1003)`。
 - 所有限流窗口为连接级（`RateWindow`，`Chat-Server/core`），与既有 fetch_keys 内联窗口语义一致；`LoginRateLimited` 现仅用于登录。多服务器部署时限流状态需共享/持久化（与 nonce 缓存同为单实例内存态限制）。
 
 ### 数据库安全

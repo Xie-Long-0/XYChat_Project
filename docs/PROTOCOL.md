@@ -81,9 +81,11 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `82` | `SetConversationPrefsResponse` | 会话偏好设置响应（M9） |
 | `83` | `ConversationPrefsNotification` | 会话偏好变更通知（服务端推送，M9：本人多端同步） |
 | `84` | `EditMessageRequest` | 消息编辑请求（M9） |
-| `85` | `EditMessageResponse` | 消息编辑响应（M9：本端请求响应，requestId=0 时复用为编辑实时推送；推送覆盖全体成员 **含操作者本人的其他设备**，发起设备按 payload.`senderId`+`originDeviceId` 自行去重） |
+| `85` | `EditMessageResponse` | 消息编辑响应（M9：仅本端请求响应，requestId 命中在途编辑才处理） |
 | `86` | `DeleteMessageRequest` | 消息删除请求（M9） |
-| `87` | `DeleteMessageResponse` | 消息删除响应（M9：本端请求响应，requestId=0 时复用为删除实时推送；推送覆盖全体成员 **含操作者本人的其他设备**，发起设备按 payload.`senderId`+`originDeviceId` 自行去重） |
+| `87` | `DeleteMessageResponse` | 消息删除响应（M9：仅本端请求响应，requestId 命中在途删除才处理） |
+| `88` | `MessageEditedNotification` | 消息编辑实时推送（服务端推送，M9 欠账修复：覆盖全体成员 **含操作者本人的其他设备**，发起设备按 payload.`senderId`+`originDeviceId` 自行去重；requestId=0。旧方案复用 `EditMessageResponse`靠 `requestId==0` 区分，现已拆分） |
+| `89` | `MessageDeletedNotification` | 消息删除实时推送（服务端推送，M9 欠账修复：语义同 `88`，与 `DeleteMessageResponse` 分离） |
 
 ### 注册请求
 
@@ -212,7 +214,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `1000` | `InvalidRequest` | 请求格式、类型或 payload 非法 |
 | `1001` | `UnsupportedVersion` | 协议版本不支持 |
 | `1002` | `ReplayRejected` | 重放保护拒绝：timestamp/nonce 缺失、格式错误、超时或重复（M5.5） |
-| `1003` | `RateLimited` | 非登录类请求频率超限：发消息 / 搜索 / 密钥拉取（M11 前置） |
+| `1003` | `RateLimited` | 非登录类请求频率超限：发消息 / 搜索 / 密钥拉取 / 消息编辑删除 / 会话偏好（M11 前置 + M9 欠账修复） |
 | `2001` | `AuthenticationFailed` | 用户名或密码错误 |
 | `2002` | `AccountAlreadyExists` | 用户名已存在 |
 | `2003` | `AccountNotFound` | 用户不存在 |
@@ -258,6 +260,8 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - **发消息**（`send_message`，私聊/群聊同一入口）：每连接 10 秒内最多 30 条；超限返回 `RateLimited (1003)`。客户端视为瞬时失败——保留 outbox 并短退避后自动重刷，不丢消息。
 - **搜索**（`search_users`）：每连接 60 秒内最多 20 次；超限返回 `RateLimited (1003)`，抑制用户名枚举/刷库。
 - **密钥拉取**（`fetch_keys` 与 `fetch_group_keys` 共享窗口）：每连接 60 秒内最多 20 次；超限返回 `RateLimited (1003)`（M11 前由 `LoginRateLimited` 迁移而来），防止恶意耗尽他人预密钥池。
+- **消息编辑/删除**（`edit_message` 与 `delete_message` 共享窗口，M9 欠账修复）：每连接 60 秒内最多 20 次；超限返回 `RateLimited (1003)`。这类操作每次按会话成员数写 `sync_events` + fan-out（O(N) 放大），需限流防刷库/DB 膨胀。
+- **会话偏好**（`set_conversation_prefs`，M9 欠账修复）：每连接 60 秒内最多 30 次；超限返回 `RateLimited (1003)`。
 
 > `LoginRateLimited (2006)` 自 M11 起仅用于登录限流；其余请求限流统一使用通用 `RateLimited (1003)`。
 
@@ -699,14 +703,15 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```json
 // 请求（content 为重新加密后的密文，contentType 须与原消息一致）
 { "type": "edit_message", "messageId": 42, "content": "<重新加密的 envelope/e2ee_group>", "contentType": "text", "timestamp": ..., "nonce": "..." }
-// 响应 data（同时作为实时推送的 payload，requestId=0；推送覆盖全体成员含操作者本人）
+// 响应 data（仅本端请求响应）
 { "messageId": 42, "conversationId": 9, "senderId": 3, "originDeviceId": "dev-a1", "content": "<密文>", "contentType": "text", "editedAt": "..." }
+// 实时推送（MessageEditedNotification 88，requestId=0）payload 同上，覆盖全体成员含操作者本人
 ```
 
 - 仅消息发送者可编辑；已删除消息与系统消息（`contentType=system`）不可编辑（`MessageNotFound`/`PermissionDenied`）。
 - `contentType` 必须与原消息一致（私聊 `text`、群 `e2ee_group`），拒绝借编辑切换形态注入非法内容；`content` 长度受 `MaxGroupMessageLength` 上限约束。
 - **fail-closed 密文校验**：`e2ee_group` 经 `GroupE2eeCrypto::decodeGroupMessage` 且 `senderDeviceId` 须为当前设备；`text` 经 `E2eeCrypto::decodeEnvelope` 校验为合法 envelope——服务端只见密文，拒绝明文注入（`E2eeInvalidEnvelope`）。
-- 成功后服务端 `messages.edited_at = datetime('now')`，向会话全体成员写 `message_edited` 事件并实时推送（复用 `EditMessageResponse` messageType，requestId=0）。**事件与推送必须携带 `senderId`**（群聊解密寻址所需，2026-09-09 补）与 `originDeviceId`（连同 `senderId` 供发起设备去重）；推送不再排除操作者本人，以保障其名下其他设备实时一致。
+- 成功后服务端 `messages.edited_at = datetime('now')`，向会话全体成员写 `message_edited` 事件并专用推送 `MessageEditedNotification (88)`（requestId=0；M9 欠账修复前曾复用 `EditMessageResponse` messageType 靠 `requestId==0` 区分，现已与响应拆分）。**事件与推送必须携带 `senderId`**（群聊解密寻址所需，2026-09-09 补）与 `originDeviceId`（连同 `senderId` 供发起设备去重）；推送不再排除操作者本人，以保障其名下其他设备实时一致。
 - 客户端编辑路径：群聊同步用 Sender-Key 重加密提交；私聊异步 `fetch_keys` 拉取对方密钥包后 `encryptForUser` 重加密提交（含发送方自身拷贝，使本人其他设备可解）。解密侧**不预先清缓存**，直接解密新密文（绕过缓存，`decryptEditContent`）；解密成功则覆盖本地明文（`messages.content_enc`）与持久化解密缓存（`decrypt_cache`），失败则保留既有可读明文与缓存、仅推进 `edited_at`。**幂等回退（2026-09-10）**：私聊预密钥一次性、群 ratchet 已推进，离线重放（重登后 `sync_events` 补发 `message_edited`，或实时推送与同步事件重复投递）时新密文无法二次解密；此时**不写空覆盖、不清缓存**既有可读正文，确保重登后仍能像普通消息一样按持久化解密缓存恢复明文，而非显示"无法解密"。
 - **群聊乱序容忍（2026-09-09）**：编辑会消耗一个新的 ratchet 迭代，使被编辑消息的 `iteration` 大于其后发送的消息，而 `sync_messages` 按 `message_id ASC` 返回；接收端为此维护**跳序消息密钥缓存**（skipped message keys，上限 `MaxSkippedMessageKeys=1000`，本地 `sender_key_skipped` 表加密持久化），使先解到高 `iteration` 后仍能解出低 `iteration` 的在途/乱序消息；缓存命中即一次性消费，不推进链状态。
 
@@ -715,13 +720,14 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```json
 // 请求
 { "type": "delete_message", "messageId": 42, "timestamp": ..., "nonce": "..." }
-// 响应 data（同时作为实时推送的 payload，requestId=0；推送覆盖全体成员含操作者本人）
+// 响应 data（仅本端请求响应）
 { "messageId": 42, "conversationId": 9, "senderId": 3, "originDeviceId": "dev-a1", "deletedAt": "..." }
+// 实时推送（MessageDeletedNotification 89，requestId=0）payload 同上，覆盖全体成员含操作者本人
 ```
 
 - 仅消息发送者可删除；系统消息不可删（`PermissionDenied`）。
 - **软删除留墓碑**：`messages.deleted = 1`、正文清空，保留 messageId/发送者/时间供客户端渲染“已删除”占位；幂等（重复删除返回成功）。
 - **写入 fail-closed（2026-09-09）**：`deleteMessage` 真实写入失败时返回 `InternalError` 且**不广播事件**（旧实现忽略返回值，会在库内状态未变的情况下向全员广播删除，造成服务端与事件流分歧）；失败记 `message.delete_failed` 结构化日志。
-- 成功后向会话全体成员写 `message_deleted` 事件并实时推送（复用 `DeleteMessageResponse` messageType，requestId=0）；payload 同样携带 `senderId` 与 `originDeviceId`，推送不排除操作者本人（发起设备按 `senderId`+`originDeviceId` 客户端去重）。
+- 成功后向会话全体成员写 `message_deleted` 事件并专用推送 `MessageDeletedNotification (89)`（requestId=0；M9 欠账修复前曾复用 `DeleteMessageResponse` messageType，现已与响应拆分）；payload 同样携带 `senderId` 与 `originDeviceId`，推送不排除操作者本人（发起设备按 `senderId`+`originDeviceId` 客户端去重）。
 
 

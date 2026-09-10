@@ -31,6 +31,8 @@ RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
     , m_fetchKeysWindow(MaxFetchKeysPerWindow, FetchKeysWindowSeconds)
     , m_sendWindow(MaxSendMessagesPerWindow, SendMessageWindowSeconds)
     , m_searchWindow(MaxSearchesPerWindow, SearchWindowSeconds)
+    , m_editDeleteWindow(MaxEditDeletePerWindow, EditDeleteWindowSeconds)
+    , m_prefsWindow(MaxPrefsPerWindow, PrefsWindowSeconds)
 {
 }
 
@@ -1973,6 +1975,14 @@ void RequestHandler::processSetConversationPrefsRequest(const Packet &packet,
     const bool pinned = pinnedVal.toBool();
     const bool muted = mutedVal.toBool();
 
+    // M9 欠账修复：会话偏好设置限流（与 send/search 一致：先校验入参形态、
+    // 后消费配额，避免畸形请求白白耗尽限流窗口；鉴权已过、DB 访问前）
+    if (!m_prefsWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse,
+                     ErrorCode::RateLimited, "Too many preference updates, please slow down");
+        return;
+    }
+
     // 先授权：仅会话成员可设置偏好
     if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
         sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse,
@@ -2022,6 +2032,14 @@ void RequestHandler::processEditMessageRequest(const Packet &packet, const QJson
     if (content.isEmpty() || contentType.isEmpty()) {
         sendResponse(packet.requestId, MessageType::EditMessageResponse,
                      ErrorCode::InvalidRequest, "content and contentType are required");
+        return;
+    }
+
+    // M9 欠账修复：编辑/删除共用限流（与 send/search 一致：先校验入参形态、
+    // 后消费配额；每次编辑按成员数写 sync_events + fan-out，鉴权已过、DB 访问前）
+    if (!m_editDeleteWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::RateLimited, "Too many edits, please slow down");
         return;
     }
 
@@ -2117,7 +2135,7 @@ void RequestHandler::processEditMessageRequest(const Packet &packet, const QJson
     const QByteArray evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
 
     Packet notifyPacket;
-    notifyPacket.messageType = MessageType::EditMessageResponse; // 复用：接收方按 messageType 识别编辑事件
+    notifyPacket.messageType = MessageType::MessageEditedNotification; // M9 欠账修复：专用推送类型
     notifyPacket.requestId = 0;
     notifyPacket.payload = evJson;
     const QByteArray encoded = PacketCodec::encode(notifyPacket);
@@ -2141,6 +2159,14 @@ void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJs
     if (messageId <= 0) {
         sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
                      ErrorCode::InvalidRequest, "Invalid messageId");
+        return;
+    }
+
+    // M9 欠账修复：编辑/删除共用限流（与 send/search 一致：先校验入参形态、
+    // 后消费配额；与 edit 同窗口，抑制刷库/O(N) 事件放大；鉴权已过、DB 访问前）
+    if (!m_editDeleteWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
+                     ErrorCode::RateLimited, "Too many deletions, please slow down");
         return;
     }
 
@@ -2185,7 +2211,7 @@ void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJs
     const QByteArray evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
 
     Packet notifyPacket;
-    notifyPacket.messageType = MessageType::DeleteMessageResponse; // 复用：接收方按 messageType 识别删除事件
+    notifyPacket.messageType = MessageType::MessageDeletedNotification; // M9 欠账修复：专用推送类型
     notifyPacket.requestId = 0;
     notifyPacket.payload = evJson;
     const QByteArray encoded = PacketCodec::encode(notifyPacket);

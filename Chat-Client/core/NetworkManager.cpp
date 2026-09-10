@@ -185,6 +185,23 @@ void NetworkManager::onDisconnected()
     m_pendingGroupDistributions.clear();
     m_groupSenderKeys.clear();
     m_healQueue.clear();
+    // M9 欠账修复：在途编辑/删除随连接失效。必须复位 m_editFetchInFlight
+    // 与清空私聊编辑队列，否则自动重连（不经 resetAuthState）后
+    // pumpPrivateEditFetch 首行即因在途标记恒真而 return，本会话所有后续
+    // 私聊编辑静默丢失。已发出的编辑/删除响应在断链后不可达，上报失败让 UI
+    // 回退乐观态（编辑/删除无 outbox 重发兜底）
+    const int pendingEditFailures = m_pendingEdits.size() + m_privateEditQueue.size();
+    const int pendingDeleteFailures = m_pendingDeleteRequestIds.size();
+    m_pendingEdits.clear();
+    m_privateEditQueue.clear();
+    m_editFetchInFlight = false;
+    m_pendingDeleteRequestIds.clear();
+    for (int i = 0; i < pendingEditFailures; ++i) {
+        emit messageEditFailed("Connection lost");
+    }
+    for (int i = 0; i < pendingDeleteFailures; ++i) {
+        emit messageDeleteFailed("Connection lost");
+    }
     setState(ConnectionState::Disconnected);
 
     if (shouldRelogin) {
@@ -491,6 +508,12 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::DeleteMessageResponse:
         handleDeleteMessageResponse(packet);
         break;
+    case MessageType::MessageEditedNotification:
+        handleMessageEditedNotification(packet);
+        break;
+    case MessageType::MessageDeletedNotification:
+        handleMessageDeletedNotification(packet);
+        break;
     case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
@@ -673,6 +696,11 @@ void NetworkManager::resetAuthState()
     m_pendingGroupDistributions.clear();
     m_groupSenderKeys.clear();
     m_healQueue.clear();
+    // M9 欠账修复：清空在途编辑/删除状态与等待密钥的私聊编辑队列
+    m_pendingEdits.clear();
+    m_privateEditQueue.clear();
+    m_editFetchInFlight = false;
+    m_pendingDeleteRequestIds.clear();
     XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
     m_identityKey = {};
     for (auto &pk : m_localPrekeys) {
@@ -983,6 +1011,11 @@ void NetworkManager::flushOutbox()
         }
         sendFetchKeysRequest(target);
     }
+
+    // M9 欠账修复：outbox 拉取若未占用 fetch 传输槽（无待发或均在退避），
+    // 在此收口处泵送等待密钥的私聊编辑，避免编辑因“槽被发送链路占用后
+    // 无人再泵”而被无限期搁置（pump 内部再判槽空闲，无重入风险）
+    pumpPrivateEditFetch();
 }
 
 // M6: E2EE 引导（加载/生成身份密钥，补齐预密钥，注册到服务端）
@@ -1161,10 +1194,14 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
     const int code = response.value("code").toInt();
     if (code != static_cast<int>(ErrorCode::Ok)) {
         const QString message = response.value("message").toString("Key bundle unavailable");
-        // M9 特性栈：在途私聊编辑拉取密钥包失败——直接上报编辑失败并清理
-        if (m_pendingEditMessageId != 0 && m_pendingEditPeerUserId == target) {
+        // M9 欠账修复：在途私聊编辑拉取密钥包失败——出队上报编辑失败并泵送下一条
+        if (m_editFetchInFlight && !m_privateEditQueue.isEmpty()
+            && m_privateEditQueue.head().peerUserId == target) {
+            m_editFetchInFlight = false;
+            m_privateEditQueue.dequeue();
             emit messageEditFailed(message);
-            clearPendingEdit();
+            flushOutbox();
+            pumpPrivateEditFetch();
             return;
         }
         if (code == static_cast<int>(ErrorCode::CannotSendToSelf)) {
@@ -1200,23 +1237,33 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
 
     const QJsonArray bundles = response.value("data").toObject().value("bundles").toArray();
     if (bundles.isEmpty()) {
+        // M9 欠账修复：若为在途私聊编辑拉取到空密钥包，同样出队失败并泵送下一条
+        if (m_editFetchInFlight && !m_privateEditQueue.isEmpty()
+            && m_privateEditQueue.head().peerUserId == target) {
+            m_editFetchInFlight = false;
+            m_privateEditQueue.dequeue();
+            emit messageEditFailed("Key bundle unavailable");
+            pumpPrivateEditFetch();
+            return;
+        }
         emit messageSendFailed("Empty key bundle");
         flushOutbox();
         return;
     }
 
-    // M9 特性栈：在途私聊编辑——优先用本轮密钥包加密编辑正文并提交，
-    // 而非走 outbox 发送链路
-    if (m_pendingEditMessageId != 0 && m_pendingEditPeerUserId == target
-        && !m_pendingEditContent.isEmpty()) {
-        const QString envelope = encryptForUser(target, bundles, m_pendingEditContent);
+    // M9 欠账修复：在途私聊编辑——优先用本轮密钥包加密队首编辑正文并提交，
+    // 而非走 outbox 发送链路（fetch 单槽串行，消费后泵送下一条）
+    if (m_editFetchInFlight && !m_privateEditQueue.isEmpty()
+        && m_privateEditQueue.head().peerUserId == target) {
+        m_editFetchInFlight = false;
+        const PrivateEditWait w = m_privateEditQueue.dequeue();
+        const QString envelope = encryptForUser(target, bundles, w.plaintext);
         if (envelope.isEmpty()) {
             emit messageEditFailed("Failed to encrypt edited message");
-            clearPendingEdit();
-            return;
+        } else {
+            sendEditMessageRequest(w.messageId, w.conversationId, envelope, "text", w.plaintext);
         }
-        sendEditMessageRequest(m_pendingEditMessageId, m_pendingEditConversationId,
-                               envelope, "text");
+        pumpPrivateEditFetch();
         return;
     }
 
@@ -2971,32 +3018,45 @@ void NetworkManager::editMessage(qint64 conversationId, qint64 peerUserId,
         return;
     }
 
-    // 记录在途编辑上下文（响应匹配与本地乐观更新用）
-    m_pendingEditMessageId = messageId;
-    m_pendingEditConversationId = conversationId;
-    m_pendingEditPeerUserId = peerUserId;
-    m_pendingEditContent = newContent;
-
     if (conversationId > 0 && peerUserId == 0) {
-        // 群聊：同步用 Sender-Key 重新加密后直接提交
+        // 群聊：同步用 Sender-Key 重新加密后直接提交（requestId 登记上下文，多编辑并发不丢）
         const QString envelope = encryptGroupMessage(conversationId, newContent);
         if (envelope.isEmpty()) {
             emit messageEditFailed("Failed to encrypt edited group message");
-            clearPendingEdit();
             return;
         }
-        sendEditMessageRequest(messageId, conversationId, envelope, "e2ee_group");
+        sendEditMessageRequest(messageId, conversationId, envelope, "e2ee_group", newContent);
     } else if (peerUserId > 0) {
-        // 私聊：拉取对方密钥包后加密（响应回调中提交）
-        sendFetchKeysRequest(peerUserId);
+        // 私聊：入队等待拉取对方密钥包后加密提交（M9 欠账修复：队列化，
+        // 避免在途期间再次编辑覆盖单槽上下文）
+        PrivateEditWait w;
+        w.messageId = messageId;
+        w.conversationId = conversationId;
+        w.peerUserId = peerUserId;
+        w.plaintext = newContent;
+        m_privateEditQueue.enqueue(w);
+        pumpPrivateEditFetch();
     } else {
         emit messageEditFailed("Invalid conversation for edit");
-        clearPendingEdit();
     }
 }
 
-void NetworkManager::sendEditMessageRequest(qint64 messageId, qint64 conversationId,
-                                            const QString &content, const QString &contentType)
+// M9 欠账修复：仅当无在途编辑 fetch 且传输槽空闲时，为队首私聊编辑发起拉取
+void NetworkManager::pumpPrivateEditFetch()
+{
+    if (m_editFetchInFlight || m_privateEditQueue.isEmpty()) {
+        return;
+    }
+    if (m_pendingFetchKeysRequestId != 0) {
+        return; // 传输槽被发送/其他拉取占用，其响应回调中会再次泵送
+    }
+    m_editFetchInFlight = true;
+    sendFetchKeysRequest(m_privateEditQueue.head().peerUserId);
+}
+
+quint64 NetworkManager::sendEditMessageRequest(qint64 messageId, qint64 conversationId,
+                                               const QString &content, const QString &contentType,
+                                               const QString &plaintext)
 {
     QJsonObject json;
     json["type"] = "edit_message";
@@ -3009,9 +3069,11 @@ void NetworkManager::sendEditMessageRequest(qint64 messageId, qint64 conversatio
     packet.messageType = MessageType::EditMessageRequest;
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    m_pendingEditMessageRequestId = packet.requestId;
+    // M9 欠账修复：以 requestId 为键登记上下文（镜像 m_pendingSendByRequestId），
+    // 连续编辑的多条响应均能匹配不被丢弃
+    m_pendingEdits.insert(packet.requestId, EditContext{messageId, conversationId, plaintext});
     sendPacket(packet);
-    Q_UNUSED(conversationId);
+    return packet.requestId;
 }
 
 void NetworkManager::deleteMessage(qint64 messageId)
@@ -3029,59 +3091,58 @@ void NetworkManager::deleteMessage(qint64 messageId)
     packet.messageType = MessageType::DeleteMessageRequest;
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    m_pendingDeleteMessageRequestId = packet.requestId;
+    // M9 欠账修复：删除无逐请求上下文（响应 payload 自带 messageId），用集合记录在途
+    m_pendingDeleteRequestIds.insert(packet.requestId);
     sendPacket(packet);
 }
 
 void NetworkManager::handleEditMessageResponse(const Packet &packet)
 {
-    // 两种形态：① 本端编辑请求的响应（requestId 匹配）；② 会话其他成员编辑的实时推送（requestId=0）
-    if (packet.requestId != 0 && packet.requestId != m_pendingEditMessageRequestId) {
+    // M9 欠账修复：仅处理本端编辑请求的响应（requestId 命中 m_pendingEdits）；
+    // 会话成员编辑的实时推送经 MessageEditedNotification (88) 走专用处理器
+    auto it = m_pendingEdits.find(packet.requestId);
+    if (packet.requestId == 0 || it == m_pendingEdits.end()) {
         return;
     }
-    const bool isOwnResponse = (packet.requestId != 0);
-    if (isOwnResponse) {
-        m_pendingEditMessageRequestId = 0;
-    }
+    const EditContext ctx = it.value();
+    m_pendingEdits.erase(it);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
-
-    if (isOwnResponse && code != static_cast<int>(ErrorCode::Ok)) {
+    if (code != static_cast<int>(ErrorCode::Ok)) {
         emit messageEditFailed(response.value("message").toString("Failed to edit message"));
-        clearPendingEdit();
         return;
     }
 
-    // 响应 data 与推送 payload 字段一致（messageId/conversationId/content/contentType/editedAt）
-    const QJsonObject data = isOwnResponse ? response.value("data").toObject() : response;
+    const QJsonObject data = response.value("data").toObject();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    const QString editedAt = data.value("editedAt").toString();
+
+    // 本端编辑成功：用本地新明文更新缓存（服务端只回传重新加密的密文，
+    // 本地需以明文落库供展示）。先失效旧解密缓存，避免后续同步/重载命中编辑前明文
+    const QString plaintext = ctx.plaintext;
+    m_decryptCache.remove(ctx.messageId);
+    if (m_localStore.isOpen()) {
+        m_localStore.clearDecryptedContent(ctx.messageId);
+        if (!plaintext.isEmpty()) {
+            m_localStore.updateMessageContent(ctx.messageId, plaintext, editedAt);
+            m_localStore.saveDecryptedContent(ctx.messageId, plaintext);
+        }
+    }
+    emit messageEdited(conversationId, ctx.messageId, plaintext, editedAt);
+}
+
+void NetworkManager::handleMessageEditedNotification(const Packet &packet)
+{
+    // M9 欠账修复：其他成员（含本人其他设备）编辑的实时推送（requestId=0）
+    const QJsonObject data = QJsonDocument::fromJson(packet.payload).object();
     const qint64 messageId = data.value("messageId").toVariant().toLongLong();
     const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
     const QString editedAt = data.value("editedAt").toString();
 
-    if (isOwnResponse) {
-        // 本端编辑成功：用本地新明文更新缓存（服务端只回传重新加密的密文，
-        // 本地需以明文落库供展示；群聊密文需解密，此处直接以乐观明文回填）。
-        // 先失效旧解密缓存，避免后续同步/重载命中编辑前明文
-        const QString plaintext = m_pendingEditContent;
-        m_decryptCache.remove(messageId);
-        if (m_localStore.isOpen()) {
-            m_localStore.clearDecryptedContent(messageId);
-            if (!plaintext.isEmpty()) {
-                m_localStore.updateMessageContent(messageId, plaintext, editedAt);
-                m_localStore.saveDecryptedContent(messageId, plaintext);
-            }
-        }
-        clearPendingEdit();
-        emit messageEdited(conversationId, messageId, plaintext, editedAt);
-        return;
-    }
-
-    // 发起设备不回显自身操作：本端已在上方响应路径完成乐观更新，
-    // 重复处理会在群聊下用已推进的 ratchet 状态重试解密并误清空正文。
-    // 注意：deviceId 为机器级（QSysInfo::machineUniqueId），同机多账号共用；
-    // 必须同时比对 senderId == 本端用户，否则同机的其他账号（接收方）会被误判
-    // 为“本设备”而丢弃编辑事件，永远看不到编辑后的正文
+    // 发起设备不回显自身操作：本端已在响应路径完成乐观更新，重复处理会在
+    // 群聊下用已推进的 ratchet 状态重试解密并误清空正文。
+    // deviceId 为机器级（同机多账号共用），必须同时比对 senderId == 本端用户
     const qint64 senderId = data.value("senderId").toVariant().toLongLong();
     const QString originDeviceId = data.value("originDeviceId").toString();
     if (senderId == m_userId && !originDeviceId.isEmpty()
@@ -3089,10 +3150,8 @@ void NetworkManager::handleEditMessageResponse(const Packet &packet)
         return;
     }
 
-    // 其他成员（含本人其他设备）编辑推送：直接解密新 content（不预先清缓存，
-    // 避免新正文解不出时把既有可读明文/缓存一并破坏）。senderId 由服务端随事件
-    // 下发，群聊解密靠它定位 Sender Key（缺失时 decryptGroupMessageObject 会按
-    // 设备 + keyId 反查兼容旧事件）
+    // 直接解密新 content（不预先清缓存，避免新正文解不出时把既有可读明文/缓存
+    // 一并破坏）。senderId 由服务端随事件下发，群聊解密靠它定位 Sender Key
     QString plaintext;
     const bool decrypted = decryptEditContent(data, plaintext);
     if (decrypted && m_localStore.isOpen()) {
@@ -3101,9 +3160,8 @@ void NetworkManager::handleEditMessageResponse(const Packet &packet)
         return;
     }
     if (m_localStore.isOpen()) {
-        // 新正文解不出：一次性预密钥已消费（私聊）/ 群 ratchet 已推进的离线
-        // 重放场景。绝不写空覆盖既有可读正文；缓存已被 decryptEditContent 保留
-        // （失败路径不清缓存），重登后仍可按持久化缓存/正文恢复可读文本。
+        // 新正文解不出：一次性预密钥已消费/群 ratchet 已推进的离线重放场景。
+        // 绝不写空覆盖既有可读正文（失败路径不清缓存），重登后仍可恢复
         const QString existing = m_localStore.loadMessageContent(messageId);
         if (!existing.isEmpty()) {
             m_localStore.markMessageEdited(messageId, editedAt);
@@ -3115,50 +3173,49 @@ void NetworkManager::handleEditMessageResponse(const Packet &packet)
 
 void NetworkManager::handleDeleteMessageResponse(const Packet &packet)
 {
-    // 同编辑：requestId 匹配为本端响应，requestId=0 为其他成员删除推送
-    if (packet.requestId != 0 && packet.requestId != m_pendingDeleteMessageRequestId) {
+    // M9 欠账修复：仅处理本端删除请求的响应（requestId 命中集合）；
+    // 其他成员删除推送经 MessageDeletedNotification (89)
+    if (packet.requestId == 0 || !m_pendingDeleteRequestIds.contains(packet.requestId)) {
         return;
     }
-    const bool isOwnResponse = (packet.requestId != 0);
-    if (isOwnResponse) {
-        m_pendingDeleteMessageRequestId = 0;
-    }
+    m_pendingDeleteRequestIds.remove(packet.requestId);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
-
-    if (isOwnResponse && code != static_cast<int>(ErrorCode::Ok)) {
+    if (code != static_cast<int>(ErrorCode::Ok)) {
         emit messageDeleteFailed(response.value("message").toString("Failed to delete message"));
         return;
     }
 
-    const QJsonObject data = isOwnResponse ? response.value("data").toObject() : response;
+    const QJsonObject data = response.value("data").toObject();
     const qint64 messageId = data.value("messageId").toVariant().toLongLong();
     const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
-
-    // 发起设备不回显自身操作（本端已在上方响应路径处理）。
-    // 同机多账号下 deviceId 相同，须连同 senderId 一并比对，否则接收方会误跳过
-    if (!isOwnResponse) {
-        const qint64 senderId = data.value("senderId").toVariant().toLongLong();
-        const QString originDeviceId = data.value("originDeviceId").toString();
-        if (senderId == m_userId && !originDeviceId.isEmpty()
-            && originDeviceId == m_localDeviceId) {
-            return;
-        }
-    }
-
     if (m_localStore.isOpen()) {
         m_localStore.markMessageDeleted(messageId);
     }
     emit messageDeleted(conversationId, messageId);
 }
 
-void NetworkManager::clearPendingEdit()
+void NetworkManager::handleMessageDeletedNotification(const Packet &packet)
 {
-    m_pendingEditMessageId = 0;
-    m_pendingEditConversationId = 0;
-    m_pendingEditPeerUserId = 0;
-    m_pendingEditContent.clear();
+    // M9 欠账修复：其他成员（含本人其他设备）删除的实时推送（requestId=0）
+    const QJsonObject data = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 messageId = data.value("messageId").toVariant().toLongLong();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+
+    // 发起设备不回显自身操作（本端已在响应路径处理）。
+    // 同机多账号下 deviceId 相同，须连同 senderId 一并比对，否则接收方会误跳过
+    const qint64 senderId = data.value("senderId").toVariant().toLongLong();
+    const QString originDeviceId = data.value("originDeviceId").toString();
+    if (senderId == m_userId && !originDeviceId.isEmpty()
+        && originDeviceId == m_localDeviceId) {
+        return;
+    }
+
+    if (m_localStore.isOpen()) {
+        m_localStore.markMessageDeleted(messageId);
+    }
+    emit messageDeleted(conversationId, messageId);
 }
 
 // M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）

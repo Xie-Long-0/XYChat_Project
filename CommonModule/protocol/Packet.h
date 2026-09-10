@@ -80,6 +80,10 @@ enum class MessageType : quint16
     EditMessageResponse = 85,
     DeleteMessageRequest = 86,
     DeleteMessageResponse = 87,
+    // M9 欠账修复：编辑/删除事件专用推送类型（与 ReadCursorNotification(80)/
+    // ConversationPrefsNotification(83) 风格统一，不再靠 requestId==0 区分响应与推送）
+    MessageEditedNotification = 88,  // 服务端推送：会话成员编辑消息（多端实时一致）
+    MessageDeletedNotification = 89, // 服务端推送：会话成员删除消息（多端实时一致）
 };
 
 enum class ErrorCode : int
