@@ -306,6 +306,112 @@ QByteArray E2eeCrypto::aesGcmDecrypt(const QByteArray &key, const QByteArray &iv
     return plaintext;
 }
 
+// M8: 带调用方 nonce 与 AAD 的 AES-256-GCM（文件分片加解密）
+
+QByteArray E2eeCrypto::aesGcmEncryptAad(const QByteArray &key, const QByteArray &nonce,
+                                        const QByteArray &plaintext, const QByteArray &aad)
+{
+    if (key.size() != 32 || nonce.size() != GcmIvSize) {
+        return {};
+    }
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return {};
+    }
+
+    bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) > 0
+        && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GcmIvSize, nullptr) > 0
+        && EVP_EncryptInit_ex(ctx, nullptr, nullptr,
+                              reinterpret_cast<const unsigned char *>(key.constData()),
+                              reinterpret_cast<const unsigned char *>(nonce.constData())) > 0;
+
+    // AAD 先于明文送入且不产出密文字节（输出缓冲传 nullptr）
+    if (ok && !aad.isEmpty()) {
+        int aadLen = 0;
+        ok = EVP_EncryptUpdate(ctx, nullptr, &aadLen,
+                               reinterpret_cast<const unsigned char *>(aad.constData()),
+                               aad.size()) > 0;
+    }
+
+    QByteArray out;
+    if (ok) {
+        out.resize(plaintext.size() + GcmTagSize);
+        int outLen = 0;
+        ok = EVP_EncryptUpdate(ctx, reinterpret_cast<unsigned char *>(out.data()), &outLen,
+                               reinterpret_cast<const unsigned char *>(plaintext.constData()),
+                               plaintext.size()) > 0;
+        int totalLen = outLen;
+        ok = ok && EVP_EncryptFinal_ex(ctx,
+                                       reinterpret_cast<unsigned char *>(out.data()) + totalLen,
+                                       &outLen) > 0;
+        totalLen += outLen;
+        ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GcmTagSize,
+                                       reinterpret_cast<unsigned char *>(out.data()) + totalLen) > 0;
+        out.resize(totalLen + GcmTagSize);
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) {
+        return {};
+    }
+    return out;
+}
+
+QByteArray E2eeCrypto::aesGcmDecryptAad(const QByteArray &key, const QByteArray &nonce,
+                                        const QByteArray &ciphertext, const QByteArray &aad)
+{
+    if (key.size() != 32 || nonce.size() != GcmIvSize || ciphertext.size() < GcmTagSize) {
+        return {};
+    }
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return {};
+    }
+
+    QByteArray plaintext;
+    bool ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) > 0
+        && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GcmIvSize, nullptr) > 0
+        && EVP_DecryptInit_ex(ctx, nullptr, nullptr,
+                              reinterpret_cast<const unsigned char *>(key.constData()),
+                              reinterpret_cast<const unsigned char *>(nonce.constData())) > 0;
+
+    if (ok && !aad.isEmpty()) {
+        int aadLen = 0;
+        ok = EVP_DecryptUpdate(ctx, nullptr, &aadLen,
+                               reinterpret_cast<const unsigned char *>(aad.constData()),
+                               aad.size()) > 0;
+    }
+
+    if (ok) {
+        const int cipherLen = ciphertext.size() - GcmTagSize;
+        plaintext.resize(cipherLen);
+        int outLen = 0;
+        ok = EVP_DecryptUpdate(ctx, reinterpret_cast<unsigned char *>(plaintext.data()), &outLen,
+                               reinterpret_cast<const unsigned char *>(ciphertext.constData()),
+                               cipherLen) > 0;
+        plaintext.resize(outLen);
+        // 设置认证标签后再 Final：AAD 或分片序号不符时标签校验失败，明文被丢弃
+        ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GcmTagSize,
+                                       const_cast<char *>(ciphertext.constData()) + cipherLen) > 0;
+        int finalLen = 0;
+        QByteArray finalBuf(GcmTagSize, Qt::Uninitialized);
+        if (!ok || EVP_DecryptFinal_ex(ctx, reinterpret_cast<unsigned char *>(finalBuf.data()), &finalLen) <= 0) {
+            ok = false; // 认证失败：篡改、密钥错误或 AAD（分片序号）不匹配
+        } else if (finalLen > 0) {
+            plaintext.append(finalBuf.left(finalLen));
+        }
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) {
+        SecureMemory::wipe(plaintext);
+        return {};
+    }
+    return plaintext;
+}
+
 // envelope 编解码
 
 QJsonObject E2eeCrypto::encodeEnvelope(const QList<EnvelopeEntry> &entries)

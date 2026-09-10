@@ -3,10 +3,13 @@
 #include "database/DatabaseManager.h"
 #include "E2eeCrypto.h"
 #include "EncryptionManager.h"
+#include "FileCrypto.h"
+#include "FileProtocol.h"
 #include "GroupE2eeCrypto.h"
 #include "LogSanitizer.h"
 #include "SecureMemory.h"
 #include "StructuredLogger.h"
+#include "storage/IObjectStorage.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -21,8 +24,10 @@
 using namespace XYChat::Protocol;
 using XYChat::Security::LogSanitizer;
 using XYChat::Security::GroupE2eeCrypto;
+using XYChat::Security::FileCrypto;
 using XYChat::Security::StructuredLogger;
 using XYChat::Security::LogLevel;
+using XYChat::Server::IObjectStorage;
 
 // 构造 / 析构
 RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
@@ -33,6 +38,8 @@ RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
     , m_searchWindow(MaxSearchesPerWindow, SearchWindowSeconds)
     , m_editDeleteWindow(MaxEditDeletePerWindow, EditDeleteWindowSeconds)
     , m_prefsWindow(MaxPrefsPerWindow, PrefsWindowSeconds)
+    , m_fileUploadWindow(MaxFileUploadsPerWindow, FileUploadWindowSeconds)
+    , m_fileOpsWindow(MaxFileOpsPerWindow, FileOpsWindowSeconds)
 {
 }
 
@@ -84,6 +91,13 @@ void RequestHandler::setSslConfiguration(const QSslConfiguration &config)
 void RequestHandler::setNonceCache(NonceCache *cache)
 {
     m_nonceCache = cache;
+}
+
+// M8: 注入对象存储。仅在存储初始化成功时由 Server 调用；
+// 未注入时文件类请求一律回 FileStorageFailed
+void RequestHandler::setObjectStorage(IObjectStorage *storage)
+{
+    m_objectStorage = storage;
 }
 
 // 线程入口
@@ -339,6 +353,32 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     if (packet.messageType == MessageType::DeleteMessageRequest || type == "delete_message") {
         processDeleteMessageRequest(packet, json);
+        return;
+    }
+    // M8: 媒体、文件与对象存储控制面
+    if (packet.messageType == MessageType::FileUploadCreateRequest
+        || type == "file_upload_create") {
+        processFileUploadCreateRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::FileUploadQueryRequest
+        || type == "file_upload_query") {
+        processFileUploadQueryRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::FileUploadCompleteRequest
+        || type == "file_upload_complete") {
+        processFileUploadCompleteRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::FileUploadCancelRequest
+        || type == "file_upload_cancel") {
+        processFileUploadCancelRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::FileDownloadTicketRequest
+        || type == "file_download_ticket") {
+        processFileDownloadTicketRequest(packet, json);
         return;
     }
 
@@ -808,10 +848,26 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         retryData["conversationId"] = existing->conversationId;
         retryData["clientMessageId"] = clientMessageId;
         retryData["status"] = existing->status;
+        retryData["fileId"] = existing->fileId;
         retryData["reused"] = true;
         sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                      "Message sent", retryData);
         return;
+    }
+
+    // M8: 文件消息校验。未携带 fileId 时按普通消息处理（fileId=0）；携带时
+    // 必须存在、已完成上传且属于本人，否则不予入库，避免把一条指向未完成
+    // 或他人文件的消息投递出去
+    qint64 fileId = 0;
+    {
+        QString fileReason;
+        const ErrorCode fileCode = checkMessageFile(
+            request.value("fileId").toVariant().toLongLong(), &fileId, &fileReason);
+        if (fileCode != ErrorCode::Ok) {
+            sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                         fileCode, fileReason);
+            return;
+        }
     }
 
     // M6: fail-closed：消息正文必须为合法 E2EE envelope（服务端只见密文）
@@ -878,12 +934,18 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     m_db->beginTransaction();
 
     // 存储消息（幂等：并发重复提交仍由幂等键兜底）
+    // M8: 文件状态在插入语句内原子复核。checkMessageFile 读到 ready 之后、写入
+    // 之前，维护任务可能把该文件迁入终态（它当时确实无引用），不复核就会
+    // 产出一条指向已取消文件的消息，而其磁盘数据随后被回收 → 附件永久打不开
+    bool fileNotReady = false;
     const qint64 msgId = m_db->sendMessage(convId, m_authenticatedUserId, content,
-                                           contentType, clientMessageId, m_currentDeviceId);
+                                           contentType, clientMessageId, m_currentDeviceId,
+                                           fileId, &fileNotReady);
     if (msgId < 0) {
         m_db->rollbackTransaction();
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
-                     ErrorCode::InternalError, "Failed to send message");
+                     fileNotReady ? ErrorCode::FileNotReady : ErrorCode::InternalError,
+                     fileNotReady ? "File is no longer available" : "Failed to send message");
         return;
     }
 
@@ -909,6 +971,9 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         ev["contentType"] = contentType;
         ev["clientMessageId"] = clientMessageId;
         ev["createdAt"] = createdAt;
+        // M8: fileId > 0 时接收端据此把解密后的正文当作 FileManifest 解析，
+        // 而不是当普通文本渲染
+        ev["fileId"] = fileId;
         const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
         m_db->appendSyncEvent(targetUserId, "message", evJson);
         m_db->appendSyncEvent(m_authenticatedUserId, "message", evJson);
@@ -922,6 +987,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     notifyJson["content"] = content;
     notifyJson["contentType"] = contentType;
     notifyJson["createdAt"] = createdAt;
+    notifyJson["fileId"] = fileId;
 
     Packet notifyPacket;
     notifyPacket.messageType = MessageType::NewMessageNotification;
@@ -937,6 +1003,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     data["conversationId"] = convId;
     data["clientMessageId"] = clientMessageId;
     data["status"] = "sent";
+    data["fileId"] = fileId;
     sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                  "Message sent", data);
 }
@@ -1077,6 +1144,8 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
         obj["contentType"] = m.contentType;
         obj["status"] = m.status;
         obj["createdAt"] = m.createdAt;
+        // M8: 文件关联（为 0 表示普通消息），与实时推送/sync_events 保持同一口径
+        obj["fileId"] = m.fileId;
         // M9 特性栈：编辑/删除标记（离线重登经 sync_messages 重建编辑/删除状态）
         obj["deleted"] = m.deleted;
         if (!m.editedAt.isEmpty()) {
@@ -1831,6 +1900,20 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
         return;
     }
 
+    // M8: 文件消息校验（与私聊路径同一口径）。群消息正文为 e2ee_group 密文，
+    // 清单经 Sender-Key 加密后对服务端不可见，因此只能靠 fileId 与归属校验
+    qint64 fileId = 0;
+    {
+        QString fileReason;
+        const ErrorCode fileCode = checkMessageFile(
+            request.value("fileId").toVariant().toLongLong(), &fileId, &fileReason);
+        if (fileCode != ErrorCode::Ok) {
+            sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                         fileCode, fileReason);
+            return;
+        }
+    }
+
     // 修复：群 Sender Key 分发引用的预密钥须在入库后消费（claimed->used），与单聊
     // processSendMessage 一致；否则 claimed 预密钥 10 分钟超时回收为 unused，被后续
     // fetch_group_keys 以 ORDER BY id 重复 claim，而接收方首次解密已删除本地私钥，
@@ -1891,17 +1974,23 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
         retryData["conversationId"] = existing->conversationId;
         retryData["clientMessageId"] = clientMessageId;
         retryData["status"] = existing->status;
+        retryData["fileId"] = existing->fileId;
         retryData["reused"] = true;
         sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                      "Message sent", retryData);
         return;
     }
 
+    // M8: 同私聊路径，文件状态在插入语句内原子复核（群路径无事务，更依赖
+    // 单语句原子性来消除与维护任务回收的竞态）
+    bool fileNotReady = false;
     const qint64 msgId = m_db->sendMessage(conversationId, m_authenticatedUserId, content,
-                                           contentType, clientMessageId, m_currentDeviceId);
+                                           contentType, clientMessageId, m_currentDeviceId,
+                                           fileId, &fileNotReady);
     if (msgId < 0) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
-                     ErrorCode::InternalError, "Failed to send message");
+                     fileNotReady ? ErrorCode::FileNotReady : ErrorCode::InternalError,
+                     fileNotReady ? "File is no longer available" : "Failed to send message");
         return;
     }
 
@@ -1922,6 +2011,8 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
     ev["contentType"] = contentType;
     ev["clientMessageId"] = clientMessageId;
     ev["createdAt"] = createdAt;
+    // M8: fileId > 0 时接收端据此把解密后的正文当作 FileManifest 解析
+    ev["fileId"] = fileId;
     const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
 
     // 在线推送给除发送方外的成员（小群直推 fan-out）
@@ -1945,6 +2036,7 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
     data["conversationId"] = conversationId;
     data["clientMessageId"] = clientMessageId;
     data["status"] = "sent";
+    data["fileId"] = fileId;
     sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                  "Message sent", data);
 }
@@ -2060,6 +2152,15 @@ void RequestHandler::processEditMessageRequest(const Packet &packet, const QJson
     if (msgOpt->deleted) {
         sendResponse(packet.requestId, MessageType::EditMessageResponse,
                      ErrorCode::MessageNotFound, "Message has been deleted");
+        return;
+    }
+    // M8: 文件消息不可编辑。编辑只能覆写正文密文而 messages.file_id 不变，
+    // 会使清单里的 fileId/密钥与服务端权威关联不一致（客户端以 file_id 作为
+    // 是否按清单解析的判据，却用清单自述的 fileId 去申请下载票据）。
+    // 替换附件应走"删除旧消息 + 发新文件消息"，已登记为 M8 后续项
+    if (msgOpt->fileId > 0) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::InvalidRequest, "File messages cannot be edited");
         return;
     }
 
@@ -2225,6 +2326,480 @@ void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJs
 
     sendResponse(packet.requestId, MessageType::DeleteMessageResponse, ErrorCode::Ok,
                  "OK", ev);
+}
+
+// M8: 文件消息的 fileId 校验（send_message 私聊/群聊两条分流路径共用）
+ErrorCode RequestHandler::checkMessageFile(qint64 fileId, qint64 *outFileId, QString *outReason)
+{
+    if (outFileId) {
+        *outFileId = 0;
+    }
+    if (fileId <= 0) {
+        return ErrorCode::Ok; // 普通消息
+    }
+    if (!m_objectStorage) {
+        // 存储不可用时不得让文件消息静默降级：正文其实是清单 JSON，
+        // 降级投递会让接收端把文件密钥当文本渲染
+        if (outReason) {
+            *outReason = "File storage is unavailable";
+        }
+        return ErrorCode::FileStorageFailed;
+    }
+    const auto rec = m_db->getFileRecord(fileId);
+    // "不存在"与"不是你的"回同一错误码：fileId 为顺序整数，差异化错误码会让
+    // 任何已登录用户都能遍历判定他人文件是否存在（元数据枚举预言机）。
+    // 真实原因只进服务端日志
+    if (!rec.has_value() || rec->uploaderId != m_authenticatedUserId) {
+        StructuredLogger::event(LogLevel::Warning, "file.message_ref_denied")
+            .userId(m_authenticatedUserId)
+            .field("fileId", fileId)
+            .field("reason", rec.has_value() ? "not_owner" : "not_found").write();
+        if (outReason) {
+            *outReason = "File not found";
+        }
+        return ErrorCode::FileNotFound;
+    }
+    // 归属已确认，以下状态只对上传者本人可见，不构成全局预言机
+    if (rec->status != FileStatus::Ready) {
+        if (outReason) {
+            *outReason = "File upload is not complete";
+        }
+        return ErrorCode::FileNotReady;
+    }
+    if (outFileId) {
+        *outFileId = fileId;
+    }
+    return ErrorCode::Ok;
+}
+
+// M8: 上传控制面共用的前置检查（存在 + 归属）
+ErrorCode RequestHandler::requireOwnedFile(qint64 fileId, FileRecord *outRecord,
+                                           QString *outReason)
+{
+    if (outReason) {
+        outReason->clear();
+    }
+    if (fileId <= 0) {
+        if (outReason) {
+            *outReason = "Invalid fileId";
+        }
+        return ErrorCode::InvalidRequest;
+    }
+    const auto rec = m_db->getFileRecord(fileId);
+    // 上传控制面只服务上传者本人（下载授权走 canUserAccessFile，范围更宽）。
+    // 与 checkMessageFile 同理："不存在"与"不是你的"必须回同一码，否则顺序
+    // fileId 就成了他人上传活动的探测窗口
+    if (!rec.has_value() || rec->uploaderId != m_authenticatedUserId) {
+        StructuredLogger::event(LogLevel::Warning, "file.owner_check_denied")
+            .userId(m_authenticatedUserId)
+            .field("fileId", fileId)
+            .field("reason", rec.has_value() ? "not_owner" : "not_found").write();
+        if (outReason) {
+            *outReason = "File not found";
+        }
+        return ErrorCode::FileNotFound;
+    }
+    if (outRecord) {
+        *outRecord = *rec;
+    }
+    return ErrorCode::Ok;
+}
+
+// finalize 结果转结构化日志用的短标识（只落枚举名，不落任何用户数据）
+static const char *finalizeReasonName(IObjectStorage::FinalizeStatus status)
+{
+    using FS = IObjectStorage::FinalizeStatus;
+    switch (status) {
+    case FS::Ok:                return "ok";
+    case FS::InvalidArguments:  return "invalid_arguments";
+    case FS::Incomplete:        return "incomplete";
+    case FS::ChunkSizeMismatch: return "chunk_size_mismatch";
+    case FS::ChecksumMismatch:  return "checksum_mismatch";
+    case FS::StorageError:      return "storage_error";
+    }
+    return "unknown";
+}
+
+// M8: 申请上传。客户端先声明密文体积与分片参数，服务端分配存储键与元数据行
+// 并签发上传票据；随后客户端凭票据把各分片 PUT 到独立 HTTP(S) 服务（数据面）。
+// 票据明文只在本响应中出现一次，服务端仅存 SHA-256 摘要
+void RequestHandler::processFileUploadCreateRequest(const Packet &packet,
+                                                    const QJsonObject &request)
+{
+    const qint64 sizeBytes = request.value("sizeBytes").toVariant().toLongLong();
+    const qint64 chunkSize = request.value("chunkSize").toVariant().toLongLong();
+    const int chunkCount = request.value("chunkCount").toInt(0);
+    const QString sha256Hex = request.value("sha256").toString().trimmed().toLower();
+
+    // 入参形态先校验、后消费配额（与 send/search 一致，畸形请求不占额度）
+    if (sizeBytes > MaxFileSize) {
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::FileTooLarge, "File exceeds the maximum size");
+        return;
+    }
+    if (!isSha256Hex(sha256Hex)) {
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::InvalidRequest,
+                     "sha256 must be 64 lowercase hex characters");
+        return;
+    }
+    // 分片口径一并校验：chunkCount 必须等于 ceil(sizeBytes / chunkSize)，
+    // 否则可用少报分片数把超大文件拆到上限之外
+    if (!isChunkingValid(sizeBytes, chunkSize, chunkCount)) {
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::InvalidRequest, "Invalid chunking parameters");
+        return;
+    }
+
+    if (!m_fileUploadWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::RateLimited, "Too many uploads, please slow down");
+        return;
+    }
+    if (!m_objectStorage) {
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::FileStorageFailed, "File storage is unavailable");
+        return;
+    }
+
+    // 并发上传配额与插入在 createFileRecord 内以单条 INSERT...SELECT 原子完成：
+    // 分步的"先读计数后插入"在同一用户多设备并发创建时会集体读到"未满"而全部放行
+    const QString blobKey = m_objectStorage->allocateBlobKey();
+    if (blobKey.isEmpty()) {
+        StructuredLogger::event(LogLevel::Warning, "file.blobkey_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId).write();
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::FileStorageFailed, "Failed to allocate storage key");
+        return;
+    }
+
+    bool quotaExceeded = false;
+    const qint64 fileId = m_db->createFileRecord(m_authenticatedUserId, m_currentDeviceId,
+                                                 blobKey, sizeBytes, chunkSize, chunkCount,
+                                                 sha256Hex, MaxConcurrentUploadsPerUser,
+                                                 &quotaExceeded);
+    if (fileId <= 0) {
+        if (quotaExceeded) {
+            sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                         ErrorCode::FileQuotaExceeded, "Too many concurrent uploads");
+            return;
+        }
+        StructuredLogger::event(LogLevel::Warning, "file.create_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("sizeBytes", sizeBytes).write();
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::InternalError, "Failed to create file record");
+        return;
+    }
+
+    const QString ticket = FileCrypto::generateTicket();
+    if (ticket.isEmpty()
+        || !m_db->issueFileTicket(fileId, m_authenticatedUserId, FileTicketKind::Upload,
+                                  FileCrypto::ticketHash(ticket), UploadTicketTtlSeconds)) {
+        // 票据签发失败：把刚建的记录标为已取消，避免留下一条无凭据可用、
+        // 又白占并发配额的 uploading 行
+        m_db->markFileCancelled(fileId);
+        StructuredLogger::event(LogLevel::Warning, "file.ticket_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId).write();
+        sendResponse(packet.requestId, MessageType::FileUploadCreateResponse,
+                     ErrorCode::InternalError, "Failed to issue upload ticket");
+        return;
+    }
+
+    // 不回传 blobKey：HTTP 数据面用 fileId + 票据定位，存储键不出服务端，
+    // 以免它成为可枚举的对象路径
+    QJsonObject data;
+    data["fileId"] = fileId;
+    data["uploadTicket"] = ticket;
+    data["expiresInSeconds"] = UploadTicketTtlSeconds;
+    sendResponse(packet.requestId, MessageType::FileUploadCreateResponse, ErrorCode::Ok,
+                 "Upload created", data);
+}
+
+// M8: 断点续传查询。返回服务端已落盘的分片索引，客户端只补传缺的那几片
+void RequestHandler::processFileUploadQueryRequest(const Packet &packet,
+                                                   const QJsonObject &request)
+{
+    const qint64 fileId = request.value("fileId").toVariant().toLongLong();
+    if (fileId <= 0) {
+        sendResponse(packet.requestId, MessageType::FileUploadQueryResponse,
+                     ErrorCode::InvalidRequest, "Invalid fileId");
+        return;
+    }
+    if (!m_fileOpsWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::FileUploadQueryResponse,
+                     ErrorCode::RateLimited, "Too many file operations, please slow down");
+        return;
+    }
+
+    FileRecord rec;
+    QString reason;
+    const ErrorCode code = requireOwnedFile(fileId, &rec, &reason);
+    if (code != ErrorCode::Ok) {
+        sendResponse(packet.requestId, MessageType::FileUploadQueryResponse, code, reason);
+        return;
+    }
+
+    QJsonArray received;
+    // 仅上传中才去数磁盘：已完成的文件分片已被回收，终态下客户端不需续传信息
+    if (rec.status == FileStatus::Uploading && m_objectStorage) {
+        const QList<int> indexes = m_objectStorage->receivedChunks(rec.blobKey);
+        for (int index : indexes) {
+            received.append(index);
+        }
+    }
+
+    QJsonObject data;
+    data["fileId"] = fileId;
+    data["status"] = QString(rec.status);
+    data["sizeBytes"] = rec.sizeBytes;
+    data["chunkSize"] = rec.chunkSize;
+    data["chunkCount"] = rec.chunkCount;
+    data["receivedChunks"] = received;
+    sendResponse(packet.requestId, MessageType::FileUploadQueryResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// M8: 宣告上传结束。服务端流式组装分片并核对整体 SHA-256，通过后才转 ready
+void RequestHandler::processFileUploadCompleteRequest(const Packet &packet,
+                                                      const QJsonObject &request)
+{
+    const qint64 fileId = request.value("fileId").toVariant().toLongLong();
+    if (fileId <= 0) {
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                     ErrorCode::InvalidRequest, "Invalid fileId");
+        return;
+    }
+    if (!m_fileOpsWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                     ErrorCode::RateLimited, "Too many file operations, please slow down");
+        return;
+    }
+
+    FileRecord rec;
+    QString reason;
+    const ErrorCode code = requireOwnedFile(fileId, &rec, &reason);
+    if (code != ErrorCode::Ok) {
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse, code, reason);
+        return;
+    }
+
+    // 幂等：已完成则直接回成功（完成响应丢失后客户端会重试）
+    if (rec.status == FileStatus::Ready) {
+        QJsonObject data;
+        data["fileId"] = fileId;
+        data["status"] = QString(FileStatus::Ready);
+        data["sizeBytes"] = rec.sizeBytes;
+        data["sha256"] = rec.sha256Hex;
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse, ErrorCode::Ok,
+                     "Upload already complete", data);
+        return;
+    }
+    if (rec.status != FileStatus::Uploading) {
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                     ErrorCode::FileNotReady, "Upload is not in progress");
+        return;
+    }
+    if (!m_objectStorage) {
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                     ErrorCode::FileStorageFailed, "File storage is unavailable");
+        return;
+    }
+
+    const IObjectStorage::FinalizeStatus result =
+        m_objectStorage->finalize(rec.blobKey, rec.sizeBytes, rec.chunkSize,
+                                  rec.chunkCount, rec.sha256Hex);
+    if (result != IObjectStorage::FinalizeStatus::Ok) {
+        // 分片缺失属可恢复：回已收索引，客户端只补传缺的那几片，保留 uploading 状态
+        if (result == IObjectStorage::FinalizeStatus::Incomplete) {
+            QJsonArray received;
+            const QList<int> indexes = m_objectStorage->receivedChunks(rec.blobKey);
+            for (int index : indexes) {
+                received.append(index);
+            }
+            QJsonObject data;
+            data["fileId"] = fileId;
+            data["status"] = QString(rec.status);
+            data["chunkCount"] = rec.chunkCount;
+            data["receivedChunks"] = received;
+            sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                         ErrorCode::FileUploadIncomplete, "Some chunks are missing", data);
+            return;
+        }
+
+        // 长度不符/摘要不符/参数非法属数据故障：重传同一批分片只会得到同样结果，
+        // 标 failed 并回收磁盘；存储故障（写满/改名失败）则保留现场让客户端稍后重试
+        const bool dataFault = result == IObjectStorage::FinalizeStatus::ChunkSizeMismatch
+            || result == IObjectStorage::FinalizeStatus::ChecksumMismatch
+            || result == IObjectStorage::FinalizeStatus::InvalidArguments;
+        if (dataFault) {
+            m_db->markFileFailed(fileId);
+            m_objectStorage->remove(rec.blobKey);
+        }
+        StructuredLogger::event(LogLevel::Warning, "file.finalize_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId)
+            .field("reason", finalizeReasonName(result)).write();
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                     dataFault ? ErrorCode::FileChecksumMismatch : ErrorCode::FileStorageFailed,
+                     dataFault ? "File checksum or chunk layout mismatch"
+                               : "Failed to assemble file");
+        return;
+    }
+
+    if (!m_db->markFileReady(fileId)) {
+        // 对象已组装但元数据未落定：保留 blob 不删，客户端重试完成请求即可
+        // （finalize 对已就绪对象幂等）
+        StructuredLogger::event(LogLevel::Warning, "file.mark_ready_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId).write();
+        sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse,
+                     ErrorCode::InternalError, "Failed to mark file ready");
+        return;
+    }
+
+    QJsonObject data;
+    data["fileId"] = fileId;
+    data["status"] = QString(FileStatus::Ready);
+    data["sizeBytes"] = rec.sizeBytes;
+    data["sha256"] = rec.sha256Hex;
+    sendResponse(packet.requestId, MessageType::FileUploadCompleteResponse, ErrorCode::Ok,
+                 "Upload complete", data);
+}
+
+// M8: 取消上传并回收已收分片。仅适用于上传中的文件
+void RequestHandler::processFileUploadCancelRequest(const Packet &packet,
+                                                    const QJsonObject &request)
+{
+    const qint64 fileId = request.value("fileId").toVariant().toLongLong();
+    if (fileId <= 0) {
+        sendResponse(packet.requestId, MessageType::FileUploadCancelResponse,
+                     ErrorCode::InvalidRequest, "Invalid fileId");
+        return;
+    }
+    if (!m_fileOpsWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::FileUploadCancelResponse,
+                     ErrorCode::RateLimited, "Too many file operations, please slow down");
+        return;
+    }
+
+    FileRecord rec;
+    QString reason;
+    const ErrorCode code = requireOwnedFile(fileId, &rec, &reason);
+    if (code != ErrorCode::Ok) {
+        sendResponse(packet.requestId, MessageType::FileUploadCancelResponse, code, reason);
+        return;
+    }
+
+    // 幂等：已取消再取消仍回成功
+    if (rec.status == FileStatus::Cancelled) {
+        QJsonObject data;
+        data["fileId"] = fileId;
+        data["status"] = QString(rec.status);
+        sendResponse(packet.requestId, MessageType::FileUploadCancelResponse, ErrorCode::Ok,
+                     "Upload already cancelled", data);
+        return;
+    }
+    // 已完成的文件不走本接口：它可能已被消息引用，撤回会让接收方的
+    // 下载票据指向已消失的对象。未被引用的 ready 文件由回收任务处理
+    if (rec.status != FileStatus::Uploading) {
+        sendResponse(packet.requestId, MessageType::FileUploadCancelResponse,
+                     ErrorCode::FileNotReady, "Only an in-progress upload can be cancelled");
+        return;
+    }
+
+    // 先落状态再删磁盘。反序会与并发的完成请求交错出"DB=ready 而 blob 已被删"
+    // 的不可自愈状态（下载票据能正常签发、数据面必然读失败）；本序最坏只留下
+    // "DB=cancelled 而分片仍在盘上"的隐形孤儿，由维护任务的终态回收兜底。
+    // markFileCancelled 带 WHERE status='uploading'，因此并发的取消/完成只有一方
+    // 能赢得状态，输家不会去删赢家刚组装好的对象
+    if (!m_db->markFileCancelled(fileId)) {
+        StructuredLogger::event(LogLevel::Info, "file.cancel_lost_race")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId).write();
+        sendResponse(packet.requestId, MessageType::FileUploadCancelResponse,
+                     ErrorCode::FileNotReady, "Upload is no longer in progress");
+        return;
+    }
+    if (m_objectStorage && !m_objectStorage->remove(rec.blobKey)) {
+        // 状态已落定为 cancelled，磁盘残留不影响正确性（该文件已不可下载），
+        // 由维护任务按终态行幂等重删；此处只告警不回错
+        StructuredLogger::event(LogLevel::Warning, "file.remove_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId).write();
+    }
+
+    QJsonObject data;
+    data["fileId"] = fileId;
+    data["status"] = QString(FileStatus::Cancelled);
+    sendResponse(packet.requestId, MessageType::FileUploadCancelResponse, ErrorCode::Ok,
+                 "Upload cancelled", data);
+}
+
+// M8: 申请下载票据。HTTP 数据面没有会话上下文，凭本票据授权；
+// 票据可在 TTL 内重复使用，以支持 Range 分段与断点续下
+void RequestHandler::processFileDownloadTicketRequest(const Packet &packet,
+                                                      const QJsonObject &request)
+{
+    const qint64 fileId = request.value("fileId").toVariant().toLongLong();
+    if (fileId <= 0) {
+        sendResponse(packet.requestId, MessageType::FileDownloadTicketResponse,
+                     ErrorCode::InvalidRequest, "Invalid fileId");
+        return;
+    }
+    if (!m_fileOpsWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::FileDownloadTicketResponse,
+                     ErrorCode::RateLimited, "Too many file operations, please slow down");
+        return;
+    }
+
+    // 先授权、后取记录：canUserAccessFile 对不存在的 fileId 天然返回 false，
+    // 因此"不存在"与"无权"在此合并为同一响应。fileId 为顺序整数，若先回
+    // FileNotFound/FileNotReady 再回 PermissionDenied，任何已登录用户都能用一个
+    // 循环遍历全库文件的存在性与完成状态（元数据枚举预言机）
+    if (!m_db->canUserAccessFile(fileId, m_authenticatedUserId)) {
+        StructuredLogger::event(LogLevel::Warning, "file.download_denied")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId).write();
+        sendResponse(packet.requestId, MessageType::FileDownloadTicketResponse,
+                     ErrorCode::FileNotFound, "File not found");
+        return;
+    }
+
+    // 授权已过，此处只剩"本人上传但尚未完成"与"已被并发取消/标失败"两种情形，
+    // 都是调用方本就有权知道的状态，不再构成全局预言机
+    const auto rec = m_db->getFileRecord(fileId);
+    if (!rec.has_value() || rec->status != FileStatus::Ready) {
+        sendResponse(packet.requestId, MessageType::FileDownloadTicketResponse,
+                     ErrorCode::FileNotReady, "File is not ready for download");
+        return;
+    }
+
+    const QString ticket = FileCrypto::generateTicket();
+    if (ticket.isEmpty()
+        || !m_db->issueFileTicket(fileId, m_authenticatedUserId, FileTicketKind::Download,
+                                  FileCrypto::ticketHash(ticket), DownloadTicketTtlSeconds)) {
+        StructuredLogger::event(LogLevel::Warning, "file.ticket_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("fileId", fileId).write();
+        sendResponse(packet.requestId, MessageType::FileDownloadTicketResponse,
+                     ErrorCode::InternalError, "Failed to issue download ticket");
+        return;
+    }
+
+    // 回传客户端规划下载所需的分片口径与校验和（均为密文侧元数据，
+    // 不含文件名/MIME 等只在清单里的敏感信息）
+    QJsonObject data;
+    data["fileId"] = fileId;
+    data["downloadTicket"] = ticket;
+    data["sizeBytes"] = rec->sizeBytes;
+    data["chunkSize"] = rec->chunkSize;
+    data["chunkCount"] = rec->chunkCount;
+    data["sha256"] = rec->sha256Hex;
+    data["expiresInSeconds"] = DownloadTicketTtlSeconds;
+    sendResponse(packet.requestId, MessageType::FileDownloadTicketResponse, ErrorCode::Ok,
+                 "Download ticket issued", data);
 }
 
 // Session 验证（P1 安全加固 2026-09-02）

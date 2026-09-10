@@ -19,8 +19,8 @@ XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含�
 ```text
 .
 ├── Chat-Client/          # Qt QML 客户端：登录/主窗口、NetworkManager、KeyStorage、LocalStore（M6.5 本地加密缓存）
-├── Chat-Server/          # Qt Core/Network/Sql 服务端：TCP 监听、请求处理、SQLite
-├── CommonModule/         # 客户端与服务端共用模块：协议编解码、加密（PBKDF2/E2EE）、安全工具
+├── Chat-Server/          # Qt Core/Network/Sql 服务端：TCP 监听、请求处理、SQLite、storage/（M8 对象存储）
+├── CommonModule/         # 客户端与服务端共用模块：协议编解码（含 M8 FileProtocol）、加密（PBKDF2/E2EE/群 E2EE/M8 FileCrypto）、安全工具
 ├── docs/                 # 架构、协议、安全与路线图文档
 ├── tests/                # 自动化测试
 ├── 3rdparty/             # Windows 第三方依赖文件
@@ -84,9 +84,11 @@ Linux/macOS 按上面手动配置的 `-B build` 目录运行 `./build/Chat-Serve
 
 > 客户端自 M6.5 起会在系统 AppData 目录下维护按账号+设备隔离的本地加密缓存（消息/会话以 AES-256-GCM 加密落库，未发送消息跨重启保留）；登出时自动清除。详见 `docs/SECURITY.md` 的本地存储安全章节。
 
+> 服务端自 M8.1 起维护对象存储根目录 `<GenericDataLocation>/XYChat-Server/data/files`（存放客户端加密后的文件密文分片与组装后的对象，可在 `start()` 前调 `Server::setStorageRoot` 改路径）。初始化失败时不阻断启动，但文件相关接口一律 fail-closed 返回 `FileStorageFailed`，启动日志会输出 `Object storage ready at ...` 或失败告警。
+
 ## 测试
 
-配置并构建后运行全部单元测试（CTest 纳入 6 套）：
+配置并构建后运行全部单元测试（CTest 纳入 9 套）：
 
 ```powershell
 # Windows 预设（Build.ps1 / Qt-Debug）
@@ -106,10 +108,13 @@ ctest --test-dir build --output-on-failure
 | --- | --- |
 | `TestPacketCodec` | 帧协议编解码 |
 | `TestEncryptionManager` | PBKDF2 / Token 生成 |
-| `TestDatabaseManager` | 服务端数据层（含群组、V1-V9 迁移、会话偏好与消息编辑/删除） |
+| `TestDatabaseManager` | 服务端数据层（含群组、V1-V10 迁移、会话偏好与消息编辑/删除、M8 文件元数据/票据/访问控制/回收） |
 | `TestSecurity` | TLS 辅助 / 日志脱敏 / NonceCache 重放保护 / RateWindow 限流 / StructuredLogger |
 | `TestLocalStore` | 客户端本地加密缓存、持久化 outbox、Sender Key 与跳序消息密钥缓存 |
 | `TestGroupE2eeCrypto` | 群 Sender-Key 加密原语（M7b）、DoS 上限、乱序解密与跳序密钥缓存 |
+| `TestNetworkManager` | 客户端链路层（编辑/删除响应多槽匹配、88/89 推送发起设备去重、私聊编辑队列化、断线清理） |
+| `TestFileProtocol` | M8 清单编解码与 fail-closed、分片数学、边界与非法入参 |
+| `TestObjectStorage` | M8 对象存储（分片读写/组装校验/断点续传/幂等删除/崩溃残留清理/路径安全） |
 
 另有 `tests/e2e/TestGroupRepro`：双客户端群 E2EE 端到端复现工具，**不纳入 CTest**，需先启动 `Chat-Server` 后手动运行：
 

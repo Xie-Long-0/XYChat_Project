@@ -29,7 +29,7 @@
 | M6.5 | 本地持久化缓存与 outbox | 已完成 | 2026-08-21 | `LocalStore` 按账号+设备隔离的加密本地库（会话/消息/持久化 outbox/解密缓存/同步游标），缓存先行展示 + 游标增量同步 |
 | M7a | 明文群聊 | 已完成 | 2026-08-21 | 群管理五接口（建群/邀请/退群自动转让/踢人层级保护/群信息）、群消息 fan-out + sync_events 兜底、系统消息与群变更通知、按人数回执聚合、客户端群聊 UI（2026-08-22 热修复联调崩溃：QML 会话列表差分更新、移除 add 动画、LocalStore 连接自愈） |
 | M7b | 群聊端到端加密（Sender Keys） | 已完成 | 2026-09-02 | 每发送方每群独立 chain key + Ed25519 签名，HKDF ratchet 派生消息密钥，AES-256-GCM 加密；sender-key 经 M6 pairwise E2EE 分发；`fetch_group_keys`（类型 71/72）；服务端群 envelope fail-closed 校验；DoS 上限防护（`MaxRatchetSteps=2000`/`MaxMessageIteration=1e8`）；双客户端联调通过 |
-| M8 | 媒体、文件与对象存储 | 未开始 | — | 见第 4.1 节 |
+| M8 | 媒体、文件与对象存储 | 进行中 | — | **M8.1（协议与存储地基）已于 2026-09-10 完成**：文件控制面协议（类型 90-99、错误码 3013-3021）、`FileManifest` 与分片数学、`FileCrypto`（每文件独立密钥 + 分片独立 AEAD + 流式 SHA-256 + 票据）、`IObjectStorage`/`LocalFileStorage`、服务端 V10（`files`/`file_tickets`/`messages.file_id`）与五个控制面处理器（限流/鉴权/配额/回收）。**M8.2（数据面 HTTP(S) 与客户端上传下载）与 M8.3（多媒体元数据）未开始**，见第 4.1 节 |
 | M9 | 多端同步与离线一致性 | 已完成 | 2026-09-09 | 已读状态多端同步（`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算）+ `sync_events` 保留清理（30 天/每小时，落后设备 `needsFullSync` 全量回退）（2026-09-04）；特性栈（2026-09-05，提交 `8224464` 于 09-07）：会话置顶/免打扰 + 消息编辑/删除（软删除留墓碑），协议类型 81-87 + V9 迁移 + `conversation_prefs`/`message_edited`/`message_deleted` 三类 sync_events 事件；**2026-09-09 修复群聊编辑解密链路**（事件补 `senderId`/`originDeviceId`、跳序消息密钥缓存、推送覆盖本人其他设备、删除写入 fail-closed），验收标准自此成立 |
 | M10 | 搜索、通知与体验完善 | 未开始 | — | 见第 4.3 节 |
 | M11 | 稳定性、可观测性与运维 | 未开始 | — | 登录限流已在 M2 落地，密钥拉取连接级限流已在 M6/M7b 落地；**M11 前置两项（发消息/搜索限流 + 结构化日志）已于 2026-09-03 提前落地**，其余见第 4.4 节 |
@@ -45,6 +45,7 @@
 | 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed/conversation_prefs/message_edited/message_deleted/read_cursor）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）；已读状态、会话偏好、消息编辑/删除均多端一致（实时推送 + sync_events 兜底）。**未实现**：会话整表删除（无对应接口/事件） |
 | 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer）；结构化日志（StructuredLogger 单行 JSON，M11 前置）；发消息/搜索/密钥拉取/编辑删除/会话偏好连接级限流（RateWindow；`send_message` 30/10s、`search_users` 20/60s、edit/delete 共用 20/60s、prefs 30/60s、`fetch_keys` 60s/20）；编辑/删除事件专用推送类型 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)` |
 | 客户端 UI | QML/Qt Quick + QWindowKit 无边框双窗口（登录/主窗口独立）；Telegram 风格主题（亮/暗切换持久化）；群聊三对话框（建群/群信息/邀请）；群 E2EE 状态横幅；会话右键菜单（置顶/免打扰）与消息右键菜单（编辑/删除） |
+| 文件与媒体传输 | **M8.1 地基（2026-09-10）**：控制面走 TCP 主通道（申请上传/续传查询/宣告完成/取消/下载票据，类型 90-99），数据面规划为独立 HTTP(S) 服务；文件字节客户端加密后上传（每文件独立 AES-256 密钥 + 分片独立 AEAD，nonce/AAD 绑定分片序号），文件名/MIME/明文大小/文件密钥只在 `FileManifest` 内随消息正文经既有 E2EE 分发，服务端只见密文与密文侧元数据；对象存储抽象 `IObjectStorage` + 本地文件系统实现（临时文件+原子改名、256 桶分目录、条带锁串行组装/删除）；服务端 V10 元数据与票据（只存摘要）、访问控制（上传者/会话成员）、并发配额（8）与三轮回收任务。**未实现**：数据面 HTTP(S) 服务、客户端上传/下载与进度 UI、已下载文件的本地缓存与清理、多媒体元数据（缩略图/尺寸/时长，清单字段已预留） |
 
 ## 2. 已完成能力摘要
 
@@ -120,6 +121,7 @@
 > 2026-09-09 销账：① P3「`GroupE2eeCrypto.cpp` 使用 `QStringLiteral`」——本次触碰该文件时顺手改为原始字面量；② 群消息编辑造成的两项高危解密缺陷（事件缺 `senderId`、`iteration` 与 `message_id` 顺序解耦）与 `latestSenderKeyId` 同秒并列不确定性——已修复并补回归用例，详见 §2 M9 与变更记录；③ 「交付前无机器门禁」——CI 工作流已重建。
 > 2026-09-10 销账：① P2「首次运行未验证」——CI 工作流已重建并验证首次运行通过。
 > 2026-09-10 M8 前置 P2/P3 欠账清理（本轮）：① P2「`edit_message`/`delete_message`/`set_conversation_prefs` 三端点无连接级限流」——edit/delete 共用 `RateWindow` 20/60s、prefs 30/60s，超限回 `RateLimited (1003)`；② P2「编辑/删除响应匹配为单发槽位」——改为 `m_pendingEdits`（requestId→上下文多槽）+ `m_pendingDeleteRequestIds` 集合 + 私聊编辑 `m_privateEditQueue` 队列串行消费 `fetch_keys` 传输槽，连续操作不再静默丢弃；③ P2「客户端 `NetworkManager` 无单测」——新增 `TestNetworkManager`（friend 注入，覆盖编辑/删除响应匹配、88/89 推送发起设备去重、私聊编辑队列化、`parseExpiresAt`、游标/偏好信号）；④ P3「编辑/删除复用 Response 类型承载自发推送」——新增专用 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`，客户端不再靠 `requestId == 0` 区分；⑤ P3「无 `AGENTS.md`」——项目根新增构建/测试/风格/完成定义入口。构建全目标通过、`ctest` 7/7 全绿。
+> 2026-09-10 M8.1（文件与对象存储地基）：本轮不销账旧条目（旧欠账均属群 E2EE/大群/TLS/TOFU 领域，与 M8 无交集），仅新增 9 项 M8 相关欠账（见下表末尾）；其中 P2「数据面未实施」与 P2「控制面无自动化测试」为 M8.1 切片的必然产物（属 M8.2 计划范围），登记目的是避免「M8.1 已完成」被误读为文件消息已可用。`ctest` 9/9 全绿。
 
 | 优先级 | 类别 | 条目 | 来源 | 影响/说明 |
 | --- | --- | --- | --- | --- |
@@ -131,30 +133,58 @@
 | P2 | 安全 | TOFU 无带外验证；无密钥备份/设备间迁移 | M6 | 首次通信无法抵抗服务端中间人；更换设备/清数据后历史消息不可恢复（产品已决策接受） |
 | P2 | 安全 | 非 Windows 平台私钥/存储密钥明文回退 | M6/M6.5 | DPAPI 仅 Windows；Linux/macOS 部署需接平台密钥环（libsecret/Keychain） |
 | P3 | 功能 | 大群拉取/游标模式；改群名接口 | M7a 遗留 | 当前仅小群直推；`setGroupName` 数据层就绪、接口层未开放 |
-| P3 | 功能 | 桌面通知；简化图片消息 | M6.5 提前项（未实施） | 分别归属 M10/M8 完整实现 |
+| P3 | 功能 | 桌面通知；简化图片消息 | M6.5 提前项（未实施） | 分别归属 M10/M8 完整实现；图片消息的协议与存储地基已由 M8.1 提供（清单预留 `width`/`height`/`thumb`），仍待 M8.2 客户端与 M8.3 缩略图管线 |
 | P3 | 工程 | 跳序消息密钥缓存按整块 blob 落库，大跳跃场景有写放大 | 2026-09-09 CodeReview | `decryptGroupMessageObject` 每次解密都会 `loadSkippedMessageKeys`（整块解密），且缓存非空时每条消息重写整块（重新序列化+加密+写库），近似 O(N × cacheSize)；上限 1000 条时单块可达数十 KB。典型编辑场景（小跳跃）影响微小，新设备/长期离线的大跳跃补收才明显。建议改为每跳序密钥一行（PK 含 iteration）+ 增量写入，或提升为批次内存态缓存 |
 | P3 | 安全 | 跳序密钥序列化时以 base64 `QString` 形态短暂驻堆，无法可靠清零 | 2026-09-09 CodeReview | `SecureMemory::wipe` 对 COW/只读的 `QString` 缓冲无效，与现有 chain key/正文落库路径（`encryptText`/`decryptText` 均返回 `QString`）为同一固有限制；如需更严格的密钥卫生，序列化应走 `QByteArray` 并用后 wipe |
 | P2 | 工程 | 编辑/删除在途请求（`m_pendingEdits`/`m_pendingDeleteRequestIds`）无超时清扫 | 2026-09-10 CodeReview | 若服务端漏答且连接未断（无 disconnect 触发清理），已发出的编辑/删除条目会残留至下次登出/断线；`requestId` 单调不回绕不会误配，仅无信号的内存泄漏（受 edit/delete 20/60s 限流天然封顶）。建议加 30s 超时 `erase` + 失败上报（镜像 token 续期看门狗） |
 | P3 | 工程 | 私聊编辑额外占用一次共享 `fetch_keys` 预算 | 2026-09-10 CodeReview | 每条私聊编辑 = 1 次 `fetch_keys`（与发送/fetch_group_keys 共设 20/60s 窗口），编辑自身窗口亦 20/60s；混合场景可能先撞 `fetch_keys` 上限使编辑以 `RateLimited` 失败，实际有效编辑率低于标称。与 P2 三端点限流相关，待真实用量评估后调参 |
 | P3 | 工程 | `TestNetworkManager` 未覆盖 pump 与编辑解密回退路径 | 2026-09-10 CodeReview | 现有 10 用例锁定 requestId 多槽匹配/消费、去重、断线清理；但 `pumpPrivateEditFetch`+`handleFetchKeysResponse` 编辑分支（需模拟 fetch 响应、会写 socket）与 88 推送“解密失败不写空”幂等回退不变量因难构造无网络环境而未断言；属测设完善，不阻塞 M8 |
+| P2 | 工程 | M8 数据面未实施，票据校验/消费无生产调用点 | 2026-09-10 M8.1 | `validateFileTicket`/`markFileTicketUsed` 目前仅被单测覆盖，`RequestHandler` 无调用点；`putChunk`/`readRange`/`finalize` 同样只能经控制面的完成/查询路径间接触发。属 M8.2 计划范围，登记以免“M8.1 已完成”被误读为文件消息已可用 |
+| P2 | 工程 | 对象存储为单机本地文件系统，无副本/无冗余 | 2026-09-10 M8.1 | `LocalFileStorage` 磁盘损坏即文件丢失；限流与并发配额为单实例/单库口径，多实例部署需换共享对象存储（`IObjectStorage` 已抽象，可接 S3/MinIO）并把配额改为全局口径 |
+| P2 | 工程 | 文件控制面五处理器无自动化测试 | 2026-09-10 M8.1 | `RequestHandler` 的 M8 处理器（鉴权与入参校验顺序、限流、幂等、finalize 结果分类、枚举预言机合并）只有人工复核；数据层（13 用例）与存储层（19 用例）已覆盖。与 M9 期“客户端 `NetworkManager` 无单测”同源，建议随 M8.2 补 handler 级测试（可复用 `TestNetworkManager` 的 friend 注入范式） |
+| P3 | 功能 | 无按用户的存储用量配额 | 2026-09-10 M8.1 | 现有约束为单文件 ≤2 GiB + 并发上传 ≤8 + 48 小时超期回收，但已就绪文件可无限累积（仅受消息删除联动回收影响）；需按用户/按会话的字节配额与用量统计接口 |
+| P3 | 安全 | 下载票据在 TTL 内可重复使用 | 2026-09-10 M8.1 | 为支持 `Range` 分段与断点续下而刻意允许（TTL 300 秒），泄露后可在窗口内重放下载该文件；一次性消费（`markFileTicketUsed`）与分段下载互斥，属取舍。若需更严可改为每段单独签发或绑定数据面会话 |
+| P3 | 工程 | `putChunk` 不入条带锁 | 2026-09-10 CodeReview | 依赖 `finalize` 的逐片长度 + 整体 SHA-256 关卡兜底：并发写同一片只会导致组装判失败（要求重传），不会把损坏对象推上下载路径；代价是极端并发下多一次重传 |
+| P3 | 工程 | 回收查询每轮 `limit=100`，积压大时需多轮收敛 | 2026-09-10 M8.1 | `getStaleUploads`/`getTerminalFiles`/`getUnreferencedReadyFiles` 均为每轮上限 100 行、每小时一轮；大量遗留时收敛慢且无积压告警指标 |
+| P3 | 功能 | 文件消息不可编辑，缺“撤回重发”替代路径 | 2026-09-10 M8.1 | `processEditMessageRequest` 对 `fileId > 0` 的消息一律回 `InvalidRequest`：编辑只能改写正文而 `messages.file_id` 不变，会使清单里的 `fileId`/密钥与服务端授权、以及客户端以 `file_id` 判别清单的口径三者失配（客户端可能拿着旧 `fileId` 去申请下载票据）。正确替代应为“删除原消息 + 重发新文件消息”，属 M8.2 客户端 UI 范围（需引导与原子化），当前仅服务端拦住 |
+| P3 | 工程 | 文件回收任务在主线程做同步磁盘 I/O | 2026-09-10 CodeReview | `pruneFileUploads` 由 Server（主）线程的定时器驱动，该线程同时承担 `incomingConnection` 与 `onMessageForUser` 路由；`remove()`（内部 `removeRecursively`）为阻塞调用，三轮合计每轮最多约 300 次删除，大文件/多分片目录时可能短时阻塞连接接受与消息转发。量级有界（每小时、limit=100）且定时器不重入，属响应性隐患而非正确性缺陷；积压增大后可移至独立维护线程或工作池 |
 
 ## 4. 未来里程碑规划
 
-### 4.1 M8：媒体、文件与对象存储（4-8 周）
+### 4.1 M8：媒体、文件与对象存储（4-8 周，分三切片；**M8.1 已于 2026-09-10 完成**）
 
 - **目标**：支持图片、语音、视频和文件消息。
 - **依赖**：M3/M7a 消息通道（已完成）；媒体 E2EE 依赖 M6/M7b 加密基础（已完成）。
-- **任务**：
-  - 文件上传协议：分片、校验、断点续传。
-  - 服务端文件元数据表（`files`）与对象存储接口。
-  - 图片缩略图、视频封面、语音时长。
-  - 客户端上传/下载进度、失败重试、取消。
-  - 大文件不走消息 TCP 主通道，使用独立 HTTP(S) 上传下载服务。
-  - 文件内容客户端加密后上传（复用 envelope/Sender-Key 体系）。
-- **验收标准**：
-  - 发送 1MB 图片和 100MB 文件稳定成功。
-  - 断网后恢复可续传。
-  - 客户端能清理缓存并重新下载。
+- **切片划分依据**：原 4-8 周的整块里程碑含三个可独立验收、依赖方向单一的切片，拆开后可逐片入库与回滚，避免长期悬置分支。
+
+#### M8.1 协议与存储地基（已完成，2026-09-10）
+
+- 交付：
+  - **协议层**：`CommonModule/protocol/FileProtocol`（消息类型 90-99、错误码 3013-3021、`FileManifest` 编解码与 fail-closed 校验、分片数学 `chunkCountFor`/`isChunkingValid`/`expectedChunkBytes`、体积/分片/票据/配额常量）；`send_message` 新增可选 `fileId` 并在响应/推送/事件/历史读取四条路径回传。
+  - **加密原语**：`CommonModule/encryption/FileCrypto`（每文件独立 AES-256 密钥 + 12 字节 nonce 前缀；第 i 片 nonce = `iv` 后 4 字节 XOR 大端 `i`、AAD = 大端 `i`；流式 SHA-256；票据生成与摘要）；`E2eeCrypto` 新增带 AAD 的 AES-GCM 原语。**刻意不复用消息 ratchet**，避开 M9 编辑踩过的“链已推进→早先分片永久不可解”不可逆损坏。
+  - **对象存储**：`Chat-Server/storage/IObjectStorage` 抽象（allocateBlobKey/putChunk/receivedChunks/readChunk/finalize/isFinalized/blobSize/readRange/remove）+ `LocalFileStorage` 实现（临时文件+原子改名、blobKey 前两位分 256 桶、同键 `finalize`/`remove` 条带锁串行、`finalize` 流式组装并逐片核长度 + 整体核 SHA-256、结果六分类）。
+  - **数据层**：V10 迁移（`files`、`file_tickets`、`messages.file_id` 与三个索引）；文件元数据 CRUD（创建含**原子并发配额**、状态迁移终态不可逆、票据签发/校验/消费/清理、访问控制 `canUserAccessFile`、回收查询）；`sendMessage` 将“文件仍为 `ready`”下推为 `INSERT` 守卫子查询（单语句原子，消除与维护回收的跨线程竞态，守卫未命中回 `FileNotReady`）。
+  - **控制面**：五个处理器（申请上传/续传查询/宣告完成/取消/下载票据），两个新限流窗口（新建上传 20/60s、其余文件操作共用 60/60s）、归属与枚举预言机防护、幂等（完成/取消）、finalize 结果分类回不同错误码；`Server` 创建并注入存储、维护连接新增 `pruneFileUploads` 三轮回收。
+- 验证：新增 `TestFileProtocol`（30 用例：清单往返/fail-closed/分片数学/边界）与 `TestObjectStorage`（19 用例：分片读写/组装校验/断点续传/幂等删除/崩溃残留清理/路径安全）；`TestDatabaseManager` 新增 14 个 M8 用例（V10 表列/记录读写/状态护栏/配额原子性/超期与终态与无引用回收选择/票据/访问控制/`fileId` 四路径/插入守卫）共 63 passed；`ctest` 9/9 全绿（9 套共 227 个用例）。**两轮 CodeReview 子代理审查**：第一轮（M8.1 主体）无 P0，2 项 P1（元数据枚举预言机、存储层并发）、1 项 P2（配额 TOCTOU）、1 项 P3（终态行与孤儿数据无回收路径）均已修复；第二轮（回收增量）无 P0/P2，1 项 P1（“终态行不可能再被引用”的不变量在跨线程下不成立，可导致仍被引用文件的磁盘数据被删）已修：发送侧把文件状态下推为 `INSERT` 守卫子查询 + 回收侧删盘前再判引用（双侧防护），并补 `sendMessageGuardsFileReadyStateAtomically` 回归用例；2 项 P3（配额用例残留绝对值断言、回收在主线程做同步 I/O）前者已修、后者登记入 §3。
+- 已知限制：单机本地文件系统存储（无副本/无冗余）；数据面未实施前控制面无法单独产生可用的端到端文件消息；无自动化文件传输集成测试（均见 §3）。
+
+#### M8.2 数据面与客户端（未开始）
+
+- 任务：
+  - 独立 HTTP(S) 上传下载服务（拟用 `QHttpServer`，已核实本机 Qt 安装含该模块）：凭 `fileId` + 票据授权、按 `expectedChunkBytes` 拒绝长度不符的 PUT、支持 `Range` 分段与断点续下、下载恒按二进制密文投递。
+  - 客户端上传/下载引擎：分片加密与流式上传、进度信号、失败重试（按 `receivedChunks` 只补传缺片）、取消、下载后整体 SHA-256 自校验与逐片解密。
+  - 客户端 UI：附件选择与发送、上传/下载进度与取消、文件消息气泡（图标/文件名/大小/状态）、保存到本地。
+  - 已下载文件的本地缓存与清理（需与 `LocalStore` 加密口径一致：磁盘上不得出现未授权明文，或明确限定为用户显式保存目录）。
+  - 文件消息的编辑限制与替代路径：服务端已拦住（带 `fileId` 的消息不可编辑正文），本切片需提供“删除原消息 + 重发新文件消息”的客户端组合流程与 UI 引导（见 §3 P3）；删除联动已落地（软删除后附件由回收任务第三轮清理）。
+- 验收标准：
+  - 发送 1MB 图片和 100MB 文件稳定成功；断网后恢复可续传；客户端能清理缓存并重新下载。
+  - 服务端全程不可见明文与文件名/MIME（日志与磁盘均需核实）。
+  - 双客户端联调（私聊 + 群聊各一例），含离线补收与多端重复下载。
+
+#### M8.3 多媒体元数据（未开始，依赖 M8.2）
+
+- 任务：图片缩略图与尺寸、视频封面与时长、语音时长（需引入 QtMultimedia，已核实本机安装）；清单预留字段 `width`/`height`/`durationMs`/`thumb` 的生成与渲染；大于 `MaxThumbnailBytes`（4096）的缩略图改走独立文件上传并在清单里引用其 `fileId`；QML 图片/视频/语音气泡与播放器。
+- 验收标准：图片消息在会话列表与气泡内展示缩略图；语音/视频展示时长；全部多媒体元数据服务端不可见。
 
 ### 4.2 M10：搜索、通知与体验完善（4-6 周）
 
@@ -188,15 +218,15 @@
   - 服务端异常重启后不丢已确认消息。
   - 压测报告可指导扩容。
 
-## 5. 推荐执行顺序（2026-09-02 重排，2026-09-09 更新）
+## 5. 推荐执行顺序（2026-09-02 重排，2026-09-10 更新）
 
 下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**：
 
 1. 解决历史遗留 P2 欠账。
-2. **M8 媒体文件**。**前置条件（2026-09-09 审查提出，2026-09-10 已闭环）**：本轮新增的四项 P2 欠账（三端点限流、编辑/删除并发护栏、CI 首次运行验证、`NetworkManager` 层单测）已全部完成，叠加两项 P3（专用推送类型 88/89、`AGENTS.md`）一并销账；`ctest` 7/7 全绿。M8 正式启动的唯一阻塞已解除，可按 §4.1 规划推进（遗留的大群分发超限/先落盘后分发/TLS 集成测试等均不阻塞 M8，见 §3）。
+2. **M8 媒体文件**（进行中）。**前置条件（2026-09-09 审查提出，2026-09-10 已闭环）**：四项 P2（三端点限流、编辑/删除并发护栏、CI 首次运行验证、`NetworkManager` 层单测）与两项 P3（专用推送类型 88/89、`AGENTS.md`）已全部销账。**M8.1（协议与存储地基）已于 2026-09-10 完成**（见 §4.1），`ctest` 9/9 全绿；下一切片为 **M8.2（数据面 HTTP(S) 与客户端上传下载）**，它同时会销账本轮新增的三项 P2（数据面未实施、票据无生产调用点、控制面无自动化测试），建议优先于其他候选。遗留的大群分发超限/先落盘后分发/TLS 集成测试等均不阻塞 M8.2（见 §3）。
 3. **M10 搜索/通知/体验**。
 
-## 6. 目录结构（2026-09-09 与实际仓库同步）
+## 6. 目录结构（2026-09-10 与实际仓库同步）
 
 ```text
 XYChat_Project/
@@ -204,8 +234,8 @@ XYChat_Project/
   3rdparty/               # 预编译依赖：QWindowKit、OpenSSL、zlib（include/lib/bin/src）
   cmake/                  # XYChatOpenSSL.cmake（按构建配置绑定 Release/Debug OpenSSL 导入库）
   CommonModule/           # 客户端/服务端共享模块
-    protocol/             # Packet/PacketCodec（消息类型 1-89，错误码 1000-9002）
-    encryption/           # EncryptionManager/E2eeCrypto(M6)/GroupE2eeCrypto(M7b)
+    protocol/             # Packet/PacketCodec（消息类型 1-99，错误码 1000-9002）、FileProtocol(M8)
+    encryption/           # EncryptionManager/E2eeCrypto(M6)/GroupE2eeCrypto(M7b)/FileCrypto(M8)
     security/             # LogSanitizer/SecureMemory/TlsHelper/StructuredLogger(M11 前置)
   Chat-Client/
     core/                 # NetworkManager/KeyStorage/LocalStore/ThemeSettings
@@ -220,20 +250,23 @@ XYChat_Project/
     main.cpp
   Chat-Server/
     core/                 # Server/RequestHandler/NonceCache/RateWindow(M11 前置)
-    database/             # DatabaseManager 与迁移（当前 V9）
+    database/             # DatabaseManager 与迁移（当前 V10）
+    storage/              # M8：IObjectStorage 抽象 + LocalFileStorage（分片/组装/校验/回收）
     main.cpp
   docs/                   # ARCHITECTURE/PROTOCOL/ROADMAP/SECURITY
   tests/
     unit/                 # TestPacketCodec/TestEncryptionManager/TestDatabaseManager/
-                          # TestSecurity/TestLocalStore/TestGroupE2eeCrypto/TestNetworkManager（均纳入 CTest）
+                          # TestSecurity/TestLocalStore/TestGroupE2eeCrypto/TestNetworkManager/
+                          # TestFileProtocol/TestObjectStorage（均纳入 CTest，共 9 套）
     e2e/                  # TestGroupRepro（双客户端群 E2EE 复现，手动运行，不纳入 CTest）
   certs/                  # 开发证书生成脚本（运行时证书自动生成于可执行文件同级 certs/）
+  AGENTS.md               # 代理/新人工程入口：构建测试命令、诊断技巧、风格约定、完成定义
   Build.ps1               # 免维护构建入口：vswhere 定位 VS + Launch-VsDevShell 载入工具链后调 cmake 预设
 ```
 
 ## 7. 数据库演进
 
-- **服务端**（SQLite，版本化迁移，当前 V9）：`schema_version`、`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`（V7 增 `name`）、`conversation_members`（V7 增 `role`、V9 增 `pinned`/`muted`）、`messages`（V9 增 `edited_at`/`deleted`）、`message_receipts`、`sync_events`、`device_identity_keys`（M6，仅公钥）、`prekeys`（M6，仅公钥）、`sync_meta`（V8，清理水位线）。中长期若需多人并发/多实例部署，迁移 PostgreSQL/MySQL，并尽早抽象 Repository/DAO。
+- **服务端**（SQLite，版本化迁移，当前 V10）：`schema_version`、`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`（V7 增 `name`）、`conversation_members`（V7 增 `role`、V9 增 `pinned`/`muted`）、`messages`（V9 增 `edited_at`/`deleted`，V10 增 `file_id`）、`message_receipts`、`sync_events`、`device_identity_keys`（M6，仅公钥）、`prekeys`（M6，仅公钥）、`sync_meta`（V8，清理水位线）、`files`（V10/M8：密文侧元数据，`blob_key` UNIQUE + 状态机 + 两个回收/配额索引）、`file_tickets`（V10/M8：只存票据 SHA-256 摘要，无明文列）。中长期若需多人并发/多实例部署，迁移 PostgreSQL/MySQL，并尽早抽象 Repository/DAO；对象存储已以 `IObjectStorage` 抽象，多实例部署时需同步换为共享存储。
 - **客户端 LocalStore**（SQLite，按账号+设备隔离，正文加密落库）：`schema_meta`、`messages`（M9 增 `edited_at`/`deleted`）、`conversations`（含群名/成员数、M9 增 `pinned`/`muted`，置顶会话按 pinned DESC 排序）、`outbox`（含 `conversation_id`）、`decrypt_cache`、`meta`（同步游标）、`sender_keys`（M7b：chain key/Ed25519 签名密钥对/迭代数，登出保留；“最新密钥”按 `rowid DESC` 选取）、`sender_key_skipped`（2026-09-09：跳序消息密钥缓存，整体密文 blob，与 `sender_keys` 同主键维度，退群一并清理）。
 
 ## 8. 安全注意事项
@@ -249,6 +282,13 @@ XYChat_Project/
 - 事件/推送 payload 必须携带解密所需的全部寻址字段：群聊密文的解密依赖（群, 发送者, 设备, keyId）四元组，缺 `senderId` 即等同不可解；新增会改动已有密文的事件时，需同时考虑历史已落库事件的兼容路径。
 - 服务端自发推送应覆盖操作者本人的其他设备（多端一致），由客户端按发起设备去重，而不是在服务端排除整个用户。
 - 以时间戳作“最新”排序依据时必须确认精度：秒级时间戳 + 随机值作并列破口等于把选择结果交给运气（`latestSenderKeyId` 教训）；应改用单调递增序号（如 SQLite `rowid`）。
+- 条件判定与状态迁移必须合并为单条 SQL 语句（M8 配额 TOCTOU 教训）：“先读计数后插入”的分步写法在多设备/多线程并发时会集体读到“未满”而全部放行，使软配额形同虚设；同理，“先查引用再删行/改状态”也会让并发请求在两步之间建立引用，随后数据被销毁。
+- 声称“某状态迁移后不可能再发生 X”类不变量时，必须确认判定与写入在同一原子单元内（M8 回收教训：“终态行不可能再被引用”因发送侧校验与 INSERT 分属两步而不成立）。跨线程窗口无法用“读得够晚”消除，只能两侧各上一道防护：写入侧把条件下推为单语句守卫，销毁侧在执行前再判一次；并且让最坏结果落在“可修复”而非“不可恢复”一侧。
+- 销毁性操作必须排序：“先保证不产生孤儿数据、再销毁”。删磁盘与删元数据不可兼得时，宁可留下可被下一轮回收的隐形孤儿，也不得产出“元数据指向已消失数据”的不可自愈状态（M8 取消上传与三轮回收均按此排序）。
+- 错误分类必须区分“数据故障”与“存储/瞬时故障”：前者重传同批输入只会得到同样结果（应标失败并回收），后者应保留现场让调用方重试；把写满/改名失败误报成校验和错误会造成客户端无限重传（M8 `finalize` 六分类教训）。
+- 顺序整数主键（如 `fileId`）对外暴露时，“不存在”与“无权”必须合并为同一错误码，否则任何已登录用户可遍历判定他人资源的存在性与状态（元数据枚举预言机）；同理，票据校验的多种失败原因也不得向调用方区分。真实原因只进服务端日志。
+- 客户端加密后再上传的大对象应使用**分片独立 AEAD 且把分片序号绑入 nonce/AAD**，不要复用消息 ratchet：链式密钥一旦推进，早先分片就永久不可解，而文件需要可重复下载与可转发（M8 刻意与 M9 编辑教训对齐的取舍）。
+- 存储路径拼接绝不使用用户可控字符串：存储键由服务端分配且每次访问前重校形态，从根源排除路径穿越；写入统一走“临时文件 + 原子改名”，避免崩溃/写满留下被当作完整数据的半截文件。
 
 ## 9. 每个迭代的完成定义
 
@@ -295,3 +335,4 @@ XYChat_Project/
 | 2026-09-09 | 周度审查 + M9 群编辑解密链路修复 + CI 重建 | 审查结论：工作区干净且与 origin/master 同步（上轮 M7b 悬置风险已闭环）；发现 8 处 ROADMAP 与代码/仓库不符、两项高危代码缺陷、一项被长期误归因的非确定性单测。修复：① **群编辑解密失败（R1）**——服务端 `message_edited`/`message_deleted` 事件与推送补 `senderId`（群密文靠它定位 Sender Key，旧实现缺失使编辑后的群消息在所有接收端不可解、且解密失败前已清缓存 → 本地已可读正文被清空）与 `originDeviceId`；客户端删除 `msgObj["senderId"] = 0` 硬编码，`decryptGroupMessageObject` 增按（群, 设备, keyId）反查发送者的兼容路径（修复前已落库的无 `senderId` 事件仍可解）；② **ratchet 与消息 id 顺序解耦（R2）**——编辑重加密使 `iteration` 大于其后发送的消息，离线按 `ORDER BY m.id ASC` 补收时先推进链状态会使后续消息命中回滚拒绝而永久不可解；`GroupE2eeCrypto::decryptMessage` 增可选跳序消息密钥缓存（Signal skipped-message-keys 语义，`MaxSkippedMessageKeys=1000` 超限淘汰最小 iteration，命中即一次性消费，伪造输入不污染缓存与链状态，仅解密+验签全部通过后提交），`LocalStore` 新增 `sender_key_skipped` 表加密持久化（磁盘无可读密钥）并随退群清理；③ **多端实时一致（R6）**——编辑/删除推送改为覆盖操作者本人（其名下其他设备），发起设备由客户端按 `originDeviceId` 去重（实时推送与 `sync_events` 补偿两路径）；④ **删除写入 fail-closed（R5附带）**——`deleteMessage` 返回值不再忽略，失败时返 `InternalError`、不广播事件、记 `message.delete_failed` 结构化日志；⑤ **TestLocalStore 非确定性根因更正**——`senderKeyLatestSelectsMostRecent` 约 50% 失败的真实原因是 `latestSenderKeyId` 按秒级 `updated_at` 排序并以随机 hex `key_id` 作并列破口（与 DPAPI/沙箱无关，上表四行归因均已标注更正）；改按 `rowid DESC` 选取（INSERT OR REPLACE 每次写入取得更大 rowid，“最新”= 最近一次写入）、`updated_at` 升为毫秒精度仅供诊断，修复后连跑 20 次 0 失败；⑥ **CI 重建**——恢复 `.github/workflows/cmake.yml`（windows-latest + Qt 6.8.3，configure/build/ctest，失败时上传 `LastTest.log`），销账“无机器门禁”并登记“首次运行未验证”为 P2；⑦ 顺手销账 `GroupE2eeCrypto.cpp` 两处 `QStringLiteral` 风格欠账。新增 9 个回归用例（`TestGroupE2eeCrypto` +6：乱序解密/一次性消费/伪造不污染缓存/伪造不烧毁缓存/容量淘汰/编辑重加密回归，共 27 passed；`TestLocalStore` +2：跳序密钥密文落库与维度隔离/按设备+keyId 反查发送者，并加固“最新密钥”用例，共 24 passed、连跑 20 次 0 失败）；构建全目标通过、`ctest` 6/6（连跑 3 轮全绿）。**CodeReview 子代理审查**：无 P0；P1（跳序缓存命中路径“先消费后认证”，伪造消息可烧毁合法密钥）与 P2（`removeSenderKeysForGroup` 两表删除非原子）已修正（改为认证成功后才 erase，且 erase 后再 wipe 才能真正清零底层缓冲；两表删除改为同一事务，事务不可用时降级为尽力清理），并补 `forgedMessageDoesNotConsumeSkippedKey` 用例锁定该语义。新增欠账（§3）：三端点无连接级限流（O(N) 事件放大）、编辑/删除单发槽位并发丢弃、`NetworkManager` 层无单测、85/87 复用推送类型、无 `AGENTS.md`、跳序缓存整块 blob 落库的写放大、密钥 base64 `QString` 短暂驻堆。文档同步：ROADMAP（§1 标题日期与 M0/M9 行、§1.2 本地存储/客户端 UI、§2 M0 更正 + 新增 M9 摘要、§3 销账与 8 项新登记、§4.2 验收注记、§4.3 M10 去重、§5 前置条件、§6 目录树、§7 LocalStore 新表、§8 四条新安全约束、§11 本行）、PROTOCOL（事件 payload 与 84-87 推送语义）、SECURITY（编辑删除章节 + 跳序密钥缓存的前向安全权衡）、README（构建/测试入口与 V9） |
 | 2026-09-10 | M8 前置 P2/P3 欠账清理 | 按 §5 前置条件逐项清理本轮新增欠账，为 M8 启动解除阻塞。**Phase A（安全快速修复）**：① 三端点限流——`RequestHandler` 新增 `m_editDeleteWindow`（edit/delete 共用 20/60s）与 `m_prefsWindow`（prefs 30/60s）两个 `RateWindow`，在 `processEditMessageRequest`/`processDeleteMessageRequest`/`processSetConversationPrefsRequest` 鉴权后、业务前检查，超限回 `RateLimited (1003)`；② 专用推送类型——`Packet.h` 新增 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`，服务端编辑/删除广播的自发推送改用对应新类型（requestId 保持 0），客户端 `handlePacket` 新增两 case 路由至专用处理器，移除靠 `requestId==0` 区分响应与推送的 hack。**Phase B（客户端数据完整性）**：① 编辑/删除响应匹配队列化——`m_pendingEditMessageRequestId`/`m_pendingDeleteMessageRequestId` 单发槽改为 `m_pendingEdits`（QHash requestId→EditContext 多槽）+ `m_pendingDeleteRequestIds`（QSet）+ 私聊编辑 `m_privateEditQueue`（QQueue）经 `m_editFetchInFlight` 串行消费 `fetch_keys` 传输槽（镜像 `m_pendingSendByRequestId`/healing 队列范式）；`handleFetchKeysResponse` 编辑分支改队列感知、异步回调按 requestId 取上下文不再互相覆盖；`resetAuthState` 清空新容器；② 项目根新增 `AGENTS.md`（构建/测试/诊断/风格/完成定义）。**Phase C（测试基础设施）**：新增 `TestNetworkManager`（`QTEST_GUILESS_MAIN` + `friend class` 注入私有处理器/状态，LocalStore 不打开使 store 分支安全跳过、信号仍同步可捕），9 用例覆盖 `parseExpiresAt`、编辑/删除响应 requestId 多槽匹配与消费、88/89 推送发起设备去重（含同机不同账号不误删）、私聊编辑队列化不被覆盖、群编辑无密钥优雅失败、已读游标/会话偏好信号；已纳入 CTest。构建全目标通过、`ctest` 7/7 全绿。**CodeReview 子代理审查发现两项 P1（见下一行）并已修复**。遗留不阻塞 M8 的大群分发超限/先落盘后分发/TLS 集成测试/nonce/TOFU/非 Windows 保持登记。文档同步：ROADMAP（§1 标题日期、§1.2 传输安全、§2 M9 已知限制、§3 销账 5 行、§5 前置条件闭环、§6 目录树消息类型 1-89 与新测试、§11 本行）、PROTOCOL（新增 88/89 类型、编辑/删除推送语义与三端点限流）、SECURITY（三端点限流 + 编辑/删除并发安全） |
 | 2026-09-10 | M8 前置清理 CodeReview 修复 | 对本轮 Phase A/B/C 改动运行 CodeReview 子代理审查。**无 P0**（构建/崩溃/越权级）；核查确认 A1 限流位置/参数、A2 广播与响应拆分、B1 requestId 匹配/去重（senderId+originDeviceId 双比）/编辑解密缓存（不预先清、失败不写空，无 M9 式不可逆烧正文）、resetAuthState 清理均正确。发现并修复 **两项 P1（均会复现本次想消除的“编辑静默丢失”）**：① **断线永久堵死编辑泵**——`onDisconnected`（自动重连不经 `resetAuthState`）未清新增容器，若私聊编辑的 `fetch_keys` 在途时断网，`m_editFetchInFlight` 永卡 true 使 `pumpPrivateEditFetch` 此后恒返回 → 本会话所有后续私聊编辑静默丢失，且残留队列头会劫持重连后发送链路的密钥包；修复：`onDisconnected` 一并复位 `m_editFetchInFlight`+清空 `m_privateEditQueue`/`m_pendingEdits`/`m_pendingDeleteRequestIds`，并对已入队/已发出未收响应的编辑/删除上报失败（新加 `disconnectClearsInFlightEditState` 回归用例锁定）；② **泵送契约不成立**——`flushOutbox` 占用 `fetch_keys` 传输槽后的非编辑响应路径仅调 `flushOutbox`、从不 `pumpPrivateEditFetch`，队首编辑可被无限期搁置；修复：在 `flushOutbox` 收口处补 `pumpPrivateEditFetch()`（内部再判槽空闲，无重入）。另采纳 P3：三端点 `allow()` 下移至入参形态校验之后（与 send/search 一致，避免畸形请求耗配额）。遗留 P2（`m_pendingEdits` 无超时 sweep，靠断线清理已覆盖主要静默丢失面）与 P3（私聊编辑另计一次 `fetch_keys` 预算；泵送/编辑解密回退的更细单测）登记不阻塞 M8。修复后构建全目标通过、`ctest` 7/7（`TestNetworkManager` 新增至 10 用例） |
+| 2026-09-10 | M8.1 完成：文件与对象存储地基 | 按 §4.1 拆分的第一个切片（协议与存储地基）落地，不含数据面与客户端 UI。**① 协议层**：`CommonModule/protocol/FileProtocol`（消息类型 90-99、错误码 3013-3021、`FileManifest` 编解码与 fail-closed 校验、分片数学 `chunkCountFor`/`isChunkingValid`/`expectedChunkBytes`、体积/分片/票据/配额常量，客户端与服务端共用）；`send_message` 新增可选 `fileId`（`checkMessageFile` 校验存在/本人/ready，存储未注入时 fail-closed 回 `FileStorageFailed` 而不降级投递）并在响应/推送/事件/历史读取四条路径回传；带 `fileId` 的消息不可编辑正文。**② 加密原语**：`CommonModule/encryption/FileCrypto`（每文件独立 AES-256 密钥 + 12 字节 nonce 前缀，第 i 片 nonce = `iv` 后 4 字节 XOR 大端 `i`、AAD = 大端 `i`，流式 SHA-256，票据生成与摘要）；`E2eeCrypto` 新增带 AAD 的 AES-GCM 原语（旧接口不变）。**刻意不复用消息 ratchet**，避开 M9 编辑踩过的“链已推进→早先分片永久不可解”。**③ 对象存储**：`Chat-Server/storage/IObjectStorage` 抽象 + `LocalFileStorage`（临时文件+原子改名、blobKey 前两位分 256 桶、同键 `finalize`/`remove` 条带锁串行、流式组装并逐片核长度 + 整体核 SHA-256、`FinalizeStatus` 六分类）。**④ 数据层**：V10 迁移（`files`/`file_tickets`/`messages.file_id` + `idx_files_uploader_status`/`idx_files_status_created`/`idx_messages_file`/`idx_file_tickets_expires`）；元数据 CRUD（创建含原子并发配额、状态迁移终态不可逆、票据签发/校验/消费/清理只存摘要、`canUserAccessFile` 访问控制、三个回收查询）。**⑤ 控制面**：五个处理器 + 两个新限流窗口（新建上传 20/60s、其余文件操作共用 60/60s，入参形态校验先于限流消费）+ 幂等（完成/取消）+ finalize 分类回不同错误码（3015 数据故障标 failed 并回收 / 3020 存储故障保留现场）；`Server` 创建并注入存储（初始化失败则不注入，文件接口一律 fail-closed），维护连接新增 `pruneFileUploads`。**⑥ 回收三轮**：超期未完成上传（48h）先删盘后标 cancelled；终态行先删盘后删行（兼孤儿清理，防 `files` 无界增长）；已就绪但无引用的行（附件消息被软删或发送未发生）**只原子迁入终态不碰磁盘**，销毁推下一轮（引用判定与迁移合并为单条语句消除 TOCTOU，否则并发 `sendMessage` 可能在两步之间引用该文件而磁盘数据已被删 → 附件永久打不开）；宽限期以 `completed_at` 为基准，避免续传数天后刚完成的大文件被当成孤儿。**验证**：新增 `TestFileProtocol`（30）与 `TestObjectStorage`（19），`TestDatabaseManager` 新增 14 个 M8 用例至 63 passed；`ctest` 9/9 全绿（共 227 用例）；构建全目标通过。**两轮 CodeReview 子代理审查**：第一轮（M8.1 主体）无 P0；2 项 P1（元数据枚举预言机：“不存在”与“不是你的”差异化错误码可遍历他人 `fileId`；存储层并发：同键并发组装/删除与固定临时名互相覆写）、1 项 P2（配额“先读计数后插入”TOCTOU）、1 项 P3（终态行与孤儿数据无回收路径）均已修复并补回归用例（含崩溃残留清理、配额原子性）。第二轮（针对回收增量）无 P0/P2；**1 项 P1 已修**——“迁入终态后不可能再被新消息引用（发送校验要求 status=ready）”这一不变量在跨线程下**不成立**（每连接一个 `RequestHandler` 线程，`checkMessageFile` 与消息 INSERT 之间有窗口，维护任务可在其中把当时确实无引用的文件迁入终态，随后下一轮先删盘后删行→仍被引用文件的磁盘数据被销毁，附件永久打不开）；修复采双侧防护：发送侧 `sendMessage` 把“文件仍为 `ready`”下推为 `INSERT ... SELECT ... WHERE EXISTS` 守卫子查询（单语句原子 + SQLite 写者串行，两种交错都安全；守卫未命中不写入任何行并置 `fileNotReady`，两个发送路径据此回 `FileNotReady` 而非 `InternalError`），回收侧终态那一轮在 `remove()` 前先 `isFileReferencedByMessage` 再判一次（宁可留下可修复的 cancelled 行 + 盘上对象，也不销毁不可恢复的数据），并同步更正三处文档/注释中该错误不变量的表述；新增 `sendMessageGuardsFileReadyStateAtomically` 用例锁定（ready 可发/已迁移不可发且无半截行/uploading 与不存在 fileId 被拦/普通消息不受影响/未传出参不崩溃）。2 项 P3：配额用例残留的绝对值断言已改为差值口径；回收在主线程做同步磁盘 I/O 登记入 §3（量级有界且定时器不重入，属响应性隐患）。**另修正两项测试非确定性**：`fileRecordCreateAndRetrieve` 遗留 `uploading` 行会吃掉后续用例的并发配额（补转终态收尾），配额用例改为差值断言（与 `uploadingCountTracksActiveUploads` 既有约定一致）。新增 9 项欠账（§3）：数据面未实施与票据无生产调用点、单机存储无副本、控制面五处理器无自动化测试（均 P2）；无存储用量配额、下载票据 TTL 内可重用、`putChunk` 不入锁、回收查询每轮 limit=100、文件消息不可编辑而缺“撤回重发”替代路径、回收在主线程做同步 I/O（均 P3）。文档同步：ROADMAP（§1.1 M8 行转进行中、§1.2 新增“文件与媒体传输”能力行、§3 新增 9 项、§4.1 拆为 M8.1/M8.2/M8.3 三切片、§5 下一切片指向 M8.2、§6 目录树、§7 V10、§8 七条新安全约束、§11 本行）、PROTOCOL（标题与状态段、类型表 90-99、错误码 3013-3021、新增 M8 章节：通道划分/清单/加密/分片口径/五接口/`fileId`/状态机与回收）、SECURITY（新增“文件与媒体传输安全”节、限流三条、数据库 V10、风险与后续要求）、ARCHITECTURE（标题日期、组件图与职责、新增 M8 能力边界节、Schema V10 与 `sender_key_skipped` 补登、下一步演进；并补正 M9 编辑/删除章节陈旧表述：88/89 拆分、`senderId` 寻址、跳序密钥缓存、不预清缓存与幂等回退、多槽并发匹配）、README（目录说明、存储根目录、测试 9 套与三个新套件）、AGENTS（测试清单 9 套 + 三条新风格约束：单语句原子迁移、销毁顺序、错误分类）。**未提交**（待用户确认） |

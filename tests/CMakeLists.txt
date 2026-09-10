@@ -148,6 +148,42 @@ add_test(NAME TestNetworkManager COMMAND TestNetworkManager)
 
 xychat_copy_runtime_dlls(TestNetworkManager)
 
+# ── TestFileProtocol (M8 文件清单/分片数学/文件加密原语) ──
+add_executable(TestFileProtocol
+    unit/TestFileProtocol.cpp
+)
+
+target_link_libraries(TestFileProtocol PRIVATE
+    Qt6::Test
+    XYChatCommon
+)
+
+add_test(NAME TestFileProtocol COMMAND TestFileProtocol)
+
+xychat_copy_runtime_dlls(TestFileProtocol)
+
+# ── TestObjectStorage (M8 本地对象存储实现) ──
+add_executable(TestObjectStorage
+    unit/TestObjectStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/IObjectStorage.h
+)
+
+target_include_directories(TestObjectStorage PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Server
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage
+)
+
+target_link_libraries(TestObjectStorage PRIVATE
+    Qt6::Test
+    XYChatCommon
+)
+
+add_test(NAME TestObjectStorage COMMAND TestObjectStorage)
+
+xychat_copy_runtime_dlls(TestObjectStorage)
+
 # ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
 add_executable(TestGroupRepro
     "e2e/TestGroupRepro.cpp"

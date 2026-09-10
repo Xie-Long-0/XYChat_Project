@@ -1,10 +1,10 @@
 # XYChat 协议文档
 
-## 当前协议状态（M7b 完成后，2026-09-02 对齐）
+## 当前协议状态（M8.1 完成后，2026-09-10 对齐）
 
-M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。**M9 特性栈（2026-09-05 实施）完成了会话置顶/免打扰与消息编辑/删除**：新增 `SetConversationPrefsRequest/Response (81/82)`、`ConversationPrefsNotification (83)`、`EditMessageRequest/Response (84/85)`、`DeleteMessageRequest/Response (86/87)`；数据库迁移至 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；编辑/删除仅发送者可操作、编辑正文须保持原 contentType 且经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入）；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件实现多端与离线同步，删除为软删除留墓碑（幂等）。
+M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。**M9 特性栈（2026-09-05 实施）完成了会话置顶/免打扰与消息编辑/删除**：新增 `SetConversationPrefsRequest/Response (81/82)`、`ConversationPrefsNotification (83)`、`EditMessageRequest/Response (84/85)`、`DeleteMessageRequest/Response (86/87)`；数据库迁移至 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；编辑/删除仅发送者可操作、编辑正文须保持原 contentType 且经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入）；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件实现多端与离线同步，删除为软删除留墓碑（幂等）。**M8.1（2026-09-10 实施）完成了媒体与文件传输的协议与存储地基**：新增文件控制面消息类型 90-99（申请上传 / 断点续传查询 / 宣告完成 / 取消 / 申请下载票据）与错误码 3013-3021；`send_message` 新增可选 `fileId` 并在响应/推送/历史读取四条路径回传；数据库迁移至 V10（`files` + `file_tickets` 两表、`messages.file_id`）；文件字节在客户端加密后才上传，文件名/MIME/明文大小与文件密钥只存在于 `FileManifest` 中并随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发，服务端只见密文与密文侧元数据。**数据面（分片字节流的 HTTP(S) 上传下载服务）与客户端上传/下载 UI 尚未实施**，见文末 M8 章节。
 
-仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、媒体消息尚未 E2EE（M8 目标）、设备信任为 TOFU（无安全码比对）。会话自动续期与失效自动重登已落地（2026-09-04：客户端解析 `expiresAt` 过期前自动 `renewToken`，失效回登录页）。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
+仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、文件传输只有控制面与存储层（M8.1），数据面 HTTP(S) 服务、客户端上传下载与多媒体元数据（缩略图/尺寸/时长）仍待实施、设备信任为 TOFU（无安全码比对）。会话自动续期与失效自动重登已落地（2026-09-04：客户端解析 `expiresAt` 过期前自动 `renewToken`，失效回登录页）。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
 
 ### 固定包头
 
@@ -86,6 +86,16 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `87` | `DeleteMessageResponse` | 消息删除响应（M9：仅本端请求响应，requestId 命中在途删除才处理） |
 | `88` | `MessageEditedNotification` | 消息编辑实时推送（服务端推送，M9 欠账修复：覆盖全体成员 **含操作者本人的其他设备**，发起设备按 payload.`senderId`+`originDeviceId` 自行去重；requestId=0。旧方案复用 `EditMessageResponse`靠 `requestId==0` 区分，现已拆分） |
 | `89` | `MessageDeletedNotification` | 消息删除实时推送（服务端推送，M9 欠账修复：语义同 `88`，与 `DeleteMessageResponse` 分离） |
+| `90` | `FileUploadCreateRequest` | 申请上传（M8：声明密文体积/分片参数/整体校验和） |
+| `91` | `FileUploadCreateResponse` | 申请上传响应（M8：返回 `fileId` + 上传票据） |
+| `92` | `FileUploadQueryRequest` | 断点续传查询（M8：拉取服务端已落盘的分片索引） |
+| `93` | `FileUploadQueryResponse` | 断点续传查询响应（M8） |
+| `94` | `FileUploadCompleteRequest` | 宣告上传结束（M8：触发服务端流式组装与整体校验） |
+| `95` | `FileUploadCompleteResponse` | 宣告完成响应（M8：成功转 `ready`；缺片时回已收索引） |
+| `96` | `FileUploadCancelRequest` | 取消上传（M8：回收已收分片） |
+| `97` | `FileUploadCancelResponse` | 取消上传响应（M8） |
+| `98` | `FileDownloadTicketRequest` | 申请下载票据（M8：授权检查通过后签发） |
+| `99` | `FileDownloadTicketResponse` | 下载票据响应（M8：票据 + 分片口径 + 校验和） |
 
 ### 注册请求
 
@@ -214,7 +224,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `1000` | `InvalidRequest` | 请求格式、类型或 payload 非法 |
 | `1001` | `UnsupportedVersion` | 协议版本不支持 |
 | `1002` | `ReplayRejected` | 重放保护拒绝：timestamp/nonce 缺失、格式错误、超时或重复（M5.5） |
-| `1003` | `RateLimited` | 非登录类请求频率超限：发消息 / 搜索 / 密钥拉取 / 消息编辑删除 / 会话偏好（M11 前置 + M9 欠账修复） |
+| `1003` | `RateLimited` | 非登录类请求频率超限：发消息 / 搜索 / 密钥拉取 / 消息编辑删除 / 会话偏好 / 文件上传与文件操作（M11 前置 + M9 欠账修复 + M8） |
 | `2001` | `AuthenticationFailed` | 用户名或密码错误 |
 | `2002` | `AccountAlreadyExists` | 用户名已存在 |
 | `2003` | `AccountNotFound` | 用户不存在 |
@@ -234,6 +244,15 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `3010` | `MemberAlreadyExists` | 被邀请者已在群中（M7a） |
 | `3011` | `MemberNotFound` | 目标不是群成员（M7a） |
 | `3012` | `NotGroupOwner` | 仅群主可执行的管理操作（M7a） |
+| `3013` | `FileNotFound` | `fileId` 不存在**或不属于当前用户**（M8：两者刻意合并为同一码，避免顺序 `fileId` 成为元数据枚举预言机） |
+| `3014` | `FileTooLarge` | 密文体积超 `MaxFileSize`（2 GiB）（M8） |
+| `3015` | `FileChecksumMismatch` | 分片长度不符或整体 SHA-256 不匹配（M8：属数据故障，服务端标 `failed` 并回收磁盘，客户端须重新上传而非重试同批分片） |
+| `3016` | `FileUploadIncomplete` | 分片未齐备（M8：可恢复，响应 `data.receivedChunks` 给出已收索引，保留 `uploading` 状态） |
+| `3017` | `FileNotReady` | 文件未完成/已取消/已失败，不可下载或不可再操作（M8） |
+| `3018` | `InvalidFileTicket` | 票据不存在/已过期/类型不符/已使用（M8：四种原因刻意不区分，避免被用来探测票据库） |
+| `3019` | `ChunkOutOfRange` | 分片序号越界或字节数与预期不符（M8：数据面用） |
+| `3020` | `FileStorageFailed` | 对象存储读写故障（M8：含存储未注入；属可重试故障，与 3015 区分以免客户端无限重传） |
+| `3021` | `FileQuotaExceeded` | 并发上传配额已满（M8：`MaxConcurrentUploadsPerUser=8`，只数 `uploading` 状态） |
 | `9001` | `Timeout` | 连接空闲超时 |
 | `9002` | `InternalError` | 服务端内部错误 |
 
@@ -729,5 +748,129 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 - **软删除留墓碑**：`messages.deleted = 1`、正文清空，保留 messageId/发送者/时间供客户端渲染“已删除”占位；幂等（重复删除返回成功）。
 - **写入 fail-closed（2026-09-09）**：`deleteMessage` 真实写入失败时返回 `InternalError` 且**不广播事件**（旧实现忽略返回值，会在库内状态未变的情况下向全员广播删除，造成服务端与事件流分歧）；失败记 `message.delete_failed` 结构化日志。
 - 成功后向会话全体成员写 `message_deleted` 事件并专用推送 `MessageDeletedNotification (89)`（requestId=0；M9 欠账修复前曾复用 `DeleteMessageResponse` messageType，现已与响应拆分）；payload 同样携带 `senderId` 与 `originDeviceId`，推送不排除操作者本人（发起设备按 `senderId`+`originDeviceId` 客户端去重）。
+
+## M8 媒体、文件与对象存储（M8.1 控制面与存储地基，2026-09-10）
+
+共享定义位于 `CommonModule/protocol/FileProtocol.h`（命名空间 `XYChat::Protocol`）与 `CommonModule/encryption/FileCrypto.h`（`XYChat::Security`），客户端与服务端共用同一组常量以免两侧校验口径漂移。
+
+### 通道划分与隐私边界
+
+- **控制面**（消息类型 90-99）复用既有 TCP 主通道，只承载 JSON 元数据，受 `MaxPayloadSize`（4 MiB）约束。
+- **数据面**（分片字节流）走独立 HTTP(S) 上传下载服务，不挤占消息长连接。**M8.1 尚未实施**；届时凭 `fileId` + 票据授权（HTTP 层无会话上下文），支持 `Range` 分段与断点续下。
+- 服务端可见：密文字节、`size_bytes`（密文体积）、分片参数、密文整体 SHA-256、上传者与其设备。
+- 服务端不可见：文件名、MIME、明文大小、多媒体尺寸/时长、文件密钥。这些只存在于 `FileManifest` 中，随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发。
+- 存储层不得从存储键、目录结构或文件名推导任何用户可控信息（blobKey 为服务端分配的随机串）。
+
+### FileManifest（文件消息的密文明文形态）
+
+一条文件消息的正文（envelope/Sender-Key 解密后得到的 plaintext）不是用户文本，而是清单的 JSON 序列化：
+
+```json
+{
+  "v": 1, "kind": "file",
+  "fileId": 123, "name": "report.pdf", "mime": "application/pdf",
+  "plainSize": 10485760, "cipherSize": 10485776,
+  "sha256": "<密文整体 SHA-256，64 位小写 hex>",
+  "key": "<32 字节文件密钥，base64>", "iv": "<12 字节 nonce 前缀，base64>",
+  "width": 0, "height": 0, "durationMs": 0, "thumb": ""
+}
+```
+
+- 收发双方以 `messages.file_id > 0` 判别文件消息（服务端权威、随消息同步），**不靠正文内容猜测**，避免用户文本恰好是 JSON 时误判。
+- `decodeFileManifest` fail-closed：版本不符、`kind` 不匹配、字段缺失、base64 非法、长度越界或分片口径不自洽时置 `ok=false`，不渲染半截元数据；`encodeFileManifest` 对非法清单返回空串（调用方据此拒发）。
+- `width`/`height`/`durationMs`/`thumb` 为**预留字段**，生成逻辑延后（需引入 QtMultimedia 与缩略图管线）；字段先行定义以免后续扩展清单时破坏已有消息的兼容性。内联缩略图密文上限 `MaxThumbnailBytes=4096`：清单随消息正文走群 Sender-Key，受 `MaxGroupMessageLength`（16384 字符）约束，base64 约 1.34 倍膨胀；更大的缩略图应作为独立文件上传并在清单里引用其 `fileId`。
+
+### 文件内容加密（FileCrypto）
+
+- 每个文件一把独立随机 AES-256 密钥 + 12 字节 nonce 前缀，**严禁跨文件复用**；二者只经清单分发，服务端无从获得。
+- 分片独立 AEAD：第 i 片 nonce = `iv` 后 4 字节 XOR 大端 `i`（与 TLS 1.3 记录层“写 IV 异或序号”的构造同构），AAD = 大端 4 字节 `i`。
+  - nonce 唯一性由 `iv` 的随机性与 XOR 对固定 `iv` 的双射性共同保证；
+  - AAD 绑定分片位置：重排、截断或以他片冒替均在 GCM 认证阶段被拒；
+  - 各片互相独立，因此上传/下载可流式进行、可断点续传、内存占用恒定。
+- **刻意不复用消息 ratchet**：文件密钥与 Sender Key 解耦后，分片没有必须按序消费的链状态，也就不会出现“链已推进导致早先分片永久不可解”这类不可逆损坏（M9 消息编辑踩过的坑）；转发/多端重复下载同一文件也不需要重新加密。
+- 认证失败（篡改、密钥错、分片序号错）返回空并清零已产出明文。为支持 AAD，`E2eeCrypto` 新增带 AAD 的 AES-GCM 原语（无 AAD 的旧接口保持不变）。
+
+### 分片口径
+
+| 常量 | 值 | 说明 |
+| --- | --- | --- |
+| `DefaultChunkSize` | 1 MiB | 默认密文分片大小 |
+| `MinChunkSize` / `MaxChunkSize` | 64 KiB / 4 MiB | 分片大小合法区间 |
+| `MaxFileSize` | 2 GiB | 密文总量上限 |
+| `MaxChunkCount` | 4096 | 单文件分片数上限 |
+| `MaxFileNameLength` | 255 | 文件名明文字符数上限 |
+
+- **`chunkSize` 一律指密文分片大小（含 16 字节 GCM 标签）**，即客户端实际 PUT 到数据面的字节数；服务端不需要也不应当知道明文分片边界。明文/密文分片换算用 `plainSizeOfChunk` / `cipherSizeOfChunk`。
+- `chunkCount` 必须等于 `ceil(cipherSize / chunkSize)`（`chunkCountFor` / `isChunkingValid`），否则可用少报分片数把超大文件拆到上限之外。
+- 非末片恒为 `chunkSize` 字节、末片为余量（`expectedChunkBytes`），数据面据此拒绝长度不符的 PUT，防止客户端自选分片边界绕过体积与分片数校验。
+
+### 控制面接口
+
+五个接口均需已认证会话，入参形态校验先于限流消费（畸形请求不占额度）。新建上传专用窗口 `MaxFileUploadsPerWindow=20 / 60s`；查询/完成/取消/下载票据共用 `MaxFileOpsPerWindow=60 / 60s`；超限回 `RateLimited (1003)`。
+
+```json
+// 90 申请上传
+{ "type": "file_upload_create", "sizeBytes": 10485776, "chunkSize": 1048576,
+  "chunkCount": 10, "sha256": "<64 hex>", "timestamp": ..., "nonce": "..." }
+// 91 响应 data（uploadTicket 明文只在本响应出现一次，服务端仅存 SHA-256 摘要）
+{ "fileId": 123, "uploadTicket": "<高熵随机串>", "expiresInSeconds": 86400 }
+
+// 92 断点续传查询
+{ "type": "file_upload_query", "fileId": 123, ... }
+// 93 响应 data（仅 uploading 状态才去数磁盘；终态下 receivedChunks 为空）
+{ "fileId": 123, "status": "uploading", "sizeBytes": ..., "chunkSize": ...,
+  "chunkCount": 10, "receivedChunks": [0, 1, 2] }
+
+// 94 宣告完成
+{ "type": "file_upload_complete", "fileId": 123, ... }
+// 95 响应 data（成功）
+{ "fileId": 123, "status": "ready", "sizeBytes": ..., "sha256": "<64 hex>" }
+// 95 响应 data（FileUploadIncomplete 3016：可恢复，客户端只补传缺的那几片）
+{ "fileId": 123, "status": "uploading", "chunkCount": 10, "receivedChunks": [0, 1] }
+
+// 96 取消上传
+{ "type": "file_upload_cancel", "fileId": 123, ... }
+// 97 响应 data
+{ "fileId": 123, "status": "cancelled" }
+
+// 98 申请下载票据
+{ "type": "file_download_ticket", "fileId": 123, ... }
+// 99 响应 data（均为密文侧元数据，不含只在清单里的文件名/MIME）
+{ "fileId": 123, "downloadTicket": "<随机串>", "sizeBytes": ..., "chunkSize": ...,
+  "chunkCount": 10, "sha256": "<64 hex>", "expiresInSeconds": 300 }
+```
+
+关键规则：
+
+- **不回传 `blobKey`**：数据面用 `fileId` + 票据定位，存储键不出服务端，以免它成为可枚举的对象路径。
+- **归属与枚举防护**：上传控制面只服务上传者本人（`requireOwnedFile`）；下载授权走 `canUserAccessFile`（本人上传，或其所属会话中存在未删除且引用该文件的消息）。两者均将“不存在”与“不是你的”合并为同一错误码（`FileNotFound`），真实原因只进服务端日志；`fileId` 为顺序整数，差异化错误码会让任何已登录用户遍历判定他人文件的存在性与完成状态。下载票据先发授权后取记录，同一道理。
+- **幂等**：完成请求对已 `ready` 的文件直接回成功（完成响应丢失后客户端会重试）；取消请求对已 `cancelled` 的文件直接回成功。
+- **并发配额**：`MaxConcurrentUploadsPerUser=8`，与插入在 `createFileRecord` 内以单条 `INSERT...SELECT` 原子完成（分步的“先读计数后插入”在同一用户多设备并发创建时会集体读到“未满”而全部放行）；配额已满回 `FileQuotaExceeded (3021)`。
+- **finalize 结果分类**（`IObjectStorage::FinalizeStatus`）：`Incomplete` 可恢复→ 3016 + 已收索引，保留 `uploading`；`ChunkSizeMismatch`/`ChecksumMismatch`/`InvalidArguments` 属数据故障→ 3015，标 `failed` 并回收磁盘（重传同一批分片只会得到同样结果）；`StorageError`（写满/改名失败）→ 3020，**保留现场**让客户端稍后重试（误报成 3015 会使客户端无限重传）。
+- **取消顺序**：先落状态再删磁盘。反序会与并发的完成请求交错出“DB=ready 而 blob 已删”的不可自愈状态（下载票据能正常签发、数据面必然读失败）；本序最坏只留下“DB=cancelled 而分片仍在盘上”的隐形孤儿，由维护任务的终态回收兜底。`markFileCancelled` 带 `WHERE status='uploading'`，因此并发的取消/完成只有一方能赢得状态。
+- **已完成的文件不走取消接口**：它可能已被消息引用，撤回会让接收方的下载票据指向已消失的对象；未被引用的 `ready` 文件由回收任务处理。
+- **票据签发失败回滚**：申请上传时若 `issueFileTicket` 失败，立即把刚建的记录标 `cancelled`，避免留下一条无凭据可用、又白占并发配额的 `uploading` 行。
+- **票据生命周期**：上传票据 `UploadTicketTtlSeconds=86400`（覆盖大文件慢速上传）；下载票据 `DownloadTicketTtlSeconds=300`（短时效，TTL 内可重复使用以支持 Range 分段与断点续下）；过期票据由维护任务 `pruneExpiredFileTickets` 清理。
+
+### send_message 的 fileId
+
+- 请求新增可选 `fileId`（缺省或 ≤ 0 为普通消息）；私聊与群聊两条分流路径共用 `checkMessageFile` 校验：必须存在、必须是本人上传、必须已 `ready`，否则回 `FileNotFound`/`FileNotReady`；存储未注入时回 `FileStorageFailed`（不得让文件消息静默降级：正文其实是清单 JSON，降级投递会让接收端把文件密钥当文本渲染）。
+- **插入时原子复核**：“文件仍为 `ready`”还被下推为 `INSERT` 的守卫子查询（`INSERT ... SELECT ... WHERE EXISTS (SELECT 1 FROM files WHERE id=? AND status='ready')`）。前置校验与写入之间存在跨线程窗口：维护任务可能在校验通过后把该文件迁入终态（它当时确实无引用），不复核就会产出一条指向已取消文件的消息，而其磁盘数据随后被回收（附件永久打不开）。单语句在 SQLite 内原子且写者串行，两种交错都安全；守卫未命中时不写入任何行并回 `FileNotReady`（而非误导性的 `InternalError`）。
+- 响应 `data`、`NewMessageNotification` 推送、`sync_events` 事件、历史/同步读取四条路径均回传 `fileId`；任一遗漏都会让离线补收的文件消息退化为文本消息。
+- `messages.file_id` 为 NULL 表示普通消息（无效 `QVariant` 入库为 NULL 而非 0，使 `IS NULL` 判定与索引可用）。
+
+### files.status 状态机与回收
+
+`uploading` → `ready` / `cancelled` / `failed`；终态不可再改（`ready` 不能被取消或标失败，否则已投递消息的附件会凭空消失），幂等由调用方先读状态实现，不在数据层隐藏。
+
+服务端以独立维护连接定时执行 `pruneFileUploads`（与 `sync_events` 清理共用定时器，不另起后台线程），三轮：
+
+1. 超期未完成的上传（`uploading` 且 `created_at` 早于 `StaleUploadHours=48` 小时前）：先幂等删磁盘、再标 `cancelled`；删不掉就保留 `uploading` 下一轮重试（先改状态会让磁盘数据无人认领）。
+2. 终态行（`cancelled`/`failed`）收尾：**删盘前先再判一次引用**（纵深防御），无引用才幂等删磁盘、再删元数据行（`deleteFileRecord` 内再做一次引用双重保险）；兼作孤儿数据清理，也防止 `files` 表无界增长。
+3. 已就绪但无引用的行（`ready` 且 `completed_at` 早于 48 小时前且无任何未删除消息引用）：**只原子地迁入 `cancelled`，不直接碰磁盘**，销毁推到下一轮的第 2 步。引用判定与迁移合并为单条语句：分步版本存在 TOCTOU，并发 `sendMessage` 可能在两步之间引用该文件，随后磁盘数据被删掉，留下一条指向空数据的消息（用户侧表现为附件永久打不开）。
+
+“终态行不可能再被引用”并不成立：发送侧的文件校验与消息写入同样存在跨线程窗口。因此两侧都做了防护——发送侧把“文件仍为 `ready`”下推为 `INSERT` 的守卫子查询（单语句原子，写者串行：要么消息先落库使迁移的 `NOT EXISTS` 放弃，要么迁移先提交使插入查不到 `ready` 行），回收侧删盘前再判一次引用。两边都失效的最坏结果是“消息指向一条 `cancelled` 但数据仍在盘上的文件”（下载回 `FileNotReady`，可修复），而不是数据丢失。
+
+时限以 `completed_at` 为基准（缺失时退回 `created_at`）：大文件的续传可能跨越数天，若按 `created_at` 算，刚完成的上传会被立即当成孤儿删掉。时间比较交给 SQLite `datetime('now')`，避开调用方与列默认值两种时间格式字典序不一致的陷阱。
 
 

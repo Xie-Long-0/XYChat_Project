@@ -30,6 +30,7 @@ set(SOURCES
     core/RequestHandler.cpp
     core/NonceCache.cpp
     database/DatabaseManager.cpp
+    storage/LocalFileStorage.cpp
 )
 
 # 头文件列表
@@ -39,6 +40,8 @@ set(HEADERS
     core/NonceCache.h
     core/RateWindow.h
     database/DatabaseManager.h
+    storage/IObjectStorage.h
+    storage/LocalFileStorage.h
 )
 
 # 生成可执行文件
@@ -48,6 +51,7 @@ qt_add_executable(Chat-Server ${SOURCES} ${HEADERS})
 target_include_directories(Chat-Server PRIVATE
     core/
     database/
+    storage/
 )
 
 # 链接 Qt 和 OpenSSL 库

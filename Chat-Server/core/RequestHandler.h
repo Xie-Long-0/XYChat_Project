@@ -14,6 +14,8 @@
 
 class DatabaseManager;
 class NonceCache;
+struct FileRecord;
+namespace XYChat::Server { class IObjectStorage; }
 
 class RequestHandler : public QThread
 {
@@ -38,6 +40,10 @@ public:
 
     // M5.5: 设置全局 nonce 缓存（由 Server 在 start() 前调用）
     void setNonceCache(NonceCache *cache);
+
+    // M8: 设置对象存储（由 Server 在 start() 前调用，存储初始化成功才会注入）。
+    // 为空时所有文件请求一律回 FileStorageFailed，不让文件消息静默退化成文本消息
+    void setObjectStorage(XYChat::Server::IObjectStorage *storage);
 
 signals:
     void finished();
@@ -91,6 +97,23 @@ private:
     void processEditMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
     void processDeleteMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
 
+    // M8: 媒体、文件与对象存储的控制面处理器（数据面走独立 HTTP(S) 服务，不在此处）。
+    // 控制面以会话 token 鉴权 + 上传者归属校验；票据只给无会话的 HTTP 数据面使用
+    void processFileUploadCreateRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processFileUploadQueryRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processFileUploadCompleteRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processFileUploadCancelRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processFileDownloadTicketRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+
+    // M8: 校验 send_message 携带的 fileId。返回 Ok 时 *outFileId 为可入库的文件 ID
+    // （未携带文件则为 0）；否则返回应回给客户端的错误码，outReason 为文案
+    XYChat::Protocol::ErrorCode checkMessageFile(qint64 fileId, qint64 *outFileId,
+                                                 QString *outReason);
+    // M8: 载入文件记录并校验调用者为上传者（上传控制面共用前置检查）。
+    // 返回非 Ok 时 *outReason 为可直接回给客户端的文案
+    XYChat::Protocol::ErrorCode requireOwnedFile(qint64 fileId, FileRecord *outRecord,
+                                                 QString *outReason);
+
     // M7a: 群消息发送（明文入库 + fan-out，与私聊 E2EE 路径分流）
     void processSendGroupMessage(const XYChat::Protocol::Packet &packet, const QJsonObject &request,
                                  qint64 conversationId, const QString &clientMessageId);
@@ -123,8 +146,11 @@ private:
     QSslConfiguration m_sslConfig;
     bool m_tlsEnabled = false;
 
-    // M5.5: 全局 nonce 缓存（Server 持有，跨连接共享）
+    // M5.5: 全局 nonce 缓存（Server 持有，各连接共享）
     NonceCache *m_nonceCache = nullptr;
+
+    // M8: 对象存储（Server 持有，各连接共享）；为空表示存储不可用
+    XYChat::Server::IObjectStorage *m_objectStorage = nullptr;
 
     // M5.5: 发送代理对象，线程亲和于 handler 线程，
     // 避免跨线程直接访问 QSslSocket
@@ -144,6 +170,10 @@ private:
     // + fan-out，O(N) 放大且事件 30 天才清理，需与 send/search 一致限流防刷库）
     XYChat::Server::RateWindow m_editDeleteWindow;
     XYChat::Server::RateWindow m_prefsWindow;
+    // M8: 文件控制面限流。新建上传会分配磁盘与 DB 行，配额更紧；
+    // 查询/完成/取消/下载票据为廉价读写，共用一个较宽窗口
+    XYChat::Server::RateWindow m_fileUploadWindow;
+    XYChat::Server::RateWindow m_fileOpsWindow;
 
     // M11 前置: 结构化日志的每请求上下文（起始计时/请求类型/请求 ID）
     QElapsedTimer m_requestTimer;
@@ -183,4 +213,11 @@ private:
     static constexpr int MaxGroupMessageLength = 16384;
     // M7a: 群名长度上限（字符数）
     static constexpr int MaxGroupNameLength = 64;
+
+    // M8: 文件控制面限流（连接级固定窗口）。新建上传会占用磁盘与元数据行，
+    // 且超期未完成的文件需等回收任务清理，因此比查询类操作收得更紧
+    static constexpr int MaxFileUploadsPerWindow = 20; // 窗口内新建上传数上限
+    static constexpr int FileUploadWindowSeconds = 60; // 窗口长度（秒）
+    static constexpr int MaxFileOpsPerWindow = 60;     // 查询/完成/取消/下载票据总上限
+    static constexpr int FileOpsWindowSeconds = 60;    // 窗口长度（秒）
 };

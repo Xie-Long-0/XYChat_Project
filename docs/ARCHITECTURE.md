@@ -1,25 +1,29 @@
 # XYChat 架构概览
 
-> 本文档描述当前架构实态（截至 2026-09-05，M9 特性栈完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
+> 本文档描述当前架构实态（截至 2026-09-10，M8.1 文件与对象存储地基完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
 
-## 当前组件（M9 特性栈完成后）
+## 当前组件（M8.1 完成后）
 
 ```text
 Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
      │        (TLS 1.2+，fail-closed)          │
+     │                                     ├─ IObjectStorage（M8：密文分片/最终对象）
+     │                                     └─ 维护任务（sync_events 与文件回收）
      └──── CommonModule（protocol/encryption/security）────┘
+
+M8 数据面（待实施）：Chat-Client ── HTTP(S) + 票据 ── 上传下载服务 ── IObjectStorage
 ```
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
 - `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
-- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包；M9 新增会话偏好/消息编辑/消息删除三个处理器；M11 前置：发消息/搜索连接级限流 RateWindow + 结构化审计日志），管理 session 路由与在线状态，访问 SQLite。
+- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包；M9 新增会话偏好/消息编辑/消息删除三个处理器；M11 前置：发消息/搜索连接级限流 RateWindow + 结构化审计日志；**M8.1 新增文件控制面五个处理器**（申请上传/续传查询/宣告完成/取消/下载票据）与 `send_message` 的 `fileId` 校验），管理 session 路由与在线状态，访问 SQLite。**M8.1 新增 `storage/`**：`IObjectStorage` 抽象与 `LocalFileStorage` 实现（由 `Server` 创建并注入各 handler，存储初始化失败则不注入，文件相关接口一律 fail-closed 回 `FileStorageFailed`）；`Server` 维护连接新增 `pruneFileUploads`（与 `pruneSyncEvents` 共用定时器）。
 - `CommonModule`：客户端和服务端共享代码：
-  - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；
-  - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）、`GroupE2eeCrypto`（M7b：Sender-Key 生成/chain-key ratchet/群消息 AES-256-GCM + Ed25519 签名/分发消息 pairwise envelope 编解码）；
+  - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；`FileProtocol`（M8.1：`FileManifest` 编解码、分片数学与体积/分片/票据常量，客户端与服务端共用同一组常量以免校验口径漂移）；
+  - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码；M8.1 新增带 AAD 的 GCM 原语）、`GroupE2eeCrypto`（M7b：Sender-Key 生成/chain-key ratchet/群消息 AES-256-GCM + Ed25519 签名/分发消息 pairwise envelope 编解码；2026-09-09 新增跳序消息密钥缓存）、`FileCrypto`（M8.1：文件密钥/nonce 前缀生成、分片独立 AEAD 加解密、流式 SHA-256、票据与其摘要）；
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）、`StructuredLogger`（M11 前置：单行 JSON 结构化日志，统一字段 + 复用 LogSanitizer 脱敏）。
 - `docs`：路线图、协议、安全和架构说明。
-- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层与 V7 迁移）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b 新增））；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
+- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层、V7-V10 迁移与 M8 文件元数据/票据/访问控制/回收）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b）、NetworkManager（2026-09-10：客户端链路层回归，friend 注入）、**FileProtocol 与 ObjectStorage（M8.1 新增）**，均纳入 CTest）；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
 
 ## 服务端运行模型
 
@@ -94,8 +98,10 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 ### 会话偏好与消息编辑/删除（M9）
 
 - **会话偏好（置顶/免打扰）**：按成员×会话维度存储于 `conversation_members.pinned/muted`（本人多设备共享，非设备级）。客户端 `NetworkManager::setConversationPrefs` 发 `SetConversationPrefsRequest`（类型 81），服务端仅会话成员可设（越权 `PermissionDenied`）后写库，向本人所有在线设备推 `ConversationPrefsNotification`（83）并写 `conversation_prefs` 事件；`get_conversations` 回填 `pinned`/`muted`。本地 `LocalStore.setConversationPrefs` 更新缓存，`loadConversations` 按 `pinned DESC` 排序置顶会话在前。
-- **消息编辑**：仅发送者可编辑、已删除与系统消息不可编辑、编辑正文 `contentType` 须与原消息一致（私聊 `text`、群 `e2ee_group`，拒绝借编辑切换形态）。服务端 fail-closed 密文校验（`e2ee_group` 经 `decodeGroupMessage` 且 `senderDeviceId` 为当前设备、`text` 经 `decodeEnvelope`）拒绝明文注入，写库 `messages.edited_at`；向会话成员推 `message_edited` 事件（复用 `EditMessageResponse` messageType，requestId=0 表他人编辑）。客户端群聊编辑同步 Sender-Key 重加密、私聊编辑异步 `fetch_keys` 后 `encryptForUser` 重加密提交；解密侧先失效该 messageId 旧解密缓存（内存 `m_decryptCache` + LocalStore `clearDecryptedContent`）再解新密文，避免命中编辑前明文（正确性关键）。
-- **消息删除**：仅发送者可删、系统消息不可删；软删除（`messages.deleted=1` + 正文清空）留墓碑，幂等（重复删除返回成功）；向会话成员推 `message_deleted` 事件（复用 `DeleteMessageResponse` messageType）。客户端 `markMessageDeleted` 置本地占位“已删除”。
+- **消息编辑**：仅发送者可编辑、已删除与系统消息不可编辑、编辑正文 `contentType` 须与原消息一致（私聊 `text`、群 `e2ee_group`，拒绝借编辑切换形态）。服务端 fail-closed 密文校验（`e2ee_group` 经 `decodeGroupMessage` 且 `senderDeviceId` 为当前设备、`text` 经 `decodeEnvelope`）拒绝明文注入，写库 `messages.edited_at`；向会话成员推 `message_edited` 事件与专用推送 `MessageEditedNotification (88)`（2026-09-10 前曾复用 `EditMessageResponse` messageType 靠 `requestId==0` 区分响应与推送，现已拆分），事件/推送携带 `senderId`（群聊解密寻址所需）与 `originDeviceId`（发起设备去重），且**不排除操作者本人**以保障其名下其他设备实时一致。客户端群聊编辑同步 Sender-Key 重加密、私聊编辑经 `m_privateEditQueue` 队列串行消费 `fetch_keys` 传输槽后 `encryptForUser` 重加密提交；解密侧**不预先清缓存**，直接解新密文，成功则覆盖本地明文与解密缓存，失败则保留既有可读正文与缓存、仅推进 `edited_at`（2026-09-10 幂等回退：预密钥一次性/群 ratchet 已推进，离线重放时新密文无法二次解密，不得写空覆盖）。
+- **群聊编辑的解密寻址与乱序容忍（2026-09-09 修复）**：`decryptGroupMessageObject` 在 `senderId` 缺失时按（群, 设备, keyId）反查发送者（兼容修复前已落库的旧事件）；`GroupE2eeCrypto::decryptMessage` 接受可选跳序消息密钥缓存（Signal skipped-message-keys），使编辑抬高 `iteration` 后按 `message_id ASC` 补收的后续消息不被回滚检查永久拒绝；缓存经 `LocalStore.sender_key_skipped` 表加密持久化，退群与 `sender_keys` 同一事务清理。
+- **消息删除**：仅发送者可删、系统消息不可删；软删除（`messages.deleted=1` + 正文清空）留墓碑，幂等（重复删除返回成功）；写入失败 fail-closed（回 `InternalError`、不广播事件、记 `message.delete_failed` 日志）。向会话成员推 `message_deleted` 事件与专用推送 `MessageDeletedNotification (89)`（语义同 88）。客户端 `markMessageDeleted` 置本地占位“已删除”。
+- **并发响应匹配（2026-09-10）**：编辑/删除的在途请求由单发槽位改为多槽 `m_pendingEdits`（requestId→上下文）+ `m_pendingDeleteRequestIds` 集合，连续操作不再静默丢弃；登出（`resetAuthState`）与断线（`onDisconnected`，自动重连不经前者）两路径均清空容器并复位 `m_editFetchInFlight`，否则在途标记恒真会永久堵死编辑泵。
 - **多端与离线同步**：`conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件 + 实时推送双通道，`ingestSyncEvents` 解密后更新本地缓存并通知 UI（编辑事件同样先失效旧缓存再解密）。
 - **UI**：`ConversationList` 会话右键菜单（置顶/取消置顶、免打扰/取消免打扰）+ 置顶/免打扰角标；`MessageBubble` 消息右键菜单（编辑/删除，仅自己消息）+ “已编辑”标记与“已删除”占位；`MainPage` 编辑对话框与删除确认对话框；`MainWindow` 接线 `setConversationPrefs`/`editMessage`/`deleteMessage` 与五个新信号。
 
@@ -114,9 +120,33 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 客户端校验服务端证书，证书错误时断开；CA 缺失拒绝连接（`XYCHAT_ALLOW_PLAINTEXT=1` 显式开发开关）。
 - 业务请求强制携带 timestamp/nonce（缺失/格式错误/超时/重复一律拒绝），nonce 由服务端全局 TTL 缓存（`NonceCache`）跨连接去重。
 - 日志脱敏（`LogSanitizer`）；敏感内存清零（`SecureMemory`）；结构化日志（M11 前置 `StructuredLogger`：单行 JSON 统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段，`sendResponse` 中央审计 + 安全事件带 reason，敏感字段脱敏）。
-- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；媒体消息尚未 E2EE（M8）。
+- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；文件传输只有控制面与存储层（M8.1），数据面 HTTP(S) 服务与客户端上传/下载尚未实施。
 
-## 数据库 Schema（V9，M9 特性栈迁移）
+### 文件与对象存储（M8.1，2026-09-10）
+
+```text
+客户端                       Chat-Server                      IObjectStorage
+  │ ① file_upload_create ─────> RequestHandler ── allocateBlobKey ──> 分配存储键
+  │ <── fileId + 上传票据 ────  createFileRecord（配额原子校验）+ issueFileTicket
+  │ ② PUT 分片 ───────────> 数据面 HTTP(S)（待实施）── putChunk ──> parts/<b0b1>/<key>/<i>.part
+  │ ③ file_upload_query ────> receivedChunks（断点续传：只补传缺的片）
+  │ ④ file_upload_complete ─> finalize（流式组装 + 逐片长度 + 整体 SHA-256）
+  │                            └─ 通过才 markFileReady → blobs/<b0b1>/<key>.bin
+  │ ⑤ send_message(fileId) ─> checkMessageFile（存在/本人/ready）→ messages.file_id
+  │ ⑥ file_download_ticket ─> canUserAccessFile → 签发一次性短时效票据
+  │ ⑦ GET/Range ──────────> 数据面（待实施）── readRange
+```
+
+- **职责分层**：`RequestHandler` 只做鉴权、入参校验、限流与元数据；字节流全部经 `IObjectStorage` 抽象（`allocateBlobKey`/`putChunk`/`receivedChunks`/`readChunk`/`finalize`/`isFinalized`/`blobSize`/`readRange`/`remove`），M8 以本地文件系统实现（`LocalFileStorage`），后续可替换为 S3/MinIO 而不改动业务代码。
+- **隐私边界**：服务端只见密文与密文侧元数据（体积/分片参数/整体 SHA-256/上传者）；文件名、MIME、明文大小、多媒体尺寸/时长与文件密钥只在 `FileManifest` 中，随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发。收发双方以 `messages.file_id > 0` 判别文件消息，不靠正文内容猜测。发送时文件需满足存在/本人上传/已 `ready`，且该状态在插入语句内原子复核。
+- **分片加密**：每文件一把独立 AES-256 密钥 + 12 字节 nonce 前缀；第 i 片 nonce = `iv` 后 4 字节 XOR 大端 `i`、AAD = 大端 `i`，各片独立认证且绑定位置（重排/截断/冒替均被拒），因此可流式、可续传、内存恒定。**刻意不复用消息 ratchet**（避开 M9 编辑踩过的“链已推进→早先分片永久不可解”不可逆损坏）。
+- **目录布局与崩溃安全**：`<root>/parts/<b0b1>/<blobKey>/<index>.part`（上传中分片）、`<root>/tmp/<b0b1>/<blobKey>.<rand>.tmp`（组装中间产物）、`<root>/blobs/<b0b1>/<key>.bin`（最终对象）；blobKey 前两位十六进制作分桶，把单目录项数摊平到 256 个桶。所有写入为“临时文件 + 原子改名”，崩溃或写满不会留下被当作完整数据的半截文件；用户可控字符串永不参与路径拼接。
+- **并发**：存储实例由各连接线程共享，同一 blobKey 的 `finalize`/`remove` 经固定条带锁（64 条）串行（同时组装会交错写入产出损坏对象；一边组装一边删除会产出“元数据 ready 而对象缺失”的不可自愈状态）；`putChunk` 不入锁（单片写入已原子，与组装交叠只会让 finalize 的长度/摘要关卡判失败）。
+- **回收**：`Server::pruneFileUploads` 三轮（超期未完成上传 → 终态行收尾 → 已就绪但无引用的行原子迁入终态），均遵循“先保证不产生孤儿数据、再销毁”；详见 `docs/PROTOCOL.md` M8 章节与 `docs/SECURITY.md`。
+- **回收与发送的竞态防护（两侧）**：“终态行不可能再被引用”并不成立——每连接一个线程，发送侧的文件校验与消息写入之间存在窗口，维护任务可在其中把无引用的 `ready` 文件迁入终态。因此发送侧把“文件仍为 `ready`”下推为 `INSERT` 的守卫子查询（`sendMessage` 单语句原子，SQLite 写者串行，守卫未命中则不写入并回 `FileNotReady`），回收侧终态那一轮在删盘前再判一次引用（宁可留下可修复的 `cancelled` 行 + 盘上对象，也不销毁仍被引用的数据）。
+- **尚未实施**：数据面 HTTP(S) 服务（拟用 `QHttpServer`）、客户端上传/下载引擎与 UI、已下载文件的本地缓存与清理、多媒体元数据生成（需 QtMultimedia，清单字段已预留）。
+
+## 数据库 Schema（V10，M8.1 文件元数据迁移）
 
 - `schema_version`：数据库迁移版本控制
 - `users`：用户基础信息（username, email, phone, password_hash）
@@ -126,13 +156,18 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - `contacts`：联系人关系（双向记录）
 - `conversations`：会话信息（type, updated_at；M7a 新增 `name` 群名列，private 会话为 NULL）
 - `conversation_members`：会话成员（conversation_id, user_id, last_read_message_id，读游标只前进；M7a 新增 `role` 成员角色列，取值 owner/admin/member，存量行默认 member；M9 新增 `pinned`/`muted` 会话偏好列，按成员×会话维度）
-- `messages`：消息主体（conversation_id, sender_id, content, status, created_at, client_message_id, sender_device_id；M9 新增 `edited_at`/`deleted`）——M6 起新消息正文为 E2EE envelope 密文，存量旧消息为明文
+- `messages`：消息主体（conversation_id, sender_id, content, status, created_at, client_message_id, sender_device_id；M9 新增 `edited_at`/`deleted`；M8.1 新增 `file_id` 引用 `files.id`，NULL 表示普通消息）——M6 起新消息正文为 E2EE envelope 密文，存量旧消息为明文；文件消息的正文为 `FileManifest` 的密文
 - `message_receipts`（V4 新增）：送达/已读回执（message_id, user_id, device_id, delivered_at, read_at，UNIQUE(message_id, user_id, device_id)）
 - `sync_events`（V4 新增）：账号级同步事件流（seq 全局自增, user_id, event_type, payload），索引 (user_id, seq)；event_type 含 message/contact_added/receipt/group_changed/read_cursor（M9）/conversation_prefs/message_edited/message_deleted（M9 特性栈）
 - `sync_meta`（V8 新增，M9）：单行清理水位线（id=1, pruned_below_seq），记录已被 `pruneSyncEvents` 清理的最大 seq，供落后设备 `needsFullSync` 判定
 - `device_identity_keys`（V5 新增）：设备身份公钥（user_id, device_id, identity_pub, UNIQUE(user_id, device_id)）——仅存公钥
 - `prekeys`（V5 新增）：一次性预密钥公钥（user_id, device_id, pub, status: unused/claimed/used, claimed_at）——仅存公钥，认领超时回退靠 `claimed_at`（V6 迁移兼容补齐该列）
-- `sender_keys`（M7b 新增，客户端 `LocalStore` 本地表）：群 Sender-Key 本地加密存储（group_id, sender_user_id, sender_device_id, key_id, chain_key_enc, public_signing_key, private_signing_key_enc, iteration, updated_at，主键 (group_id, sender_user_id, sender_device_id, key_id)）——chain key 与签名私钥经 `LocalStore` 存储密钥加密后落库，登出保留
+- `sender_keys`（M7b 新增，客户端 `LocalStore` 本地表）：群 Sender-Key 本地加密存储（group_id, sender_user_id, sender_device_id, key_id, chain_key_enc, public_signing_key, private_signing_key_enc, iteration, updated_at，主键 (group_id, sender_user_id, sender_device_id, key_id)）——chain key 与签名私钥经 `LocalStore` 存储密钥加密后落库，登出保留；“最新密钥”按 `rowid DESC` 选取
+- `sender_key_skipped`（2026-09-09 新增，客户端 `LocalStore` 本地表）：跳序消息密钥缓存（与 `sender_keys` 同主键维度 + `skipped_keys_enc` 整体密文 blob）——属 E2EE 密钥材料：登出保留、退群与 `sender_keys` 同一事务清理
+- `files`（V10 新增，M8.1）：文件密文侧元数据（blob_key UNIQUE, uploader_id, uploader_device_id, size_bytes, chunk_size, chunk_count, sha256_hex, status: uploading/ready/cancelled/failed, created_at, completed_at）；索引 `idx_files_uploader_status`（配额计数）与 `idx_files_status_created`（回收扫描）。不存文件名/MIME 等敏感元数据（只在客户端清单里）
+- `file_tickets`（V10 新增，M8.1）：上传/下载票据（ticket_hash UNIQUE, file_id, user_id, kind: upload/download, used, expires_at, created_at）——**无票据明文列**，只存 SHA-256 摘要（与 `sessions.token_hash` 同一做法）；索引 `idx_file_tickets_expires` 供过期清理
+
+V10 还为 `messages.file_id` 建 `idx_messages_file`，使“文件是否被未删除消息引用”的回收判定不全表扫描。
 
 messages 表幂等唯一约束：`UNIQUE(sender_id, sender_device_id, client_message_id)`（部分索引，仅对非空幂等键生效，存量旧数据不受影响）。
 
@@ -249,9 +284,9 @@ M6 首次实现后经代码审查发现并修复：
 
 ## 下一步演进
 
-M0-M7b 已全部完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
+M0-M7b、M9 与 M8.1（文件与对象存储地基）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
 
-- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（validateSession 安全修复、限流与结构化日志、M9 多端同步核心一致性、Sender-Key healing、M9 特性栈（置顶/免打扰/编辑/删除，2026-09-05 已完成）、M8 媒体）。
+- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M8.2 数据面 HTTP(S) 与客户端上传/下载、M8.3 多媒体元数据、M10 搜索/通知/体验、M11 稳定性与可运维）。
 - 集中登记的欠账与风险见 `docs/ROADMAP.md` §3（P1/P2/P3 分级）。
 
 本文档不再维护逐里程碑的演进流水账，新增架构实态变化时直接更新对应章节。

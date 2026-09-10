@@ -33,7 +33,7 @@ ctest --test-dir out/build/debug --output-on-failure
   - 设置 `$env:QT_FORCE_STDERR_LOGGING = "1"`（QTest/qDebug 转 stderr，不被丢弃）。
   - 直接运行用例可执行文件并重定向落盘：`TestXxx.exe -o result.txt,txt`。
 - 曾因此把 `latestSenderKeyId` 的同秒 tie-break（约 50% 概率失败）误归因为"沙箱 DPAPI 偶发"。审查类任务应实跑测试并落盘输出，而非止步静态阅读。
-- 单测均纳入 CTest：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
+- 单测均纳入 CTest（当前 9 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
 
 ## 代码风格约定
 
@@ -42,6 +42,9 @@ ctest --test-dir out/build/debug --output-on-failure
 - 遵循周边代码的命名与惯例；新增/修改密码学路径必须设步数与参数上限（见 `docs/SECURITY.md` DoS 教训）。
 - 以时间戳作"最新"排序依据时用单调递增序号（如 SQLite `rowid`），不用秒级时间戳 + 随机值破口。
 - 事件/推送 payload 必须携带解密所需全部寻址字段（群密文依赖 群/发送者/设备/keyId 四元组）。
+- 条件判定与状态迁移合并为**单条 SQL 语句**（如 `INSERT...SELECT` 带配额子查询、`UPDATE ... WHERE NOT EXISTS`）：先查后改的分步版本存在 TOCTOU，并发请求会集体读到“未满足”而全部放行。
+- 销毁性操作（删磁盘/删行）遵循“先保证不产生孤儿数据、再销毁”；无法两者兼得时，宁可留下可被下一轮回收的隐形孤儿，也不得产出“元数据指向已消失的数据”这类不可自愈状态。
+- 错误分类必须区分“数据故障”（重传同批输入只会得到同样结果，标失败并回收）与“存储/瞬时故障”（保留现场让调用方重试）；把后者归为前者会造成客户端无限重传。
 
 ## 里程碑完成定义（§9）
 

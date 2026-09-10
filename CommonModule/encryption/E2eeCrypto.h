@@ -58,6 +58,17 @@ public:
     static QByteArray aesGcmDecrypt(const QByteArray &key, const QByteArray &iv,
                                     const QByteArray &ciphertext);
 
+    // M8: 带调用方指定 nonce 与 AAD 的 AES-256-GCM（文件分片加解密）
+    //
+    // 与 aesGcmEncrypt 的区别：nonce 不由本函数随机生成而由调用方派生，以便同一
+    // 密钥下按分片序号确定性重建；AAD 参与认证但不加密，用于绑定分片位置
+    // （防重排/截断）。输入输出格式同为 密文||16B 标签。
+    // nonce 必须为 12 字节；密钥必须为 32 字节；失败（含认证失败）返回空
+    static QByteArray aesGcmEncryptAad(const QByteArray &key, const QByteArray &nonce,
+                                       const QByteArray &plaintext, const QByteArray &aad);
+    static QByteArray aesGcmDecryptAad(const QByteArray &key, const QByteArray &nonce,
+                                       const QByteArray &ciphertext, const QByteArray &aad);
+
     // envelope 编解码
     // envelope: {"v":1,"devices":[{"deviceId","prekeyId","eph","iv","ct"}...]}
     // prekeyId == SelfCopyPrekeyId 表示发送方自己设备的拷贝（仅用身份密钥加密，

@@ -121,6 +121,9 @@ bool DatabaseManager::runMigrations()
     if (currentVersion < 9) {
         if (!migrateToV9()) return false;
     }
+    if (currentVersion < 10) {
+        if (!migrateToV10()) return false;
+    }
 
     return true;
 }
@@ -667,6 +670,109 @@ bool DatabaseManager::migrateToV9()
     }
 
     qDebug() << "[DB] Migration V9 complete";
+    return true;
+}
+
+// V10（M8）：文件元数据表、文件票据表与消息的文件关联列
+bool DatabaseManager::migrateToV10()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V10...";
+
+    // files：只存服务端自身可见的元数据。文件名/MIME/明文大小/多媒体尺寸
+    // 一律不入本表：它们在 FileManifest 中随消息正文 E2EE 传输，服务端无从得知。
+    // blob_key 为对象存储分配的不透明键，UNIQUE 避免同一存储键被两条记录争用
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS files ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  blob_key TEXT NOT NULL UNIQUE,"
+            "  uploader_id INTEGER NOT NULL,"
+            "  uploader_device_id TEXT NOT NULL DEFAULT '',"
+            "  size_bytes INTEGER NOT NULL,"
+            "  chunk_size INTEGER NOT NULL,"
+            "  chunk_count INTEGER NOT NULL,"
+            "  sha256_hex TEXT NOT NULL,"
+            "  status TEXT NOT NULL DEFAULT 'uploading',"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  completed_at TEXT,"
+            "  FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE)")) {
+        qCritical() << "[DB] V10: Failed to create files table:" << q.lastError().text();
+        return false;
+    }
+
+    // 两个回收/配额查询路径：按上传者查在传文件、按状态+时间查超期上传
+    if (!q.exec("CREATE INDEX IF NOT EXISTS idx_files_uploader_status "
+                "ON files(uploader_id, status)")) {
+        qCritical() << "[DB] V10: Failed to create idx_files_uploader_status:"
+                    << q.lastError().text();
+        return false;
+    }
+    if (!q.exec("CREATE INDEX IF NOT EXISTS idx_files_status_created "
+                "ON files(status, created_at)")) {
+        qCritical() << "[DB] V10: Failed to create idx_files_status_created:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    // file_tickets：上传/下载授权凭据。只存 SHA-256 摘要，明文票据仅在签发响应中
+    // 返回一次，与 sessions.token_hash 同一套做法（库泄露不等于凭据泄露）
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS file_tickets ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  ticket_hash TEXT NOT NULL UNIQUE,"
+            "  file_id INTEGER NOT NULL,"
+            "  user_id INTEGER NOT NULL,"
+            "  kind TEXT NOT NULL,"
+            "  used INTEGER NOT NULL DEFAULT 0,"
+            "  expires_at TEXT NOT NULL,"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,"
+            "  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)")) {
+        qCritical() << "[DB] V10: Failed to create file_tickets table:"
+                    << q.lastError().text();
+        return false;
+    }
+    if (!q.exec("CREATE INDEX IF NOT EXISTS idx_file_tickets_expires "
+                "ON file_tickets(expires_at)")) {
+        qCritical() << "[DB] V10: Failed to create idx_file_tickets_expires:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    // messages.file_id：文件消息与 files 的关联，同时作为"正文密文解出后是否为
+    // FileManifest"的判别依据（随消息同步给客户端，不靠解析正文猜测）。
+    // 故不对外键加 ON DELETE 行为：若文件行被误删而列被置 NULL，客户端会把
+    // 清单 JSON 当普通文本渲染；不变量由应用层保证（不删被引用的文件）
+    bool hasFileId = false;
+    if (q.exec("PRAGMA table_info(messages)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "file_id") {
+                hasFileId = true;
+                break;
+            }
+        }
+    }
+    if (!hasFileId &&
+        !q.exec("ALTER TABLE messages ADD COLUMN file_id INTEGER")) {
+        qCritical() << "[DB] V10: Failed to add messages.file_id:"
+                    << q.lastError().text();
+        return false;
+    }
+    if (!q.exec("CREATE INDEX IF NOT EXISTS idx_messages_file ON messages(file_id)")) {
+        qCritical() << "[DB] V10: Failed to create idx_messages_file:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    q.prepare("INSERT INTO schema_version (version) VALUES (10)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V10: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V10 complete";
     return true;
 }
 
@@ -1260,9 +1366,13 @@ bool DatabaseManager::canAccessMessage(qint64 messageId, qint64 userId)
 qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
                                     const QString &content, const QString &contentType,
                                     const QString &clientMessageId,
-                                    const QString &senderDeviceId)
+                                    const QString &senderDeviceId,
+                                    qint64 fileId, bool *fileNotReady)
 {
-    // M5.5: 幂等去重：同一设备重复提交同一 client_message_id 时返回已有消息
+    if (fileNotReady) {
+        *fileNotReady = false;
+    }
+    // M5.5: 幂等去重：同一设备重复提交同一 client_message_id 时返回既有消息
     if (!clientMessageId.isEmpty()) {
         auto existing = getMessageByClientKey(senderId, senderDeviceId, clientMessageId);
         if (existing.has_value()) {
@@ -1272,10 +1382,20 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
 
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
     QSqlQuery q(db);
-    q.prepare(
-        "INSERT INTO messages "
-        "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id) "
-        "VALUES (?, ?, ?, ?, 'sent', ?, ?)");
+    // M8: 带文件时把“文件仍为 ready”下推为插入条件（单语句原子，消除与回收
+    // 任务的竞态，详见头文件注释）；不带文件时保持原 VALUES 形式
+    if (fileId > 0) {
+        q.prepare(
+            "INSERT INTO messages "
+            "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id, file_id) "
+            "SELECT ?, ?, ?, ?, 'sent', ?, ?, ? "
+            "WHERE EXISTS (SELECT 1 FROM files WHERE id = ? AND status = 'ready')");
+    } else {
+        q.prepare(
+            "INSERT INTO messages "
+            "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id, file_id) "
+            "VALUES (?, ?, ?, ?, 'sent', ?, ?, ?)");
+    }
     q.addBindValue(conversationId);
     q.addBindValue(senderId);
     q.addBindValue(content);
@@ -1284,6 +1404,12 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
                                              : QVariant(clientMessageId));
     q.addBindValue(senderDeviceId.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
                                             : QVariant(senderDeviceId));
+    // M8: file_id 为 NULL 表示普通消息，文件消息写入 files.id。
+    // 绑定无效 QVariant 即 NULL（区别于 0，使 IS NULL 判定与索引都更紧凑）
+    q.addBindValue(fileId > 0 ? QVariant(fileId) : QVariant());
+    if (fileId > 0) {
+        q.addBindValue(fileId); // 守卫子查询的 files.id
+    }
     if (!q.exec()) {
         // 并发重试可能命中唯一索引：再查一次幂等键
         if (!clientMessageId.isEmpty()) {
@@ -1293,6 +1419,14 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
             }
         }
         qWarning() << "[DB] sendMessage failed:" << q.lastError().text();
+        return -1;
+    }
+    if (fileId > 0 && q.numRowsAffected() == 0) {
+        // 守卫子查询未命中：文件已不是 ready（被并发取消/标失败，或被维护任务
+        // 迁入终态）。不写入消息，也不得让调用方把它当成 SQL 故障
+        if (fileNotReady) {
+            *fileNotReady = true;
+        }
         return -1;
     }
 
@@ -1317,7 +1451,7 @@ std::optional<MessageInfo> DatabaseManager::getMessageByClientKey(qint64 senderI
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
     QSqlQuery q(db);
     q.prepare(
-        "SELECT id, conversation_id, content, content_type, status, created_at "
+        "SELECT id, conversation_id, content, content_type, status, created_at, file_id "
         "FROM messages "
         "WHERE sender_id = ? AND sender_device_id = ? AND client_message_id = ?");
     q.addBindValue(senderId);
@@ -1332,6 +1466,8 @@ std::optional<MessageInfo> DatabaseManager::getMessageByClientKey(qint64 senderI
         mi.contentType = q.value(3).toString();
         mi.status = q.value(4).toString();
         mi.createdAt = q.value(5).toString();
+        // M8: 幂等命中时也要带回 fileId，否则重发的文件消息在客户端退化为文本消息
+        mi.fileId = q.value(6).toLongLong();
         mi.clientMessageId = clientMessageId;
         return mi;
     }
@@ -1345,7 +1481,7 @@ std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
     q.prepare(
         "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
         "  m.content, m.content_type, m.status, m.created_at, "
-        "  m.edited_at, m.deleted "
+        "  m.edited_at, m.deleted, m.file_id "
         "FROM messages m JOIN users u ON m.sender_id = u.id "
         "WHERE m.id = ?");
     q.addBindValue(messageId);
@@ -1361,6 +1497,7 @@ std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
         mi.createdAt = q.value(7).toString();
         mi.editedAt = q.value(8).toString();
         mi.deleted = q.value(9).toInt() != 0;
+        mi.fileId = q.value(10).toLongLong();
         return mi;
     }
     return std::nullopt;
@@ -1376,7 +1513,7 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
         q.prepare(
             "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
             "  m.content, m.content_type, m.status, m.created_at, "
-            "  m.edited_at, m.deleted "
+            "  m.edited_at, m.deleted, m.file_id "
             "FROM messages m JOIN users u ON m.sender_id = u.id "
             "WHERE m.conversation_id = ? AND m.id < ? "
             "ORDER BY m.id DESC LIMIT ?");
@@ -1387,7 +1524,7 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
         q.prepare(
             "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
             "  m.content, m.content_type, m.status, m.created_at, "
-            "  m.edited_at, m.deleted "
+            "  m.edited_at, m.deleted, m.file_id "
             "FROM messages m JOIN users u ON m.sender_id = u.id "
             "WHERE m.conversation_id = ? "
             "ORDER BY m.id DESC LIMIT ?");
@@ -1408,6 +1545,7 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
             mi.createdAt = q.value(7).toString();
             mi.editedAt = q.value(8).toString();
             mi.deleted = q.value(9).toInt() != 0;
+            mi.fileId = q.value(10).toLongLong();
             result.prepend(mi); // 按时间正序排列
         }
     }
@@ -1422,7 +1560,7 @@ QList<MessageInfo> DatabaseManager::syncMessages(qint64 conversationId, qint64 a
     q.prepare(
         "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
         "  m.content, m.content_type, m.status, m.created_at, "
-        "  m.edited_at, m.deleted "
+        "  m.edited_at, m.deleted, m.file_id "
         "FROM messages m JOIN users u ON m.sender_id = u.id "
         "WHERE m.conversation_id = ? AND m.id > ? "
         "ORDER BY m.id ASC LIMIT ?");
@@ -1442,6 +1580,7 @@ QList<MessageInfo> DatabaseManager::syncMessages(qint64 conversationId, qint64 a
             mi.createdAt = q.value(7).toString();
             mi.editedAt = q.value(8).toString();
             mi.deleted = q.value(9).toInt() != 0;
+            mi.fileId = q.value(10).toLongLong();
             result.append(mi);
         }
     }
@@ -2329,4 +2468,416 @@ std::optional<std::pair<bool, bool>> DatabaseManager::getConversationPrefs(qint6
     // 非成员（无 conversation_members 行）返回默认 false/false，
     // 与文档契约一致（成员存在性由调用方通过 isConversationMember 校验）
     return std::make_pair(false, false);
+}
+
+// M8: 文件状态迁移的统一实现
+// 把 status='uploading' 写进 WHERE：既保证终态不可被覆写（重复完成/取消请求
+// 不会把 ready 改回 cancelled），也让"记录不存在"与"已处终态"都落到
+// numRowsAffected()==0，不会被误判为成功
+static bool transitionFileStatus(const QString &connectionName, qint64 fileId,
+                                 const QString &toStatus, bool stampCompleted)
+{
+    if (fileId <= 0 || toStatus.isEmpty()) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(connectionName);
+    QSqlQuery q(db);
+    if (stampCompleted) {
+        q.prepare("UPDATE files SET status = ?, completed_at = datetime('now') "
+                  "WHERE id = ? AND status = 'uploading'");
+    } else {
+        q.prepare("UPDATE files SET status = ? "
+                  "WHERE id = ? AND status = 'uploading'");
+    }
+    q.addBindValue(toStatus);
+    q.addBindValue(fileId);
+    if (!q.exec()) {
+        qWarning() << "[DB] transitionFileStatus failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+// 从当前结果行装配 FileRecord（列顺序需与各处 SELECT 一致）
+static FileRecord fileRecordFromQuery(const QSqlQuery &q)
+{
+    FileRecord rec;
+    rec.id = q.value(0).toLongLong();
+    rec.blobKey = q.value(1).toString();
+    rec.uploaderId = q.value(2).toLongLong();
+    rec.uploaderDeviceId = q.value(3).toString();
+    rec.sizeBytes = q.value(4).toLongLong();
+    rec.chunkSize = q.value(5).toLongLong();
+    rec.chunkCount = q.value(6).toInt();
+    rec.sha256Hex = q.value(7).toString();
+    rec.status = q.value(8).toString();
+    rec.createdAt = q.value(9).toString();
+    rec.completedAt = q.value(10).toString();
+    return rec;
+}
+
+// files 表各查询共用的列清单（与 fileRecordFromQuery 的取值下标一一对应）
+static const QString FileSelectSql =
+    "SELECT id, blob_key, uploader_id, uploader_device_id, size_bytes, "
+    "  chunk_size, chunk_count, sha256_hex, status, created_at, completed_at "
+    "FROM files ";
+
+qint64 DatabaseManager::createFileRecord(qint64 uploaderId, const QString &uploaderDeviceId,
+                                         const QString &blobKey, qint64 sizeBytes,
+                                         qint64 chunkSize, int chunkCount,
+                                         const QString &sha256Hex,
+                                         int maxConcurrentUploads, bool *quotaExceeded)
+{
+    if (quotaExceeded) {
+        *quotaExceeded = false;
+    }
+    // 只做结构性兜底（非正数/空串）；分片口径与体积上限属协议策略，
+    // 由 RequestHandler 依 Protocol::isChunkingValid 先行判定
+    if (uploaderId <= 0 || blobKey.isEmpty() || sizeBytes <= 0
+        || chunkSize <= 0 || chunkCount <= 0 || sha256Hex.isEmpty()) {
+        return -1;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    if (maxConcurrentUploads > 0) {
+        // 配额与插入合并为单条语句：SQLite 语句本身原子，消除"先读计数后插入"
+        // 的 TOCTOU（同一用户多设备并发创建时，分步版本会全部读到未满而集体放行）。
+        // 条件不满足时 SELECT 无行 -> 不插入 -> numRowsAffected 为 0
+        q.prepare(
+            "INSERT INTO files "
+            "  (blob_key, uploader_id, uploader_device_id, size_bytes, chunk_size, "
+            "   chunk_count, sha256_hex, status) "
+            "SELECT ?, ?, ?, ?, ?, ?, ?, 'uploading' "
+            "WHERE (SELECT COUNT(*) FROM files "
+            "       WHERE uploader_id = ? AND status = 'uploading') < ?");
+        q.addBindValue(blobKey);
+        q.addBindValue(uploaderId);
+        q.addBindValue(uploaderDeviceId);
+        q.addBindValue(sizeBytes);
+        q.addBindValue(chunkSize);
+        q.addBindValue(chunkCount);
+        q.addBindValue(sha256Hex);
+        q.addBindValue(uploaderId);
+        q.addBindValue(maxConcurrentUploads);
+    } else {
+        q.prepare(
+            "INSERT INTO files "
+            "  (blob_key, uploader_id, uploader_device_id, size_bytes, chunk_size, "
+            "   chunk_count, sha256_hex, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'uploading')");
+        q.addBindValue(blobKey);
+        q.addBindValue(uploaderId);
+        q.addBindValue(uploaderDeviceId);
+        q.addBindValue(sizeBytes);
+        q.addBindValue(chunkSize);
+        q.addBindValue(chunkCount);
+        q.addBindValue(sha256Hex);
+    }
+
+    if (!q.exec()) {
+        // blob_key UNIQUE 冲突（存储键重复分配）也落到这里：宁可让本次上传失败，
+        // 也不能把两个文件的数据写进同一个 blob
+        qWarning() << "[DB] createFileRecord failed:" << q.lastError().text();
+        return -1;
+    }
+    if (q.numRowsAffected() == 0) {
+        // 仅配额受限的子查询形式会出现"执行成功但未插入"
+        if (quotaExceeded) {
+            *quotaExceeded = true;
+        }
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+std::optional<FileRecord> DatabaseManager::getFileRecord(qint64 fileId)
+{
+    if (fileId <= 0) {
+        return std::nullopt;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(FileSelectSql + "WHERE id = ?");
+    q.addBindValue(fileId);
+    if (q.exec() && q.next()) {
+        return fileRecordFromQuery(q);
+    }
+    return std::nullopt;
+}
+
+bool DatabaseManager::markFileReady(qint64 fileId)
+{
+    return transitionFileStatus(m_connectionName, fileId, "ready", true);
+}
+
+bool DatabaseManager::markFileCancelled(qint64 fileId)
+{
+    return transitionFileStatus(m_connectionName, fileId, "cancelled", false);
+}
+
+bool DatabaseManager::markFileFailed(qint64 fileId)
+{
+    return transitionFileStatus(m_connectionName, fileId, "failed", false);
+}
+
+int DatabaseManager::uploadingCountForUser(qint64 userId)
+{
+    if (userId <= 0) {
+        return 0;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT COUNT(*) FROM files WHERE uploader_id = ? AND status = 'uploading'");
+    q.addBindValue(userId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt();
+    }
+    // 查询失败返回 -1（而非 0）：调用方据此区分"确无在传文件"与"用量不明"，
+    // 后者应回 InternalError 而不是误导性的配额超限
+    return -1;
+}
+
+QList<FileRecord> DatabaseManager::getStaleUploads(int staleHours, int limit)
+{
+    QList<FileRecord> result;
+    if (staleHours <= 0 || limit <= 0) {
+        return result;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(FileSelectSql
+              + "WHERE status = 'uploading' AND created_at < datetime('now', ?) "
+                "ORDER BY created_at LIMIT ?");
+    q.addBindValue(QString("-%1 hours").arg(staleHours));
+    q.addBindValue(limit);
+    if (q.exec()) {
+        while (q.next()) {
+            result.append(fileRecordFromQuery(q));
+        }
+    }
+    return result;
+}
+
+QList<FileRecord> DatabaseManager::getTerminalFiles(int olderThanHours, int limit)
+{
+    QList<FileRecord> result;
+    if (olderThanHours <= 0 || limit <= 0) {
+        return result;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 仅终态：ready 行可能仍被消息引用，不得进入本回收路径
+    q.prepare(FileSelectSql
+              + "WHERE status IN ('cancelled', 'failed') "
+                "AND created_at < datetime('now', ?) "
+                "ORDER BY created_at LIMIT ?");
+    q.addBindValue(QString("-%1 hours").arg(olderThanHours));
+    q.addBindValue(limit);
+    if (q.exec()) {
+        while (q.next()) {
+            result.append(fileRecordFromQuery(q));
+        }
+    }
+    return result;
+}
+
+QList<FileRecord> DatabaseManager::getUnreferencedReadyFiles(int olderThanHours, int limit)
+{
+    QList<FileRecord> result;
+    if (olderThanHours <= 0 || limit <= 0) {
+        return result;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 引用判定与 isFileReferencedByMessage 同口径（deleted = 0），两处不一致会
+    // 让回收任务删掉仍可下载的文件。子查询走 idx_messages_file
+    q.prepare(FileSelectSql
+              + "WHERE status = 'ready' "
+                "AND COALESCE(completed_at, created_at) < datetime('now', ?) "
+                "AND NOT EXISTS (SELECT 1 FROM messages m "
+                "                WHERE m.file_id = files.id AND m.deleted = 0) "
+                "ORDER BY COALESCE(completed_at, created_at) LIMIT ?");
+    q.addBindValue(QString("-%1 hours").arg(olderThanHours));
+    q.addBindValue(limit);
+    if (q.exec()) {
+        while (q.next()) {
+            result.append(fileRecordFromQuery(q));
+        }
+    }
+    return result;
+}
+
+bool DatabaseManager::isFileReferencedByMessage(qint64 fileId)
+{
+    if (fileId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 排除软删除的消息：与 canUserAccessFile 同一口径。已删除的消息不再给任何人
+    // 提供下载路径，其文件应可被回收；否则每次删除附件消息都会永久泄露一份存储
+    q.prepare("SELECT COUNT(*) FROM messages WHERE file_id = ? AND deleted = 0");
+    q.addBindValue(fileId);
+    if (!q.exec() || !q.next()) {
+        // 查不到就当被引用：误删会让客户端把 FileManifest 当文本渲染
+        return true;
+    }
+    return q.value(0).toLongLong() > 0;
+}
+
+bool DatabaseManager::canUserAccessFile(qint64 fileId, qint64 userId)
+{
+    if (fileId <= 0 || userId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    // 本人上传的文件自己始终可取：发送失败重试、本人其他设备同步都需要
+    q.prepare("SELECT COUNT(*) FROM files WHERE id = ? AND uploader_id = ?");
+    q.addBindValue(fileId);
+    q.addBindValue(userId);
+    if (q.exec() && q.next() && q.value(0).toLongLong() > 0) {
+        return true;
+    }
+
+    // 其余情况要求"存在一条未删除的消息把该文件带进了用户所属的会话"。
+    // 以 messages.file_id（服务端权威）而非清单自述为准：清单由发送者加密，
+    // 其中声称的 fileId 不可信，若据此授权就能让接收方被诱导下载任意文件
+    q.prepare("SELECT COUNT(*) FROM messages m "
+              "JOIN conversation_members cm ON cm.conversation_id = m.conversation_id "
+              "WHERE m.file_id = ? AND cm.user_id = ? AND m.deleted = 0");
+    q.addBindValue(fileId);
+    q.addBindValue(userId);
+    if (!q.exec() || !q.next()) {
+        return false; // 查询失败按无权处理（fail-closed）
+    }
+    return q.value(0).toLongLong() > 0;
+}
+
+bool DatabaseManager::deleteFileRecord(qint64 fileId)
+{
+    if (fileId <= 0) {
+        return false;
+    }
+    // 双重保险：即便调用方漏判，也不得删掉仍被消息引用的文件元数据
+    if (isFileReferencedByMessage(fileId)) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM files WHERE id = ?");
+    q.addBindValue(fileId);
+    if (!q.exec()) {
+        qWarning() << "[DB] deleteFileRecord failed:" << q.lastError().text();
+        return false;
+    }
+    // 行本就不存在不算失败：回收任务需要可重复调用
+    return true;
+}
+
+bool DatabaseManager::cancelUnreferencedReadyFile(qint64 fileId)
+{
+    if (fileId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 单条语句完成"确认无引用 + 迁入终态"，避开先查后改的竞态
+    q.prepare("UPDATE files SET status = 'cancelled' "
+              "WHERE id = ? AND status = 'ready' "
+              "  AND NOT EXISTS (SELECT 1 FROM messages m "
+              "                  WHERE m.file_id = files.id AND m.deleted = 0)");
+    q.addBindValue(fileId);
+    if (!q.exec()) {
+        qWarning() << "[DB] cancelUnreferencedReadyFile failed:" << q.lastError().text();
+        return false;
+    }
+    // 未命中条件（被引用 / 已不是 ready / 行不存在）时不报错，调用方下一轮重试
+    return q.numRowsAffected() > 0;
+}
+
+bool DatabaseManager::issueFileTicket(qint64 fileId, qint64 userId, const QString &kind,
+                                      const QString &ticketHash, int ttlSeconds)
+{
+    if (fileId <= 0 || userId <= 0 || kind.isEmpty()
+        || ticketHash.isEmpty() || ttlSeconds <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 过期时间由 SQLite 计算，与 validateFileTicket 的 datetime('now') 同一时钟源、
+    // 同一格式，避免两侧字典序比较因格式差异而失效
+    q.prepare("INSERT INTO file_tickets (ticket_hash, file_id, user_id, kind, expires_at) "
+              "VALUES (?, ?, ?, ?, datetime('now', ?))");
+    q.addBindValue(ticketHash);
+    q.addBindValue(fileId);
+    q.addBindValue(userId);
+    q.addBindValue(kind);
+    q.addBindValue(QString("+%1 seconds").arg(ttlSeconds));
+    if (!q.exec()) {
+        // ticket_hash UNIQUE 冲突意味着 32 字节随机票据撞车，概率可忽略；
+        // 真发生时让本次签发失败而不是复用他人票据
+        qWarning() << "[DB] issueFileTicket failed:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+std::optional<FileTicketInfo> DatabaseManager::validateFileTicket(const QString &ticketHash,
+                                                                  const QString &kind)
+{
+    if (ticketHash.isEmpty() || kind.isEmpty()) {
+        return std::nullopt;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 四项条件（存在、用途匹配、未过期、未消费）全部下推到 SQL：
+    // 单条语句内完成判定，不留"先查后判"的时间窗，也不向调用方暴露失败原因差异
+    q.prepare("SELECT id, file_id, user_id, kind, used, expires_at, created_at "
+              "FROM file_tickets "
+              "WHERE ticket_hash = ? AND kind = ? AND used = 0 "
+              "  AND expires_at >= datetime('now')");
+    q.addBindValue(ticketHash);
+    q.addBindValue(kind);
+    if (!q.exec() || !q.next()) {
+        return std::nullopt;
+    }
+    FileTicketInfo info;
+    info.id = q.value(0).toLongLong();
+    info.fileId = q.value(1).toLongLong();
+    info.userId = q.value(2).toLongLong();
+    info.kind = q.value(3).toString();
+    info.used = q.value(4).toInt() != 0;
+    info.expiresAt = q.value(5).toString();
+    info.createdAt = q.value(6).toString();
+    return info;
+}
+
+bool DatabaseManager::markFileTicketUsed(qint64 ticketId)
+{
+    if (ticketId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("UPDATE file_tickets SET used = 1 WHERE id = ? AND used = 0");
+    q.addBindValue(ticketId);
+    if (!q.exec()) {
+        qWarning() << "[DB] markFileTicketUsed failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+int DatabaseManager::pruneExpiredFileTickets()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    if (!q.exec("DELETE FROM file_tickets WHERE expires_at < datetime('now')")) {
+        qWarning() << "[DB] pruneExpiredFileTickets failed:" << q.lastError().text();
+        return -1;
+    }
+    return q.numRowsAffected();
 }

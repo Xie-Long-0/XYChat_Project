@@ -22,9 +22,13 @@ add_library(XYChatCommon STATIC
     CommonModule/encryption/E2eeCrypto.h
     CommonModule/encryption/GroupE2eeCrypto.cpp
     CommonModule/encryption/GroupE2eeCrypto.h
+    CommonModule/encryption/FileCrypto.cpp
+    CommonModule/encryption/FileCrypto.h
     CommonModule/protocol/Packet.h
     CommonModule/protocol/PacketCodec.cpp
     CommonModule/protocol/PacketCodec.h
+    CommonModule/protocol/FileProtocol.cpp
+    CommonModule/protocol/FileProtocol.h
     CommonModule/security/TlsHelper.cpp
     CommonModule/security/TlsHelper.h
     CommonModule/security/SecureMemory.cpp
@@ -38,6 +42,7 @@ add_library(XYChatCommon STATIC
 target_include_directories(XYChatCommon PUBLIC
     ${PROJECT_SOURCE_DIR}/CommonModule
     ${PROJECT_SOURCE_DIR}/CommonModule/encryption
+    ${PROJECT_SOURCE_DIR}/CommonModule/protocol
     ${PROJECT_SOURCE_DIR}/CommonModule/security
 )
 
