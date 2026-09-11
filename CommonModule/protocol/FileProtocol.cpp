@@ -70,6 +70,16 @@ bool FileManifest::isValid() const
     if (!isSha256Hex(sha256Hex)) {
         return false;
     }
+    // 分片口径必须由清单自带且自洽：chunkSize 在合法区间内，按它算出的
+    // 分片数不超上限。缺失（旧清单或被篡改）一律拒绝，不猜默认值：
+    // 接收方需要它才能切分密文并逐片解密
+    if (chunkSize < MinChunkSize || chunkSize > MaxChunkSize) {
+        return false;
+    }
+    const int chunks = chunkCountFor(cipherSize, chunkSize);
+    if (chunks <= 0 || chunks > MaxChunkCount) {
+        return false;
+    }
     // 文件名必填：接收端要靠它落地到磁盘，空名会让下载路径退化为用户目录
     if (name.isEmpty() || name.size() > MaxFileNameLength) {
         return false;
@@ -100,6 +110,7 @@ QString encodeFileManifest(const FileManifest &manifest)
     obj["mime"] = manifest.mime;
     obj["plainSize"] = manifest.plainSize;
     obj["cipherSize"] = manifest.cipherSize;
+    obj["chunkSize"] = manifest.chunkSize;
     obj["sha256"] = manifest.sha256Hex;
     obj["key"] = toBase64(manifest.key);
     obj["iv"] = toBase64(manifest.iv);
@@ -143,6 +154,7 @@ FileManifest decodeFileManifest(const QString &json, bool *ok)
     manifest.mime = obj.value("mime").toString();
     manifest.plainSize = obj.value("plainSize").toVariant().toLongLong();
     manifest.cipherSize = obj.value("cipherSize").toVariant().toLongLong();
+    manifest.chunkSize = obj.value("chunkSize").toVariant().toLongLong();
     manifest.sha256Hex = obj.value("sha256").toString();
     manifest.key = fromBase64(obj.value("key").toString());
     manifest.iv = fromBase64(obj.value("iv").toString());

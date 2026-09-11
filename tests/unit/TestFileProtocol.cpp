@@ -26,8 +26,12 @@ FileManifest makeValidManifest()
     m.fileId = 42;
     m.name = "quarterly-report.pdf";
     m.mime = "application/pdf";
-    m.plainSize = 3 * 1024 * 1024;       // 3 MiB 明文，按 1 MiB 分三片
-    m.cipherSize = m.plainSize + 3 * 16; // 每片各多一个 GCM 标签
+    m.chunkSize = 1024 * 1024; // 密文分片 1 MiB
+    // 明文分片 = 密文分片 - GCM 标签，因此取"整三片"必须按明文分片口径算：
+    // 直接写 3 MiB 明文实际会多出 48 字节而成为第四片，夹具不自洽会让
+    // 后续"单点破坏"用例失去意义
+    m.plainSize = 3 * plainSizeOfChunk(m.chunkSize);
+    m.cipherSize = m.plainSize + 3 * 16; // 恰好三个满密文分片
     m.sha256Hex = FileCrypto::sha256Hex("ciphertext-placeholder");
     m.key = fileKey.key;
     m.iv = fileKey.iv;
@@ -62,6 +66,7 @@ private slots:
     void decodeRejectsBadKeyMaterial();
     void decodeRejectsBadSha256();
     void decodeRejectsInconsistentSizes();
+    void decodeRejectsBadChunkSize();
     void decodeRejectsBadNameAndOversizeThumbnail();
     void looksLikeFileManifestDiscriminates();
 
@@ -103,6 +108,7 @@ void TestFileProtocol::manifestRoundTrips()
     QCOMPARE(decoded.mime, original.mime);
     QCOMPARE(decoded.plainSize, original.plainSize);
     QCOMPARE(decoded.cipherSize, original.cipherSize);
+    QCOMPARE(decoded.chunkSize, original.chunkSize);
     QCOMPARE(decoded.sha256Hex, original.sha256Hex);
     QCOMPARE(decoded.key, original.key);
     QCOMPARE(decoded.iv, original.iv);
@@ -281,6 +287,52 @@ void TestFileProtocol::decodeRejectsInconsistentSizes()
     ok = true;
     decodeObject(obj, &ok);
     QVERIFY(!ok);
+}
+
+void TestFileProtocol::decodeRejectsBadChunkSize()
+{
+    // 分片口径必须自带且自洽：缺失或非法一律拒绝，不猜默认值。
+    // 若接收方改用服务端声明的口径，不可信的服务端就能让解密错乱
+    bool ok = true;
+
+    QJsonObject obj = manifestObject(makeValidManifest());
+    obj.remove("chunkSize");
+    QVERIFY(!decodeObject(obj, &ok).isValid());
+    QVERIFY(!ok);
+
+    obj = manifestObject(makeValidManifest());
+    obj["chunkSize"] = 0;
+    ok = true;
+    QVERIFY(!decodeObject(obj, &ok).isValid());
+    QVERIFY(!ok);
+
+    obj = manifestObject(makeValidManifest());
+    obj["chunkSize"] = MinChunkSize - 1;
+    ok = true;
+    QVERIFY(!decodeObject(obj, &ok).isValid());
+    QVERIFY(!ok);
+
+    obj = manifestObject(makeValidManifest());
+    obj["chunkSize"] = MaxChunkSize + 1;
+    ok = true;
+    QVERIFY(!decodeObject(obj, &ok).isValid());
+    QVERIFY(!ok);
+
+    // 口径在区间内但与 cipherSize 不自洽：最小分片 + 最大体积远超分片数上限
+    obj = manifestObject(makeValidManifest());
+    obj["chunkSize"] = MinChunkSize;
+    obj["cipherSize"] = MaxFileSize;
+    obj["plainSize"] = MaxFileSize - 16;
+    ok = true;
+    QVERIFY(!decodeObject(obj, &ok).isValid());
+    QVERIFY(!ok);
+
+    // 合法值原样往返，且与分片数学口径一致
+    const FileManifest valid = makeValidManifest();
+    const FileManifest decoded = decodeFileManifest(encodeFileManifest(valid), &ok);
+    QVERIFY(ok);
+    QCOMPARE(decoded.chunkSize, valid.chunkSize);
+    QCOMPARE(chunkCountFor(decoded.cipherSize, decoded.chunkSize), 3);
 }
 
 void TestFileProtocol::decodeRejectsBadNameAndOversizeThumbnail()

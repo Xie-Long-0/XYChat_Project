@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 import "../theme"
 
@@ -10,6 +11,23 @@ Rectangle {
     color: Theme.inputBackground
 
     signal messageSent(string text)
+    // M8.2: 用户选定附件后上报本地路径（上传与清单封装全在 C++ 侧完成，
+    // 文件密钥不经 QML）
+    signal attachmentSelected(string filePath)
+
+    // M8.2: 附件选择器。fileMode 为 OpenFile（单选），路径以本地文件形式传给引擎
+    FileDialog {
+        id: attachmentDialog
+        title: qsTr("选择要发送的文件")
+        fileMode: FileDialog.OpenFile
+        onAccepted: {
+            if (selectedFile.toString().length > 0) {
+                // 用 Qt.urlToLocalFile 而不是正则剔 file:// 前缀：后者对 UNC
+                // 路径与含 %/#/? 的文件名会给出错误结果，上传时表现为"文件不存在"
+                attachmentSelected(Qt.urlToLocalFile(selectedFile))
+            }
+        }
+    }
 
     // 顶部分隔线
     Rectangle {
@@ -28,6 +46,55 @@ Rectangle {
         anchors.leftMargin: Theme.spacingLarge
         anchors.rightMargin: Theme.spacingLarge
         spacing: Theme.spacingSmall
+
+        // M8.2: 附件按钮（回形针）。未开启文件能力时置灰并提示，
+        // 而不是让用户点了没反应
+        Rectangle {
+            id: attachButton
+            width: Theme.inputHeight
+            height: Theme.inputHeight
+            radius: Theme.inputHeight / 2
+            color: attachMouse.pressed ? Theme.inputBorderColor : "transparent"
+            // context property 未注册时直接引用会抛 ReferenceError，故用 typeof 判定
+            opacity: typeof fileTransfer !== "undefined" && fileTransfer.enabled ? 1.0 : 0.4
+
+            Behavior on color { ColorAnimation { duration: Theme.animationFast } }
+
+            MouseArea {
+                id: attachMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                    if (typeof fileTransfer !== "undefined" && fileTransfer.enabled) {
+                        attachmentDialog.open()
+                    }
+                }
+            }
+
+            Canvas {
+                anchors.centerIn: parent
+                width: 18; height: 18
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.clearRect(0, 0, width, height)
+                    ctx.strokeStyle = Theme.textSecondary
+                    ctx.lineWidth = 2
+                    ctx.lineCap = "round"
+                    // 回形针：两段同心圆弧加一条斜线
+                    ctx.beginPath()
+                    ctx.moveTo(5, 12)
+                    ctx.lineTo(12, 5)
+                    ctx.stroke()
+                    ctx.beginPath()
+                    ctx.arc(5.5, 12.5, 2.5, Math.PI * 0.5, Math.PI * 2)
+                    ctx.stroke()
+                    ctx.beginPath()
+                    ctx.arc(12.5, 5.5, 3.5, Math.PI * 1.2, Math.PI * 2.7)
+                    ctx.stroke()
+                }
+            }
+        }
 
         // 输入框
         TextField {

@@ -16,6 +16,7 @@
 #include "encryption/GroupE2eeCrypto.h"
 #include "KeyStorage.h"
 #include "LocalStore.h"
+#include "FileTransferManager.h"
 
 class NetworkManager : public QObject
 {
@@ -54,7 +55,7 @@ public:
     // M3: 会话与消息
     Q_INVOKABLE void getConversations();
     // M4.5: 返回客户端幂等键 clientMessageId，供 QML 跟踪乐观消息状态
-    Q_INVOKABLE QString sendMessage(qint64 toUserId, const QString &content);
+    Q_INVOKABLE QString sendMessage(qint64 toUserId, const QString &content, qint64 fileId = 0);
     Q_INVOKABLE void ackMessage(qint64 messageId, const QString &status = "delivered");
     Q_INVOKABLE void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
     // M5.5: 账号级增量同步
@@ -67,7 +68,8 @@ public:
     Q_INVOKABLE void kickGroupMember(qint64 conversationId, qint64 userId);
     Q_INVOKABLE void getGroupInfo(qint64 conversationId);
     // M7a: 发送群消息（明文，返回幂等键供乐观消息跟踪）
-    Q_INVOKABLE QString sendGroupMessage(qint64 conversationId, const QString &content);
+    Q_INVOKABLE QString sendGroupMessage(qint64 conversationId, const QString &content,
+                                         qint64 fileId = 0);
 
     // M9 特性栈：会话偏好（置顶/免打扰）与消息编辑/删除
     Q_INVOKABLE void setConversationPrefs(qint64 conversationId, bool pinned, bool muted);
@@ -85,6 +87,11 @@ public:
 
     // QML 可调用的方法
     Q_INVOKABLE QString encryptPassword(const QString &password) const;
+
+    // M8.2: 文件传输引擎（数据面 HTTP + 分片加解密 + 密文缓存）。
+    // 经 main.cpp 注册为 QML context property "fileTransfer"，QML 直接连其
+    // 信号与调用其方法；本类只负责它的控制面（90-99）与清单登记
+    QObject *fileTransfer() const;
     Q_INVOKABLE QVariantList toVariantList(const QJsonArray &array) const;
 
 signals:
@@ -238,6 +245,27 @@ private:
     // M6.5: 本地持久化缓存
     // 登录后打开本地加密库：加载持久化 outbox、立即展示缓存会话、游标增量同步
     void openLocalStore();
+
+    // M8.2: 文件传输。数据面（HTTP）由 FileTransferManager 负责，控制面（90-99）
+    // 仍走本类的 TCP 通道：两者经"请求信号 + seq 回调"协作，因此传输引擎
+    // 不持有 socket，可脱离网络单测
+    void wireFileTransfer();
+    void sendFileControlRequest(XYChat::Protocol::MessageType type, qint64 seq,
+                                const QJsonObject &fields);
+    void handleFileUploadCreateResponse(const XYChat::Protocol::Packet &packet);
+    void handleFileUploadQueryResponse(const XYChat::Protocol::Packet &packet);
+    void handleFileUploadCompleteResponse(const XYChat::Protocol::Packet &packet);
+    void handleFileUploadCancelResponse(const XYChat::Protocol::Packet &packet);
+    void handleFileDownloadTicketResponse(const XYChat::Protocol::Packet &packet);
+    // 解密后的消息若为文件清单：登记到传输引擎（含密钥，仅 C++ 侧），
+    // 并向消息对象补上脱敏展示字段（不含 key/iv）供 QML 渲染
+    void attachFileInfo(QJsonObject &message);
+    // emit 给 QML 前的唯一脱敏出口：登记清单（含密钥，留在 C++ 侧）、
+    // 补脱敏展示字段，并把正文置空。清单含 32 字节文件密钥，字符串一旦
+    // 进入 JS 引擎就无法可靠清零，因此每一条通向 UI 的消息都必须经此处。
+    // 兼作兜底防线：即使 fileId 缺失或清单解析失败，只要正文形态像清单就置空
+    void sanitizeForUi(QJsonObject &message);
+    QJsonArray sanitizeArrayForUi(const QJsonArray &messages);
     void emitCachedConversations();
     // 将 sync_events 事件写入本地缓存并推进游标（hasMore 时自动续拉）
     void ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, bool hasMore);
@@ -326,6 +354,10 @@ private:
         qint64 toUserId = 0;       // 私聊目标（群消息为 0）
         qint64 conversationId = 0; // M7a: 群聊目标会话（私聊为 0）
         QString content;
+        // M8.2: 文件消息携带的 files.id（普通消息为 0）。仅存内存：
+        // 持久化 outbox 表不带此列，落库后重发会退化成"正文是清单"的
+        // 普通消息，等于把文件密钥当文本发给对方
+        qint64 fileId = 0;
     };
     QList<OutboxItem> m_outbox;
     QHash<quint64, QString> m_pendingSendByRequestId; // requestId -> clientMessageId
@@ -347,4 +379,9 @@ private:
 
     // M6.5: 本地加密持久化缓存（会话/消息/outbox/解密缓存/同步游标）
     LocalStore m_localStore;
+
+    // M8.2: 文件传输引擎（本类拥有，并经 main.cpp 注册为 QML context property）
+    XYChat::Client::FileTransferManager *m_fileTransfer = nullptr;
+    // TCP requestId -> 传输引擎的 seq（响应到达时反查，用后即删）
+    QHash<qint64, qint64> m_fileSeqByRequestId;
 };

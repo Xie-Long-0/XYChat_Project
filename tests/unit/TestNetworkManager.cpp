@@ -1,11 +1,17 @@
 #include <QtTest>
 #include <QSignalSpy>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
 #include <QTimeZone>
 
 #include "NetworkManager.h"
+#include "FileCrypto.h"
+#include "FileProtocol.h"
+
+namespace FileProtocol = XYChat::Protocol;
+using XYChat::Security::FileCrypto;
 
 using XYChat::Protocol::Packet;
 using XYChat::Protocol::MessageType;
@@ -264,6 +270,121 @@ private slots:
 
         nm.applyConversationPrefs(5, true, false);
         QCOMPARE(prefsSpy.count(), 1);
+    }
+    // M8.2 P0 回归：文件清单（含 32 字节文件密钥）绝不能进入 QML/JS 引擎。
+    // 脱敏必须覆盖所有通向 UI 的路径，而不只是实时推送那一条：
+    // 旧实现只处理了 new_message 推送，离线补收、历史翻页、本地缓存回填
+    // 三条路径会把含密钥的清单 JSON 当正文渲染进气泡
+    void fileManifestNeverReachesUiLayer()
+    {
+        NetworkManager nm;
+
+        const auto key = FileCrypto::generateFileKey();
+        QVERIFY(key.valid);
+        FileProtocol::FileManifest manifest;
+        manifest.fileId = 77;
+        manifest.name = "secret-report.pdf";
+        manifest.mime = "application/pdf";
+        manifest.chunkSize = FileProtocol::DefaultChunkSize;
+        manifest.plainSize = 2 * FileProtocol::plainSizeOfChunk(manifest.chunkSize);
+        manifest.cipherSize = manifest.plainSize + 2 * 16;
+        manifest.sha256Hex = FileCrypto::sha256Hex("cipher-bytes");
+        manifest.key = key.key;
+        manifest.iv = key.iv;
+        const QString manifestJson = FileProtocol::encodeFileManifest(manifest);
+        QVERIFY(!manifestJson.isEmpty());
+        const QString keyB64 = QString::fromLatin1(key.key.toBase64());
+        QVERIFY(manifestJson.contains(keyB64));  // 清单原文确实带着密钥
+
+        // ① 服务端实时推送形态：带 fileId 字段
+        QJsonObject pushed;
+        pushed["messageId"] = 1001;
+        pushed["fileId"] = 77;
+        pushed["content"] = manifestJson;
+        pushed["contentType"] = "text";
+        nm.sanitizeForUi(pushed);
+        QVERIFY(pushed.value("isFileMessage").toBool());
+        QVERIFY(pushed.value("content").toString().isEmpty());
+        QVERIFY(!pushed.contains("key"));
+        QVERIFY(!pushed.contains("iv"));
+        QCOMPARE(pushed.value("fileName").toString(), QString("secret-report.pdf"));
+        QCOMPARE(pushed.value("fileSizeBytes").toVariant().toLongLong(), manifest.plainSize);
+        QCOMPARE(pushed.value("fileId").toVariant().toLongLong(), qint64(77));
+
+        // ② 本地缓存回填形态：LocalStore 的 messages 表无 file_id 列，
+        //    消息不带 fileId，必须能从清单里取回并照样脱敏
+        QJsonObject fromCache;
+        fromCache["messageId"] = 1002;
+        fromCache["content"] = manifestJson;
+        fromCache["contentType"] = "text";
+        nm.sanitizeForUi(fromCache);
+        QVERIFY(fromCache.value("isFileMessage").toBool());
+        QVERIFY(fromCache.value("content").toString().isEmpty());
+        QCOMPARE(fromCache.value("fileId").toVariant().toLongLong(), qint64(77));
+
+        // ③ 密钥确实登记到了 C++ 侧的传输引擎（而不是随正文一起丢掉）：
+        //    这是"仅凭 messageId 就能下载/另存"的前提
+        QVERIFY(nm.m_fileTransfer != nullptr);
+        QVERIFY(nm.m_fileTransfer->m_incoming.contains(1002));
+        QCOMPARE(nm.m_fileTransfer->m_incoming.value(1002).key, key.key);
+        QCOMPARE(nm.m_fileTransfer->m_incoming.value(1002).iv, key.iv);
+
+        // ④ 批量出口（sync_messages 与本地缓存批量回填）逐条脱敏，
+        //    且不得误伤普通文本消息
+        QJsonObject plain;
+        plain["messageId"] = 1003;
+        plain["content"] = "hello world";
+        plain["contentType"] = "text";
+        QJsonObject offline;
+        offline["messageId"] = 1004;
+        offline["content"] = manifestJson;
+        offline["contentType"] = "text";
+        QJsonArray batch;
+        batch.append(pushed);
+        batch.append(fromCache);
+        batch.append(plain);
+        batch.append(offline);
+        const QJsonArray sanitized = nm.sanitizeArrayForUi(batch);
+        QCOMPARE(sanitized.size(), qsizetype(4));
+        bool sawPlain = false;
+        for (const QJsonValue &value : sanitized) {
+            const QJsonObject msg = value.toObject();
+            const QString content = msg.value("content").toString();
+            QVERIFY2(!content.contains(keyB64), "file key leaked into a UI payload");
+            if (msg.value("messageId").toVariant().toLongLong() == 1003) {
+                QCOMPARE(content, QString("hello world"));
+                QVERIFY(!msg.value("isFileMessage").toBool());
+                sawPlain = true;
+            } else {
+                QVERIFY(content.isEmpty());
+            }
+        }
+        QVERIFY(sawPlain);
+
+        // ⑤ 兜底防线：清单被破坏到 isValid 失败时，只要正文形态像清单
+        //    就必须置空，不能因为解析失败而放行原文（宁可少展示一个附件）
+        QJsonObject brokenObj = QJsonDocument::fromJson(manifestJson.toUtf8()).object();
+        brokenObj["key"] = QString("bm90LWEtdmFsaWQta2V5");
+        QJsonObject broken;
+        broken["messageId"] = 1005;
+        broken["fileId"] = 77;
+        broken["content"] = QString::fromUtf8(
+            QJsonDocument(brokenObj).toJson(QJsonDocument::Compact));
+        nm.sanitizeForUi(broken);
+        QVERIFY(broken.value("content").toString().isEmpty());
+        QVERIFY(broken.value("isFileMessage").toBool());
+        // 非法清单不得被登记（否则下载时才发现解不开）
+        QVERIFY(!nm.m_fileTransfer->m_incoming.contains(1005));
+
+        // ⑥ 无法解密的消息（正文是 envelope 密文而非清单）不参与登记，
+        //    也不得被误判为文件消息（UI 靠 undecryptable 显示占位）
+        QJsonObject undecryptable;
+        undecryptable["messageId"] = 1006;
+        undecryptable["content"] = QString("{\"type\":\"envelope\",\"v\":1}");
+        undecryptable["undecryptable"] = true;
+        nm.sanitizeForUi(undecryptable);
+        QVERIFY(!undecryptable.value("isFileMessage").toBool());
+        QVERIFY(!nm.m_fileTransfer->m_incoming.contains(1006));
     }
 };
 

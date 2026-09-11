@@ -11,6 +11,7 @@
 #include "NonceCache.h"
 #include "database/DatabaseManager.h"
 #include "storage/IObjectStorage.h"
+#include "http/FileHttpService.h"
 
 class RequestHandler;
 class QTimer;
@@ -50,6 +51,15 @@ public:
     // M8: 对象存储是否就绪（未就绪时文件类请求一律 fail-closed）
     bool storageReady() const { return m_objectStorage != nullptr; }
 
+    // M8.2: 文件传输数据面（HTTP(S)）的监听端口与对外通告主机名，须在 start()
+    // 前调用。主机名由运维指定：服务端无法自知 NAT/反向代理后的对外地址
+    void setFileHttpEndpoint(quint16 port, const QString &advertisedHost);
+    // 下发给客户端的数据面基地址（登录响应 fileTransferBaseUrl）。
+    // 数据面未启动时为空，客户端据此禁用文件能力而不是猜端口
+    QString fileTransferBaseUrl() const;
+    // 数据面是否在监听（供测试与监控）
+    bool fileHttpReady() const;
+
     // 在线用户管理
     int onlineUserCount() const;
     QSet<qint64> onlineUserIds() const;
@@ -81,6 +91,13 @@ private:
     // handler 据此对文件请求 fail-closed，不拖垮纯文本聊天能力
     QString m_storageRoot;
     std::unique_ptr<XYChat::Server::IObjectStorage> m_objectStorage;
+
+    // M8.2: 文件传输数据面。不传 QObject parent：由 unique_ptr 独占生命周期，
+    // 否则 parent 析构与 unique_ptr 会各删一次。启动失败时保持为空，
+    // handler 据此不下发 fileTransferBaseUrl（客户端禁用文件能力）
+    std::unique_ptr<XYChat::Server::FileHttpService> m_fileHttp;
+    quint16 m_fileHttpPort = 12346;
+    QString m_fileHttpHost = "127.0.0.1";
 
     // userId -> set of sessionIds
     QHash<qint64, QSet<qint64>> m_onlineSessions;

@@ -20,6 +20,18 @@ Item {
     property bool edited: false
     property bool deleted: false
 
+    // M8.2: 文件消息的脱敏展示字段（由 C++ 侧从已解密的清单里取出，
+    // 不包含文件密钥与 nonce；正文 content 对文件消息已被置空）
+    property bool isFileMessage: false
+    property string fileName: ""
+    property real fileSizeBytes: 0
+    // available=本地已就绪、downloading=下载中、missing=需下载
+    property string fileState: "missing"
+    property real fileProgress: 0
+
+    signal downloadRequested()
+    signal saveRequested()
+
     // M9 特性栈：右键菜单操作（由 ChatView 转发到 MainPage）
     signal editRequested()
     signal deleteRequested()
@@ -65,9 +77,11 @@ Item {
                 width: bubbleRect.width - Theme.spacingMedium * 2
                 spacing: Theme.spacingXSmall
 
-                // 消息内容：短消息单行自然宽度，长消息在最大宽度内自动换行
+                // 消息内容：短消息单行自然宽度，长消息在最大宽度内自动换行。
+                // 文件消息不展示正文（正文是清单，已置空），改走下方文件面板
                 Label {
                     id: contentLabel
+                    visible: !isFileMessage || deleted
                     width: Math.min(implicitWidth, messageBubble.maxContentWidth)
                     text: deleted ? "此消息已删除"
                                   : (undecryptable ? "⚠ 无法解密此消息" : content)
@@ -77,6 +91,75 @@ Item {
                     color: deleted ? Theme.textTertiary
                                    : (undecryptable ? Theme.textTertiary : Theme.textPrimary)
                     textFormat: Text.PlainText
+                }
+
+                // M8.2: 文件消息面板（图标 + 文件名 + 大小 + 下载/保存）
+                Column {
+                    id: filePanel
+                    visible: isFileMessage && !deleted
+                    width: Math.min(260, messageBubble.maxContentWidth)
+                    spacing: Theme.spacingSmall
+
+                    Row {
+                        spacing: Theme.spacingSmall
+
+                        Rectangle {
+                            width: 34; height: 34
+                            radius: Theme.radiusSmall
+                            color: Theme.primaryColor
+                            Label {
+                                anchors.centerIn: parent
+                                text: "📎"
+                                color: Theme.textOnPrimary
+                                font.pixelSize: Theme.fontSizeMedium
+                            }
+                        }
+
+                        Column {
+                            spacing: 2
+                            Label {
+                                text: fileName
+                                width: Math.min(implicitWidth, filePanel.width - 46)
+                                elide: Text.ElideMiddle
+                                font.pixelSize: Theme.fontSizeMedium
+                                color: Theme.textPrimary
+                            }
+                            Label {
+                                text: messageBubble.formatSize(fileSizeBytes)
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                color: Theme.textTertiary
+                            }
+                        }
+                    }
+
+                    // 下载中：进度条（值由引擎的 taskProgress 折算为 0..1）
+                    ProgressBar {
+                        visible: fileState === "downloading"
+                        width: filePanel.width
+                        from: 0; to: 1
+                        value: fileProgress
+                    }
+
+                    Row {
+                        spacing: Theme.spacingSmall
+                        Button {
+                            visible: fileState === "missing"
+                            text: "下载"
+                            onClicked: downloadRequested()
+                        }
+                        Button {
+                            visible: fileState === "available"
+                            text: "另存为"
+                            onClicked: saveRequested()
+                        }
+                        Label {
+                            visible: fileState === "downloading"
+                            text: "下载中…"
+                            font.pixelSize: Theme.fontSizeSmall - 1
+                            color: Theme.textTertiary
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
                 }
 
                 // 时间和状态
@@ -135,6 +218,10 @@ Item {
                 id: contextMenu
                 MenuItem {
                     text: "编辑"
+                    // M8.2: 文件消息不可编辑正文（服务端也会拒）：编辑只能改写
+                    // 正文而 messages.file_id 不变，会使清单里的 fileId/密钥与
+                    // 服务端授权失配。正确做法是删除后重发
+                    enabled: !isFileMessage
                     onTriggered: messageBubble.editRequested()
                 }
                 MenuItem {
@@ -143,5 +230,22 @@ Item {
                 }
             }
         }
+    }
+
+    // M8.2: 字节数转可读大小（清单里的 plainSize 为加密前字节数）
+    function formatSize(bytes) {
+        if (bytes <= 0) {
+            return ""
+        }
+        if (bytes < 1024) {
+            return bytes + " B"
+        }
+        if (bytes < 1024 * 1024) {
+            return (bytes / 1024).toFixed(1) + " KB"
+        }
+        if (bytes < 1024 * 1024 * 1024) {
+            return (bytes / (1024 * 1024)).toFixed(1) + " MB"
+        }
+        return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB"
     }
 }

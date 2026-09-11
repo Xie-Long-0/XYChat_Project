@@ -27,6 +27,26 @@ void Server::setStorageRoot(const QString &rootPath)
     m_storageRoot = rootPath;
 }
 
+void Server::setFileHttpEndpoint(quint16 port, const QString &advertisedHost)
+{
+    if (port != 0) {
+        m_fileHttpPort = port;
+    }
+    if (!advertisedHost.isEmpty()) {
+        m_fileHttpHost = advertisedHost;
+    }
+}
+
+QString Server::fileTransferBaseUrl() const
+{
+    return m_fileHttp ? m_fileHttp->baseUrl() : QString();
+}
+
+bool Server::fileHttpReady() const
+{
+    return m_fileHttp && m_fileHttp->isListening();
+}
+
 void ConnectionServer::incomingConnection(qintptr socketDescriptor)
 {
     emit socketAccepted(socketDescriptor);
@@ -93,6 +113,20 @@ bool Server::start(quint16 port, bool allowPlaintext)
         }
     }
 
+    // M8.2: 启动文件传输数据面。仅在对象存储就绪时启动（没有存储的数据面
+    // 只会对每个请求回 500），并与主通道共用同一套 TLS 配置与 fail-closed 口径。
+    // 启动失败只关闭文件传输能力，不影响消息收发（与控制面口径一致）
+    if (m_objectStorage) {
+        auto fileHttp = std::make_unique<XYChat::Server::FileHttpService>();
+        fileHttp->setAdvertisedHost(m_fileHttpHost);
+        fileHttp->setObjectStorage(m_objectStorage.get());
+        if (fileHttp->start(m_fileHttpPort, m_sslConfig, m_tlsEnabled, allowPlaintext)) {
+            m_fileHttp = std::move(fileHttp);
+        } else {
+            qCritical() << "[Server] File data plane failed to start; file transfer disabled";
+        }
+    }
+
     // M9: 初始化维护连接并启动 sync_events 定时清理（启动即清理一次 + 每小时）
     if (m_maintenanceDb.initialize()) {
         m_maintenanceDb.pruneSyncEvents(SyncEventRetentionDays);
@@ -129,6 +163,9 @@ void Server::onSocketAccepted(qintptr socketDescriptor)
     handler->setNonceCache(&m_nonceCache);
     // M8: 传递对象存储（未就绪时为 nullptr，handler 对文件请求 fail-closed）
     handler->setObjectStorage(m_objectStorage.get());
+    // M8.2: 传递数据面基地址（未启动时为空，登录响应不下发该字段，
+    // 客户端据此禁用文件能力而不是自行猜端口）
+    handler->setFileTransferBaseUrl(fileTransferBaseUrl());
 
     connect(handler, &RequestHandler::userLoggedIn, this, &Server::onUserLoggedIn);
     connect(handler, &RequestHandler::userLoggedOut, this, &Server::onUserLoggedOut);

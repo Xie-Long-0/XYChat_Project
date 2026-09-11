@@ -365,6 +365,10 @@ public:
                                                      const QString &kind);
     // 标记票据已消费（一次性票据用毕置位，重复使用即失效）
     bool markFileTicketUsed(qint64 ticketId);
+    // 吊销某文件某类型的全部票据，返回删除条数（入参非法或 SQL 错误返回 -1）。
+    // 上传完成或取消后立即调用：票据已无用途，而上传票据 TTL 长达 24 小时，
+    // 留着只会白白延长泄露窗口（分片在完成后已被组装回收，持票也无处可用）
+    int revokeFileTickets(qint64 fileId, const QString &kind);
     // 清理已过期票据，返回删除条数（SQL 错误返回 -1）
     int pruneExpiredFileTickets();
 

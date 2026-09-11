@@ -100,6 +100,11 @@ void RequestHandler::setObjectStorage(IObjectStorage *storage)
     m_objectStorage = storage;
 }
 
+void RequestHandler::setFileTransferBaseUrl(const QString &url)
+{
+    m_fileTransferBaseUrl = url;
+}
+
 // 线程入口
 void RequestHandler::run()
 {
@@ -462,6 +467,11 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
     data["expiresAt"] = QDateTime::currentDateTimeUtc()
                                             .addSecs(86400 * 7)
                                             .toString(Qt::ISODate);
+    // M8.2: 下发数据面基地址。未启动时不下发该字段（而不是下发空串），
+    // 使"部署未开启文件能力"与"旧服务端"对客户端呈现为同一个字段缺失语义
+    if (!m_fileTransferBaseUrl.isEmpty()) {
+        data["fileTransferBaseUrl"] = m_fileTransferBaseUrl;
+    }
 
     emit userLoggedIn(user.id, sessionId, deviceId);
 
@@ -2636,6 +2646,8 @@ void RequestHandler::processFileUploadCompleteRequest(const Packet &packet,
         if (dataFault) {
             m_db->markFileFailed(fileId);
             m_objectStorage->remove(rec.blobKey);
+            // M8.2: 上传已不可恢复，同步吊销上传票据（同上）
+            m_db->revokeFileTickets(fileId, FileTicketKind::Upload);
         }
         StructuredLogger::event(LogLevel::Warning, "file.finalize_failed")
             .requestId(packet.requestId).userId(m_authenticatedUserId)
@@ -2658,6 +2670,11 @@ void RequestHandler::processFileUploadCompleteRequest(const Packet &packet,
                      ErrorCode::InternalError, "Failed to mark file ready");
         return;
     }
+
+    // M8.2: 上传已终结，立即吊销上传票据（TTL 长达 24 小时，而分片已被组装
+    // 回收，持票也无处可用，留着只会白白延长泄露窗口）。吊销失败不影响
+    // 本次响应：过期票据清理会兜底
+    m_db->revokeFileTickets(fileId, FileTicketKind::Upload);
 
     QJsonObject data;
     data["fileId"] = fileId;
@@ -2729,6 +2746,9 @@ void RequestHandler::processFileUploadCancelRequest(const Packet &packet,
             .requestId(packet.requestId).userId(m_authenticatedUserId)
             .field("fileId", fileId).write();
     }
+
+    // M8.2: 取消后吊销上传票据，避免已回收的分片仍持有效凭据
+    m_db->revokeFileTickets(fileId, FileTicketKind::Upload);
 
     QJsonObject data;
     data["fileId"] = fileId;

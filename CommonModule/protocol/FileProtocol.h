@@ -71,6 +71,12 @@ struct FileManifest
     QString mime;          // MIME 类型（E2EE；服务端下载恒按二进制密文投递）
     qint64 plainSize = 0;  // 加密前字节数（供 UI 显示与下载后校验）
     qint64 cipherSize = 0; // 加密后字节数，等于服务端 files.size_bytes
+    // 密文分片大小（含 GCM 标签）。必须由清单自带而不是取自服务端响应：
+    // 接收方只凭清单与服务端 blob 就能完成解密，若分片口径由服务端声明，
+    // 不可信的服务端就能声称一个不同口径让解密错乱（GCM 会拒绝，但那是
+    // 一次无意义的带宽与 CPU 消耗）。下载时应将服务端返回值与本字段比对，
+    // 不一致即拒绝
+    qint64 chunkSize = 0;
     QString sha256Hex;     // 密文整体 SHA-256（hex 小写），下载重组后自校验
     QByteArray key;        // 32 字节 AES-256 文件密钥（原始字节，序列化时 base64）
     QByteArray iv;         // 12 字节 nonce 前缀，分片 nonce 由它与分片序号派生

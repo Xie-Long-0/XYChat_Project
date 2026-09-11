@@ -1,18 +1,19 @@
 # XYChat 架构概览
 
-> 本文档描述当前架构实态（截至 2026-09-10，M8.1 文件与对象存储地基完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
+> 本文档描述当前架构实态（截至 2026-09-11，M8.2 数据面与客户端文件传输完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
 
-## 当前组件（M8.1 完成后）
+## 当前组件（M8.2 完成后）
 
 ```text
 Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
      │        (TLS 1.2+，fail-closed)          │
      │                                     ├─ IObjectStorage（M8：密文分片/最终对象）
      │                                     └─ 维护任务（sync_events 与文件回收）
+     ├─ FileTransferManager (M8.2) ─ HTTP(S) + 票据 ─> FileHttpService ─> IObjectStorage
      └──── CommonModule（protocol/encryption/security）────┘
-
-M8 数据面（待实施）：Chat-Client ── HTTP(S) + 票据 ── 上传下载服务 ── IObjectStorage
 ```
+
+控制面（申请上传/续传查询/宣告完成/取消/下载票据，类型 90-99）走 TCP 主通道；数据面（分片字节流）走独立 HTTP(S) 服务。两者在客户端由 `NetworkManager` 与 `FileTransferManager` 分工，经“请求信号 + seq 回调”协作。
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
@@ -144,7 +145,31 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - **并发**：存储实例由各连接线程共享，同一 blobKey 的 `finalize`/`remove` 经固定条带锁（64 条）串行（同时组装会交错写入产出损坏对象；一边组装一边删除会产出“元数据 ready 而对象缺失”的不可自愈状态）；`putChunk` 不入锁（单片写入已原子，与组装交叠只会让 finalize 的长度/摘要关卡判失败）。
 - **回收**：`Server::pruneFileUploads` 三轮（超期未完成上传 → 终态行收尾 → 已就绪但无引用的行原子迁入终态），均遵循“先保证不产生孤儿数据、再销毁”；详见 `docs/PROTOCOL.md` M8 章节与 `docs/SECURITY.md`。
 - **回收与发送的竞态防护（两侧）**：“终态行不可能再被引用”并不成立——每连接一个线程，发送侧的文件校验与消息写入之间存在窗口，维护任务可在其中把无引用的 `ready` 文件迁入终态。因此发送侧把“文件仍为 `ready`”下推为 `INSERT` 的守卫子查询（`sendMessage` 单语句原子，SQLite 写者串行，守卫未命中则不写入并回 `FileNotReady`），回收侧终态那一轮在删盘前再判一次引用（宁可留下可修复的 `cancelled` 行 + 盘上对象，也不销毁仍被引用的数据）。
-- **尚未实施**：数据面 HTTP(S) 服务（拟用 `QHttpServer`）、客户端上传/下载引擎与 UI、已下载文件的本地缓存与清理、多媒体元数据生成（需 QtMultimedia，清单字段已预留）。
+- **尚未实施**：多媒体元数据生成（需 QtMultimedia，清单字段已预留）与应用内图片/视频/语音预览（属 M8.3）。
+
+### 文件数据面与客户端传输引擎（M8.2，2026-09-11）
+
+```text
+发送方                                              接收方
+FileTransferManager                                FileTransferManager
+  │ ① 第一遍流式加密：算密文整体 SHA-256          │
+  │ ② file_upload_create ─(TCP)─> RequestHandler   │
+  │ ③ 逐片加密 PUT ─(HTTP)─> FileHttpService        │
+  │ ④ file_upload_complete ─> finalize + ready      │
+  │ ⑤ 清单作正文经 E2EE 发送（带 fileId） ───────> ⑥ 解密得清单
+  │                                                 │    → attachFileInfo 登记（密钥留 C++）
+  │                                                 │    → sanitizeForUi 置空正文后给 QML
+  │                                                 ⑦ file_download_ticket ─> 票据
+  │                                                 ⑧ 逐片 Range GET → 临时密文
+  │                                                 ⑨ 整体 SHA-256 自校验 → 原子改名进缓存
+  │                                                 ⑩ “另存为”时逐片解密写明文
+```
+
+- **职责划分**：`NetworkManager` 只负责 TCP 控制面（五个请求/响应 + `requestId`→`seq` 映射）与清单登记/脱敏；`FileTransferManager` 只负责 HTTP 数据面与分片加解密/缓存，**不持有 socket**（经信号请求控制面、经回调接收结果），因此可脱离网络单测。引擎经 `main.cpp` 注册为 QML context property `fileTransfer`。
+- **隐私边界（关键）**：清单含 32 字节文件密钥，**只在 C++ 侧流转**。所有通向 QML 的消息经唯一脱敏出口 `sanitizeForUi`（四条路径：实时推送、`sync_messages` 历史/离线补收、`sync_events`、本地缓存回填），正文置空、只给脱敏展示字段；另有“形态像清单就置空”兜底，使将来新增出口不会重蹈覆辙（M8.2 P0 教训，由 `TestNetworkManager::fileManifestNeverReachesUiLayer` 锁定）。
+- **本地缓存**：密文原样落盘（`<AppData>/XYChat/filecache/<sha256[0..1]>/<sha256>`，无后缀），零额外加密开销且磁盘上不是明文；明文只在用户“另存为”时写出。缓存命中判定只看“存在且字节数相符”，内容完整性由入库前的整体 SHA-256 与解密时的逐片 GCM 认证两道关卡保证（损坏则删缓存并回退到可重下状态，一次性自愈）。
+- **串行调度与重入护栏**：一次只跑一个分片（避免带宽争抢、内存峰值与服务端 per-IP 限流）；`pumpNext` 先取 token 快照再遍历（循环体内可能同步 `failTask` → `erase` 当前节点）+ `m_pumping` 防嵌套；`reset()` 用 `m_resetting` 护栏并显式复位在途 reply（`abort()` 会同步触发回调）；`finishTask`/`failTask` 先取 `token` 副本再 `erase`（否则 `emit` 时读已释放内存）。
+- **重试与恢复**：分片失败先问控制面“服务端实际收了哪些片”再决定跳过/重传（处理“响应丢失但数据已落盘”）；重试预算双层（分片 3 次 + 总恢复轮次 5 轮），后者防止数据面持续 5xx 而控制面正常时“成功的查询”不断清零预算而形成活锁。
 
 ## 数据库 Schema（V10，M8.1 文件元数据迁移）
 
@@ -284,9 +309,9 @@ M6 首次实现后经代码审查发现并修复：
 
 ## 下一步演进
 
-M0-M7b、M9 与 M8.1（文件与对象存储地基）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
+M0-M7b、M9 与 M8.1/M8.2（文件与对象存储地基 + 数据面与客户端）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
 
-- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M8.2 数据面 HTTP(S) 与客户端上传/下载、M8.3 多媒体元数据、M10 搜索/通知/体验、M11 稳定性与可运维）。
+- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M8.3 多媒体元数据与预览、M10 搜索/通知/体验、M11 稳定性与可运维）。
 - 集中登记的欠账与风险见 `docs/ROADMAP.md` §3（P1/P2/P3 分级）。
 
 本文档不再维护逐里程碑的演进流水账，新增架构实态变化时直接更新对应章节。

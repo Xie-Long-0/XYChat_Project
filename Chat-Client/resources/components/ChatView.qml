@@ -23,6 +23,11 @@ Rectangle {
     // M9 特性栈：消息右键菜单操作（转发到 MainPage）
     signal editRequested(int messageId, string content)
     signal deleteRequested(int messageId)
+    // M8.2: 文件消息的下载/另存请求（由 MainPage 接到传输引擎）
+    signal fileDownloadRequested(int messageId)
+    signal fileSaveRequested(int messageId)
+    // M8.2: 附件选择上转（由 MainPage 按会话类型分流到群聊/私聊，与 sendMessage 一致）
+    signal attachmentSelected(string filePath)
 
     // 顶部标题栏
     Rectangle {
@@ -269,6 +274,14 @@ Rectangle {
                 messageId: model.messageId
                 edited: model.edited === true
                 deleted: model.deleted === true
+                // M8.2: 文件消息的脱敏展示与下载/保存交互
+                isFileMessage: model.isFileMessage === true
+                fileName: model.fileName || ""
+                fileSizeBytes: model.fileSizeBytes || 0
+                fileState: model.fileState || "missing"
+                fileProgress: model.fileProgress || 0
+                onDownloadRequested: chatView.fileDownloadRequested(model.messageId)
+                onSaveRequested: chatView.fileSaveRequested(model.messageId)
                 onEditRequested: chatView.editRequested(model.messageId, model.content)
                 onDeleteRequested: chatView.deleteRequested(model.messageId)
             }
@@ -326,6 +339,10 @@ Rectangle {
         visible: hasConversation
         onMessageSent: function(text) {
             chatView.sendMessage(text)
+        }
+        // M8.2: 选定附件后上转，上传进度横幅由 MainPage 统一展示
+        onAttachmentSelected: function(filePath) {
+            chatView.attachmentSelected(filePath)
         }
     }
 
@@ -434,7 +451,10 @@ Rectangle {
                 messageId: 0, clientMessageId: "", senderId: 0,
                 senderUsername: "", content: "", contentType: "text",
                 createdAt: "", displayTime: "", status: "", isMine: false,
-                undecryptable: false
+                undecryptable: false,
+                // M8.2: ListModel 要求各条目角色一致，分隔线也带上文件字段
+                isFileMessage: false, fileName: "", fileSizeBytes: 0,
+                fileSha256: "", fileState: "missing", fileProgress: 0
             })
         }
     }
@@ -458,7 +478,44 @@ Rectangle {
             undecryptable: msg.undecryptable === true,
             // M9 特性栈：编辑/删除状态
             edited: msg.edited === true,
-            deleted: msg.deleted === true
+            deleted: msg.deleted === true,
+            // M8.2: 文件消息的脱敏展示字段（密钥与清单正文不经 QML）。
+            // fileState 由本地缓存情况初始化，下载进度由引擎信号推进
+            isFileMessage: msg.isFileMessage === true,
+            fileName: msg.fileName || "",
+            fileSizeBytes: msg.fileSizeBytes || 0,
+            fileSha256: msg.fileSha256 || "",
+            fileState: msg.isFileMessage === true
+                       ? (fileTransferAvailable(msg.fileSha256, msg.fileCipherSize) ? "available" : "missing")
+                       : "missing",
+            fileProgress: 0
+        }
+    }
+
+    // M8.2: 本地密文缓存是否已就绪（引擎以密文摘要为缓存键）
+    function fileTransferAvailable(sha256, cipherSize) {
+        if (typeof fileTransfer === "undefined" || !sha256 || sha256.length === 0) {
+            return false
+        }
+        return fileTransfer.isCached(sha256, cipherSize || 0)
+    }
+
+    // M8.2: 更新某条消息的附件状态与下载进度
+    function updateFileState(messageId, state) {
+        for (var i = 0; i < msgModel.count; i++) {
+            if (msgModel.get(i).messageId === messageId) {
+                msgModel.setProperty(i, "fileState", state)
+                return
+            }
+        }
+    }
+
+    function updateFileProgress(messageId, progress) {
+        for (var i = 0; i < msgModel.count; i++) {
+            if (msgModel.get(i).messageId === messageId) {
+                msgModel.setProperty(i, "fileProgress", progress)
+                return
+            }
         }
     }
 

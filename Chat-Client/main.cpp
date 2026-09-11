@@ -32,6 +32,9 @@ int main(int argc, char *argv[])
     // 暴露 C++ 对象到 QML
     engine.rootContext()->setContextProperty("networkManager", &networkManager);
     engine.rootContext()->setContextProperty("themeSettings", &themeSettings);
+    // M8.2: 文件传输引擎（数据面 HTTP + 分片加解密 + 密文缓存）单独暴露，
+    // QML 直接连其进度/状态信号并调用上传/下载/保存；文件密钥与清单不经 QML
+    engine.rootContext()->setContextProperty("fileTransfer", networkManager.fileTransfer());
 
     // 注册 QWindowKit QML 类型
     QWK::registerTypes(&engine);

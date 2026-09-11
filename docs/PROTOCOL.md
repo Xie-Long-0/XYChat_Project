@@ -1,8 +1,8 @@
 # XYChat 协议文档
 
-## 当前协议状态（M8.1 完成后，2026-09-10 对齐）
+## 当前协议状态（M8.2 完成后，2026-09-11 对齐）
 
-M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。**M9 特性栈（2026-09-05 实施）完成了会话置顶/免打扰与消息编辑/删除**：新增 `SetConversationPrefsRequest/Response (81/82)`、`ConversationPrefsNotification (83)`、`EditMessageRequest/Response (84/85)`、`DeleteMessageRequest/Response (86/87)`；数据库迁移至 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；编辑/删除仅发送者可操作、编辑正文须保持原 contentType 且经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入）；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件实现多端与离线同步，删除为软删除留墓碑（幂等）。**M8.1（2026-09-10 实施）完成了媒体与文件传输的协议与存储地基**：新增文件控制面消息类型 90-99（申请上传 / 断点续传查询 / 宣告完成 / 取消 / 申请下载票据）与错误码 3013-3021；`send_message` 新增可选 `fileId` 并在响应/推送/历史读取四条路径回传；数据库迁移至 V10（`files` + `file_tickets` 两表、`messages.file_id`）；文件字节在客户端加密后才上传，文件名/MIME/明文大小与文件密钥只存在于 `FileManifest` 中并随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发，服务端只见密文与密文侧元数据。**数据面（分片字节流的 HTTP(S) 上传下载服务）与客户端上传/下载 UI 尚未实施**，见文末 M8 章节。
+M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。**M9 特性栈（2026-09-05 实施）完成了会话置顶/免打扰与消息编辑/删除**：新增 `SetConversationPrefsRequest/Response (81/82)`、`ConversationPrefsNotification (83)`、`EditMessageRequest/Response (84/85)`、`DeleteMessageRequest/Response (86/87)`；数据库迁移至 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；编辑/删除仅发送者可操作、编辑正文须保持原 contentType 且经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入）；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件实现多端与离线同步，删除为软删除留墓碑（幂等）。**M8.1（2026-09-10 实施）完成了媒体与文件传输的协议与存储地基**：新增文件控制面消息类型 90-99（申请上传 / 断点续传查询 / 宣告完成 / 取消 / 申请下载票据）与错误码 3013-3021；`send_message` 新增可选 `fileId` 并在响应/推送/历史读取四条路径回传；数据库迁移至 V10（`files` + `file_tickets` 两表、`messages.file_id`）；文件字节在客户端加密后才上传，文件名/MIME/明文大小与文件密钥只存在于 `FileManifest` 中并随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发，服务端只见密文与密文侧元数据。**数据面（分片字节流的 HTTP(S) 上传下载服务）与客户端上传/下载已于 M8.2（2026-09-11）实施**：数据面为独立 `QHttpServer` + `QSslServer` 服务（与主通道同一套证书与 fail-closed 口径，默认端口 12346），基地址由登录响应的 `fileTransferBaseUrl` 下发；客户端 `FileTransferManager` 负责分片加密上传、流式下载与解密、密文本地缓存与“另存为”。**仅多媒体元数据（缩略图/尺寸/时长）与应用内预览仍待实施（M8.3）**，见文末 M8 章节。
 
 仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、文件传输只有控制面与存储层（M8.1），数据面 HTTP(S) 服务、客户端上传下载与多媒体元数据（缩略图/尺寸/时长）仍待实施、设备信任为 TOFU（无安全码比对）。会话自动续期与失效自动重登已落地（2026-09-04：客户端解析 `expiresAt` 过期前自动 `renewToken`，失效回登录页）。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
 
@@ -769,12 +769,14 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 {
   "v": 1, "kind": "file",
   "fileId": 123, "name": "report.pdf", "mime": "application/pdf",
-  "plainSize": 10485760, "cipherSize": 10485776,
+  "plainSize": 10485760, "cipherSize": 10485776, "chunkSize": 1048576,
   "sha256": "<密文整体 SHA-256，64 位小写 hex>",
   "key": "<32 字节文件密钥，base64>", "iv": "<12 字节 nonce 前缀，base64>",
   "width": 0, "height": 0, "durationMs": 0, "thumb": ""
 }
 ```
+
+- **`chunkSize` 为必填字段（M8.2 补）**：接收方必须只凭清单（经 E2EE，可信）就能确定分片边界。若分片口径取自服务端响应，不可信的服务端就能声称一个不同口径让客户端在错误偏移上解密（GCM 最终会拒绝，但那是一次无意义的完整下载）。客户端拿到下载票据后会将服务端返回的 `sizeBytes`/`chunkSize`/`chunkCount`/`sha256` 四项与清单逐一比对，不一致即拒绝下载。
 
 - 收发双方以 `messages.file_id > 0` 判别文件消息（服务端权威、随消息同步），**不靠正文内容猜测**，避免用户文本恰好是 JSON 时误判。
 - `decodeFileManifest` fail-closed：版本不符、`kind` 不匹配、字段缺失、base64 非法、长度越界或分片口径不自洽时置 `ok=false`，不渲染半截元数据；`encodeFileManifest` 对非法清单返回空串（调用方据此拒发）。
@@ -850,7 +852,28 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 - **取消顺序**：先落状态再删磁盘。反序会与并发的完成请求交错出“DB=ready 而 blob 已删”的不可自愈状态（下载票据能正常签发、数据面必然读失败）；本序最坏只留下“DB=cancelled 而分片仍在盘上”的隐形孤儿，由维护任务的终态回收兜底。`markFileCancelled` 带 `WHERE status='uploading'`，因此并发的取消/完成只有一方能赢得状态。
 - **已完成的文件不走取消接口**：它可能已被消息引用，撤回会让接收方的下载票据指向已消失的对象；未被引用的 `ready` 文件由回收任务处理。
 - **票据签发失败回滚**：申请上传时若 `issueFileTicket` 失败，立即把刚建的记录标 `cancelled`，避免留下一条无凭据可用、又白占并发配额的 `uploading` 行。
-- **票据生命周期**：上传票据 `UploadTicketTtlSeconds=86400`（覆盖大文件慢速上传）；下载票据 `DownloadTicketTtlSeconds=300`（短时效，TTL 内可重复使用以支持 Range 分段与断点续下）；过期票据由维护任务 `pruneExpiredFileTickets` 清理。
+- **票据生命周期**：上传票据 `UploadTicketTtlSeconds=86400`（覆盖大文件慢速上传），**上传完成/取消/标失败后立即由服务端吊销**（`revokeFileTickets`：分片已组装回收，持票也无处可用，留着只白白延长泄露窗口）；下载票据 `DownloadTicketTtlSeconds=300`（短时效，TTL 内可重复使用以支持 Range 分段与断点续下，因此**不**调 `markFileTicketUsed` 消费）；过期票据由维护任务 `pruneExpiredFileTickets` 清理。
+
+### 数据面（HTTP(S)，M8.2）
+
+控制面只承载 JSON 元数据；分片字节流走独立 HTTP(S) 服务（`QHttpServer` + `QSslServer`，与主通道同一套证书与 fail-closed 口径：TLS 不可用且未显式允许明文则拒启）。
+
+- **基地址发现**：登录响应 `data.fileTransferBaseUrl`（如 `https://127.0.0.1:12346/file`）。服务端无法自知 NAT/反向代理后的对外地址，故主机名由 `--http-host`（默认 127.0.0.1）、端口由 `--http-port`（默认 12346）指定。**字段缺失表示服务端未开启文件能力**，客户端据此禁用文件功能而不是猜端口。
+- **授权**：HTTP 层没有会话上下文，凭票据授权。票据放请求头 `X-XYChat-Ticket`，**不放 URL query**（query 会进反向代理与访问日志，等于把凭据写进日志）；服务端只比对 SHA-256 摘要。四种票据失败（不存在/过期/类型不符/`fileId` 不匹配）统一回 401 且响应体一致；票据通过后的 404/409 才对持票者可见（与控制面 `requireOwnedFile` 之后的分层同理）。
+- **端点**：
+
+| 方法与路径 | 用途 | 主要状态码 |
+| --- | --- | --- |
+| `PUT /file/<fileId>/chunk/<index>` | 上传一个密文分片 | 200 / 400（长度或序号不符、路径参数畸形）/ 401 / 404 / 409（非 `uploading`）/ 413（超 `MaxChunkSize`）/ 429 / 500 |
+| `GET /file/<fileId>` | 下载密文，支持 `Range` | 200 / 206 / 400 / 401 / 404 / 409（非 `ready` 或对象缺失）/ 413 / 416 / 429 / 500 |
+
+- **分片长度**：PUT 的 body 长度必须精确等于 `expectedChunkBytes(sizeBytes, chunkSize, chunkCount, index)`；不符回 400 并在 body 里给出 `expectedBytes`。这防止客户端自选分片边界绕过体积与分片数校验。重复 PUT 同一片为幂等覆盖（支持重试）。
+- **Range 语义**：只支持单区间 `bytes=<start>-[<end>]`（range-unit 大小写不敏感）；多区间、后缀形式（`bytes=-500`）、非数字、倒置区间一律 400；起点越界回 416 + `Content-Range: bytes */<total>`；终点越界按 RFC 截断到末尾；成功回 206 + `Content-Range: bytes <start>-<end>/<total>`。
+- **单次 GET 上限**：`MaxSingleGetBytes = 4 MiB`（= `MaxChunkSize`）。无 `Range` 且对象超上限时回 413 + `Accept-Ranges: bytes` + `X-XYChat-Total-Size`，**不读任何数据**；带 `Range` 但区间超上限同样 413。理由：客户端必须逐片解密（分片独立 AEAD），全量下载并无用处，而无上限的 `readRange` 会让单请求把最大 2 GiB 读进内存。
+- **响应头**：下载恒 `Content-Type: application/octet-stream`（服务端不知道真实 MIME，也不得猜测）+ `Cache-Control: no-store`（票据在请求头里，缓存命中会绕过授权）+ `Accept-Ranges: bytes` + `X-XYChat-Total-Size`。**不回传 `blobKey`**。`readRange` 短读一律回 500，绝不返回截断的 200/206（否则客户端的整体校验会失败却无法定位原因）。
+- **限流**：per-IP 固定窗口**只统计授权失败与畸形请求**（30 次/60 秒 → 429）。成功的数据搬运不计入：合法上传一个大文件需要多达 `MaxChunkCount`（4096）次 PUT，按请求数限流会直接挡住正常业务；真正的攻击面是票据爆破与未授权扫描，而成功请求的资源消耗已由控制面的并发配额（8）与单文件上限（2 GiB）封顶。
+- **错误语义映射**：HTTP 层不复用 TCP 的业务错误码，但一一对应——401 ≈ `InvalidFileTicket (3018)`、404 ≈ `FileNotFound (3013)`、409 ≈ `FileNotReady (3017)`、413 ≈ `FileTooLarge (3014)`/`ChunkOutOfRange (3019)`、400 ≈ `InvalidRequest (1000)`/`ChunkOutOfRange`、429 ≈ `RateLimited (1003)`、500 ≈ `FileStorageFailed (3020)`。
+- **已知限制**：`QHttpServer` 在进入 handler 前已把请求体完整缓冲，因此“超大分片早退 413”发生在内存已被消耗之后；未认证客户端可用巨大 `Content-Length` 造成内存放大（已登记为 §3 P2，建议部署在带 body 上限的反向代理之后，`--http-host` 默认仅回环）。
 
 ### send_message 的 fileId
 

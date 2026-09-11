@@ -18,8 +18,8 @@ XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含�
 
 ```text
 .
-├── Chat-Client/          # Qt QML 客户端：登录/主窗口、NetworkManager、KeyStorage、LocalStore（M6.5 本地加密缓存）
-├── Chat-Server/          # Qt Core/Network/Sql 服务端：TCP 监听、请求处理、SQLite、storage/（M8 对象存储）
+├── Chat-Client/          # Qt QML 客户端：登录/主窗口、NetworkManager、KeyStorage、LocalStore（M6.5 本地加密缓存）、FileTransferManager（M8.2 文件上传下载）
+├── Chat-Server/          # Qt Core/Network/Sql/HttpServer 服务端：TCP 监听、请求处理、SQLite、storage/（M8 对象存储）、http/（M8.2 数据面）
 ├── CommonModule/         # 客户端与服务端共用模块：协议编解码（含 M8 FileProtocol）、加密（PBKDF2/E2EE/群 E2EE/M8 FileCrypto）、安全工具
 ├── docs/                 # 架构、协议、安全与路线图文档
 ├── tests/                # 自动化测试
@@ -86,9 +86,13 @@ Linux/macOS 按上面手动配置的 `-B build` 目录运行 `./build/Chat-Serve
 
 > 服务端自 M8.1 起维护对象存储根目录 `<GenericDataLocation>/XYChat-Server/data/files`（存放客户端加密后的文件密文分片与组装后的对象，可在 `start()` 前调 `Server::setStorageRoot` 改路径）。初始化失败时不阻断启动，但文件相关接口一律 fail-closed 返回 `FileStorageFailed`，启动日志会输出 `Object storage ready at ...` 或失败告警。
 
+> 服务端自 M8.2 起额外监听文件传输数据面（HTTP(S)，默认端口 **12346**），可用 `--http-port` 改端口、`--http-host` 指定对外通告的主机名（位于 NAT/反向代理后时必填；服务端无法自知对外地址，而客户端是根据登录响应的 `fileTransferBaseUrl` 去连数据面的）。数据面与主通道共用同一套证书与 fail-closed 口径：TLS 不可用且未传 `--allow-plaintext` 时拒启。对象存储未就绪时数据面不启动，登录响应也不下发 `fileTransferBaseUrl`，客户端会自动禁用附件按钮。
+
+> 客户端自 M8.2 起在 `<AppData>/XYChat/filecache/` 下缓存已下载文件的**密文**（按密文 SHA-256 命名、前两位分桶、无后缀）。磁盘上不存在明文，明文只在你点“另存为”时写到你选定的位置；缓存可在设置中清理，清理后重新下载即可。
+
 ## 测试
 
-配置并构建后运行全部单元测试（CTest 纳入 9 套）：
+配置并构建后运行全部单元测试（CTest 纳入 11 套）：
 
 ```powershell
 # Windows 预设（Build.ps1 / Qt-Debug）
@@ -112,9 +116,11 @@ ctest --test-dir build --output-on-failure
 | `TestSecurity` | TLS 辅助 / 日志脱敏 / NonceCache 重放保护 / RateWindow 限流 / StructuredLogger |
 | `TestLocalStore` | 客户端本地加密缓存、持久化 outbox、Sender Key 与跳序消息密钥缓存 |
 | `TestGroupE2eeCrypto` | 群 Sender-Key 加密原语（M7b）、DoS 上限、乱序解密与跳序密钥缓存 |
-| `TestNetworkManager` | 客户端链路层（编辑/删除响应多槽匹配、88/89 推送发起设备去重、私聊编辑队列化、断线清理） |
+| `TestNetworkManager` | 客户端链路层（编辑/删除响应多槽匹配、88/89 推送发起设备去重、私聊编辑队列化、断线清理、**文件清单不得进 QML 的脱敏回归**） |
 | `TestFileProtocol` | M8 清单编解码与 fail-closed、分片数学、边界与非法入参 |
 | `TestObjectStorage` | M8 对象存储（分片读写/组装校验/断点续传/幂等删除/崩溃残留清理/路径安全） |
+| `TestFileHttpService` | M8.2 数据面集成（真实 HTTP 回环：票据授权、分片长度/序号校验、Range 全语义、状态护栏、失败限流） |
+| `TestFileTransfer` | M8.2 客户端引擎端到端（上传→组装→下载→解密→另存字节级一致，并断言服务端只见密文） |
 
 另有 `tests/e2e/TestGroupRepro`：双客户端群 E2EE 端到端复现工具，**不纳入 CTest**，需先启动 `Chat-Server` 后手动运行：
 

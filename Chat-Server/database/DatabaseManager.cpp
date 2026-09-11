@@ -2871,6 +2871,23 @@ bool DatabaseManager::markFileTicketUsed(qint64 ticketId)
     return q.numRowsAffected() > 0;
 }
 
+int DatabaseManager::revokeFileTickets(qint64 fileId, const QString &kind)
+{
+    if (fileId <= 0 || kind.isEmpty()) {
+        return -1;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM file_tickets WHERE file_id = ? AND kind = ?");
+    q.addBindValue(fileId);
+    q.addBindValue(kind);
+    if (!q.exec()) {
+        qWarning() << "[DB] revokeFileTickets failed:" << q.lastError().text();
+        return -1;
+    }
+    return q.numRowsAffected();
+}
+
 int DatabaseManager::pruneExpiredFileTickets()
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);

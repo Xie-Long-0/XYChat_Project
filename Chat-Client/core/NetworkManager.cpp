@@ -35,7 +35,8 @@ NetworkManager::NetworkManager(QObject *parent) :
     m_sslSocket(new QSslSocket(this)),
     m_heartbeatTimer(new QTimer(this)),
     m_reconnectTimer(new QTimer(this)),
-    m_tokenRenewTimer(new QTimer(this))
+    m_tokenRenewTimer(new QTimer(this)),
+    m_fileTransfer(new XYChat::Client::FileTransferManager(this))
 {
     m_heartbeatTimer->setInterval(30000);
     m_reconnectTimer->setInterval(3000);
@@ -53,6 +54,10 @@ NetworkManager::NetworkManager(QObject *parent) :
 
     // M5: 初始化 TLS
     initTls();
+
+    // M8.2: 传输引擎的控制面接线。须在 initTls 之后：引擎复用同一份 CA
+    // 配置访问 https 数据面，不另行放宽证书校验
+    wireFileTransfer();
 }
 
 // 登录
@@ -193,6 +198,11 @@ void NetworkManager::onDisconnected()
     const int pendingEditFailures = m_pendingEdits.size() + m_privateEditQueue.size();
     const int pendingDeleteFailures = m_pendingDeleteRequestIds.size();
     m_pendingEdits.clear();
+    // M8.2: 中止在途传输并清零已登记的清单密钥（含文件密钥，不得跨会话驻留）。
+    // 登出与断线是两条独立路径，两处都必须清（同 M9 编辑泵的教训）
+    m_fileTransfer->reset();
+    m_fileTransfer->setBaseUrl(QString());
+    m_fileSeqByRequestId.clear();
     m_privateEditQueue.clear();
     m_editFetchInFlight = false;
     m_pendingDeleteRequestIds.clear();
@@ -361,6 +371,8 @@ void NetworkManager::initTls()
     sslConfig.setPeerVerifyMode(QSslSocket::VerifyPeer);
     m_sslSocket->setSslConfiguration(sslConfig);
     m_tlsEnabled = true;
+    // M8.2: 数据面（https）用同一套开发 CA，否则自签证书会被全部拒连
+    m_fileTransfer->setSslConfiguration(sslConfig);
 
     qInfo() << "[NetMgr] TLS enabled, CA:" << caCertPath;
 }
@@ -514,6 +526,22 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::MessageDeletedNotification:
         handleMessageDeletedNotification(packet);
         break;
+    // M8.2: 文件控制面响应（数据面走 HTTP，不经此处）
+    case MessageType::FileUploadCreateResponse:
+        handleFileUploadCreateResponse(packet);
+        break;
+    case MessageType::FileUploadQueryResponse:
+        handleFileUploadQueryResponse(packet);
+        break;
+    case MessageType::FileUploadCompleteResponse:
+        handleFileUploadCompleteResponse(packet);
+        break;
+    case MessageType::FileUploadCancelResponse:
+        handleFileUploadCancelResponse(packet);
+        break;
+    case MessageType::FileDownloadTicketResponse:
+        handleFileDownloadTicketResponse(packet);
+        break;
     case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
@@ -547,6 +575,10 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         m_sessionExpiresAtSecs = parseExpiresAt(data.value("expiresAt").toString());
         m_sessionExpiredNotified = false;
         m_loginQueued = false;
+        // M8.2: 数据面基地址由服务端下发（而不是客户端猜端口）。字段缺失
+        // 意味着服务端未开启文件能力，此时 baseUrl 为空，传输引擎会对任何
+        // 任务立即回失败而不是静默排队
+        m_fileTransfer->setBaseUrl(data.value("fileTransferBaseUrl").toString());
         setState(ConnectionState::Authenticated);
         emit sessionChanged();
         emit loginSuccessful();
@@ -698,6 +730,11 @@ void NetworkManager::resetAuthState()
     m_healQueue.clear();
     // M9 欠账修复：清空在途编辑/删除状态与等待密钥的私聊编辑队列
     m_pendingEdits.clear();
+    // M8.2: 中止在途传输并清零已登记的清单密钥（含文件密钥，不得跨会话驻留）。
+    // 登出与断线是两条独立路径，两处都必须清（同 M9 编辑泵的教训）
+    m_fileTransfer->reset();
+    m_fileTransfer->setBaseUrl(QString());
+    m_fileSeqByRequestId.clear();
     m_privateEditQueue.clear();
     m_editFetchInFlight = false;
     m_pendingDeleteRequestIds.clear();
@@ -873,39 +910,46 @@ void NetworkManager::getConversations()
 }
 
 // M3: 发送消息
-QString NetworkManager::sendMessage(qint64 toUserId, const QString &content)
+QString NetworkManager::sendMessage(qint64 toUserId, const QString &content, qint64 fileId)
 {
     // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
     // M4.5: 返回幂等键供 QML 跟踪乐观消息气泡状态
     const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // M6.5: outbox 加密落库，重启后不丢未发送消息
-    if (!m_localStore.isOpen()) {
-        // 登录前排队的场景：尝试以待登录账号打开本地库
-        const QString user = m_state == ConnectionState::Authenticated
-            ? m_username : m_pendingUsername;
-        const QString deviceId = m_localDeviceId.isEmpty()
-            ? QString::fromLatin1(QSysInfo::machineUniqueId().toHex())
-            : m_localDeviceId;
-        if (!user.isEmpty() && !deviceId.isEmpty()) {
-            m_localStore.open(user, deviceId);
+    // M8.2: 文件消息的正文是清单 JSON（含 32 字节文件密钥），而持久化 outbox 表
+    // 不带 fileId 列。若把它落库，重启后重发会以 fileId=0 投出一条"正文是清单"
+    // 的普通消息，等于把密钥当文本发给接收方。因此文件消息只进内存 outbox：
+    // 应用重启后需重新上传（本地源文件仍在），已登记为欠账
+    if (fileId <= 0) {
+        // M6.5: outbox 加密落库，重启后不丢未发送消息
+        if (!m_localStore.isOpen()) {
+            // 登录前排队的场景：尝试以待登录账号打开本地库
+            const QString user = m_state == ConnectionState::Authenticated
+                ? m_username : m_pendingUsername;
+            const QString deviceId = m_localDeviceId.isEmpty()
+                ? QString::fromLatin1(QSysInfo::machineUniqueId().toHex())
+                : m_localDeviceId;
+            if (!user.isEmpty() && !deviceId.isEmpty()) {
+                m_localStore.open(user, deviceId);
+            }
         }
+        m_localStore.addOutboxItem(clientMessageId, toUserId, content);
     }
-    m_localStore.addOutboxItem(clientMessageId, toUserId, content);
 
     if (m_state != ConnectionState::Authenticated) {
         // M5.5: 未认证时进入 outbox，登录成功后自动重发
-        m_outbox.append({clientMessageId, toUserId, 0, content});
+        m_outbox.append({clientMessageId, toUserId, 0, content, fileId});
         return clientMessageId;
     }
 
-    m_outbox.append({clientMessageId, toUserId, 0, content});
+    m_outbox.append({clientMessageId, toUserId, 0, content, fileId});
     flushOutbox();
     return clientMessageId;
 }
 
 // M7a: 发送群消息（明文；返回幂等键供 QML 乐观消息跟踪）
-QString NetworkManager::sendGroupMessage(qint64 conversationId, const QString &content)
+QString NetworkManager::sendGroupMessage(qint64 conversationId, const QString &content,
+                                         qint64 fileId)
 {
     if (conversationId <= 0 || content.trimmed().isEmpty()) {
         emit messageSendFailed("Invalid group message");
@@ -914,20 +958,23 @@ QString NetworkManager::sendGroupMessage(qint64 conversationId, const QString &c
 
     const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // 与私聊一致：outbox 加密落库，重启后不丢未发送消息
-    if (!m_localStore.isOpen()) {
-        const QString user = m_state == ConnectionState::Authenticated
-            ? m_username : m_pendingUsername;
-        const QString deviceId = m_localDeviceId.isEmpty()
-            ? QString::fromLatin1(QSysInfo::machineUniqueId().toHex())
-            : m_localDeviceId;
-        if (!user.isEmpty() && !deviceId.isEmpty()) {
-            m_localStore.open(user, deviceId);
+    // 与私聊一致：outbox 加密落库，重启后不丢未发送消息。
+    // 文件消息例外（只进内存 outbox），理由同 sendMessage
+    if (fileId <= 0) {
+        if (!m_localStore.isOpen()) {
+            const QString user = m_state == ConnectionState::Authenticated
+                ? m_username : m_pendingUsername;
+            const QString deviceId = m_localDeviceId.isEmpty()
+                ? QString::fromLatin1(QSysInfo::machineUniqueId().toHex())
+                : m_localDeviceId;
+            if (!user.isEmpty() && !deviceId.isEmpty()) {
+                m_localStore.open(user, deviceId);
+            }
         }
+        m_localStore.addOutboxItem(clientMessageId, 0, content, conversationId);
     }
-    m_localStore.addOutboxItem(clientMessageId, 0, content, conversationId);
 
-    m_outbox.append({clientMessageId, 0, conversationId, content});
+    m_outbox.append({clientMessageId, 0, conversationId, content, fileId});
     if (m_state == ConnectionState::Authenticated) {
         flushOutbox();
     }
@@ -974,6 +1021,11 @@ void NetworkManager::flushOutbox()
             json["content"] = envelope;
             json["contentType"] = "e2ee_group";
             json["clientMessageId"] = item.clientMessageId;
+            // M8.2: 文件消息带上 files.id（服务端据此校验归属与 ready 状态，
+            // 并随消息同步给接收端；缺它会把清单当普通文本投递）
+            if (item.fileId > 0) {
+                json["fileId"] = item.fileId;
+            }
             addReplayProtection(json);
 
             Packet groupPacket;
@@ -1314,6 +1366,10 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
         json["content"] = envelope;
         json["contentType"] = "text";
         json["clientMessageId"] = item.clientMessageId;
+        // M8.2: 同群聊路径，文件消息带上 files.id
+        if (item.fileId > 0) {
+            json["fileId"] = item.fileId;
+        }
         addReplayProtection(json);
 
         Packet sendPacketMsg;
@@ -2120,7 +2176,9 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     if (afterId == 0 && conversationId > 0) {
         const QJsonArray cached = m_localStore.loadMessages(conversationId, limit);
         if (!cached.isEmpty()) {
-            emit messagesSynced(conversationId, cached, false);
+            // M8.2: 本地缓存表无 file_id 列，回填的消息正文可能是清单（含密钥），
+            // 同样必经脱敏出口（attachFileInfo 会从清单里取回 fileId 并登记）
+            emit messagesSynced(conversationId, sanitizeArrayForUi(cached), false);
         }
     }
 
@@ -2274,6 +2332,9 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
             cached["status"] = "sent";
             cached["clientMessageId"] = ackedId;
             cached["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+            // M8.2: 带上 messageId，本地缓存回填时才能凭它把清单登记到传输
+            // 引擎（否则发送方自己也无法下载/另存刚发的文件）
+            cached["messageId"] = messageId;
             m_localStore.upsertMessage(cached);
         }
         emit messageSent(messageId, conversationId, ackedId);
@@ -2341,8 +2402,10 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
                 continue;
             }
             decryptMessageObject(msg);
-            // M6.5: 写入本地缓存（加密存储）
+            // M6.5: 写入本地缓存（加密存储，保留清单原文以便重启后恢复）
             m_localStore.upsertMessage(msg);
+            // M8.2: 落库之后再脱敏：交给 UI 的消息不得携带清单（含文件密钥）
+            sanitizeForUi(msg);
             visibleMessages.append(msg);
         }
         // 修复：emit 解密后的 visibleMessages（原始 messages 的 content 为 envelope
@@ -2356,6 +2419,302 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
                 data.value("hasMore").toBool());
         }
     }
+}
+
+// M8.2: 文件传输引擎（供 main.cpp 注册为 QML context property）
+QObject *NetworkManager::fileTransfer() const
+{
+    return m_fileTransfer;
+}
+
+// M8.2: 把传输引擎的控制面请求接到 TCP 通道。引擎不持有 socket，
+// 只发信号并等回调，因此可脱离网络单测
+void NetworkManager::wireFileTransfer()
+{
+    using FT = XYChat::Client::FileTransferManager;
+
+    connect(m_fileTransfer, &FT::uploadCreateRequested, this,
+            [this](qint64 seq, qint64 cipherSize, qint64 chunkSize, int chunkCount,
+                   const QString &sha256Hex) {
+                QJsonObject fields;
+                fields["type"] = "file_upload_create";
+                fields["sizeBytes"] = cipherSize;
+                fields["chunkSize"] = chunkSize;
+                fields["chunkCount"] = chunkCount;
+                fields["sha256"] = sha256Hex;
+                sendFileControlRequest(MessageType::FileUploadCreateRequest, seq, fields);
+            });
+    connect(m_fileTransfer, &FT::uploadQueryRequested, this,
+            [this](qint64 seq, qint64 fileId) {
+                QJsonObject fields;
+                fields["type"] = "file_upload_query";
+                fields["fileId"] = fileId;
+                sendFileControlRequest(MessageType::FileUploadQueryRequest, seq, fields);
+            });
+    connect(m_fileTransfer, &FT::uploadCompleteRequested, this,
+            [this](qint64 seq, qint64 fileId) {
+                QJsonObject fields;
+                fields["type"] = "file_upload_complete";
+                fields["fileId"] = fileId;
+                sendFileControlRequest(MessageType::FileUploadCompleteRequest, seq, fields);
+            });
+    connect(m_fileTransfer, &FT::uploadCancelRequested, this,
+            [this](qint64 seq, qint64 fileId) {
+                QJsonObject fields;
+                fields["type"] = "file_upload_cancel";
+                fields["fileId"] = fileId;
+                sendFileControlRequest(MessageType::FileUploadCancelRequest, seq, fields);
+            });
+    connect(m_fileTransfer, &FT::downloadTicketRequested, this,
+            [this](qint64 seq, qint64 fileId) {
+                QJsonObject fields;
+                fields["type"] = "file_download_ticket";
+                fields["fileId"] = fileId;
+                sendFileControlRequest(MessageType::FileDownloadTicketRequest, seq, fields);
+            });
+
+    // 上传完成：把清单作为消息正文经既有 E2EE（私聊 envelope / 群 Sender-Key）
+    // 加密后发送，并带上 fileId。清单明文只在本进程 C++ 侧流转，不进 QML
+    connect(m_fileTransfer, &FT::sendMessageRequested, this,
+            [this](qint64 conversationId, qint64 peerUserId, const QString &manifestJson,
+                   qint64 fileId) {
+                if (conversationId > 0) {
+                    sendGroupMessage(conversationId, manifestJson, fileId);
+                } else if (peerUserId > 0) {
+                    sendMessage(peerUserId, manifestJson, fileId);
+                } else {
+                    emit messageSendFailed("Invalid file message target");
+                }
+            });
+}
+
+void NetworkManager::sendFileControlRequest(MessageType type, qint64 seq,
+                                            const QJsonObject &fields)
+{
+    if (m_state != ConnectionState::Authenticated) {
+        // 未认证时不能发控制面请求：直接把失败回给引擎，让它上报而不是静默挂起
+        switch (type) {
+        case MessageType::FileUploadCreateRequest:
+            m_fileTransfer->onUploadCreated(seq, false, 0, QString(), "Not authenticated");
+            return;
+        case MessageType::FileUploadQueryRequest:
+            m_fileTransfer->onUploadQueried(seq, false, QList<int>(), "Not authenticated");
+            return;
+        case MessageType::FileUploadCompleteRequest:
+            m_fileTransfer->onUploadCompleted(seq, false, "Not authenticated");
+            return;
+        case MessageType::FileUploadCancelRequest:
+            m_fileTransfer->onUploadCancelled(seq, false, "Not authenticated");
+            return;
+        default:
+            m_fileTransfer->onDownloadTicket(seq, false, QString(), 0, 0, 0, QString(),
+                                             "Not authenticated");
+            return;
+        }
+    }
+
+    QJsonObject json = fields;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = type;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    // requestId -> seq：响应到达时反查并即删，避免遗留条目无界增长
+    m_fileSeqByRequestId.insert(static_cast<qint64>(packet.requestId), seq);
+    sendPacket(packet);
+}
+
+void NetworkManager::handleFileUploadCreateResponse(const Packet &packet)
+{
+    const qint64 requestId = static_cast<qint64>(packet.requestId);
+    const auto it = m_fileSeqByRequestId.constFind(requestId);
+    if (it == m_fileSeqByRequestId.constEnd()) {
+        return;  // 非本端发起，或任务已取消/超时清理
+    }
+    const qint64 seq = it.value();
+    m_fileSeqByRequestId.remove(requestId);
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+    if (code != static_cast<int>(ErrorCode::Ok)) {
+        m_fileTransfer->onUploadCreated(seq, false, 0, QString(),
+                                        response.value("message").toString());
+        return;
+    }
+    const QJsonObject data = response.value("data").toObject();
+    m_fileTransfer->onUploadCreated(seq, true,
+                                    data.value("fileId").toVariant().toLongLong(),
+                                    data.value("uploadTicket").toString(), QString());
+}
+
+void NetworkManager::handleFileUploadQueryResponse(const Packet &packet)
+{
+    const qint64 requestId = static_cast<qint64>(packet.requestId);
+    const auto it = m_fileSeqByRequestId.constFind(requestId);
+    if (it == m_fileSeqByRequestId.constEnd()) {
+        return;
+    }
+    const qint64 seq = it.value();
+    m_fileSeqByRequestId.remove(requestId);
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+    if (code != static_cast<int>(ErrorCode::Ok)) {
+        m_fileTransfer->onUploadQueried(seq, false, QList<int>(),
+                                        response.value("message").toString());
+        return;
+    }
+    QList<int> received;
+    const QJsonArray chunks = response.value("data").toObject().value("receivedChunks").toArray();
+    received.reserve(chunks.size());
+    for (const QJsonValue &value : chunks) {
+        received.append(value.toVariant().toInt());
+    }
+    m_fileTransfer->onUploadQueried(seq, true, received, QString());
+}
+
+void NetworkManager::handleFileUploadCompleteResponse(const Packet &packet)
+{
+    const qint64 requestId = static_cast<qint64>(packet.requestId);
+    const auto it = m_fileSeqByRequestId.constFind(requestId);
+    if (it == m_fileSeqByRequestId.constEnd()) {
+        return;
+    }
+    const qint64 seq = it.value();
+    m_fileSeqByRequestId.remove(requestId);
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+    // 分片未齐备（3016）属可恢复：把已收分片回给引擎，它只补传缺的那几片
+    if (code == static_cast<int>(ErrorCode::FileUploadIncomplete)) {
+        QList<int> received;
+        const QJsonArray chunks =
+            response.value("data").toObject().value("receivedChunks").toArray();
+        for (const QJsonValue &value : chunks) {
+            received.append(value.toVariant().toInt());
+        }
+        m_fileTransfer->onUploadQueried(seq, true, received, QString());
+        return;
+    }
+    m_fileTransfer->onUploadCompleted(seq, code == static_cast<int>(ErrorCode::Ok),
+                                      response.value("message").toString());
+}
+
+void NetworkManager::handleFileUploadCancelResponse(const Packet &packet)
+{
+    const qint64 requestId = static_cast<qint64>(packet.requestId);
+    const auto it = m_fileSeqByRequestId.constFind(requestId);
+    if (it == m_fileSeqByRequestId.constEnd()) {
+        return;
+    }
+    const qint64 seq = it.value();
+    m_fileSeqByRequestId.remove(requestId);
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+    m_fileTransfer->onUploadCancelled(seq, code == static_cast<int>(ErrorCode::Ok),
+                                      response.value("message").toString());
+}
+
+void NetworkManager::handleFileDownloadTicketResponse(const Packet &packet)
+{
+    const qint64 requestId = static_cast<qint64>(packet.requestId);
+    const auto it = m_fileSeqByRequestId.constFind(requestId);
+    if (it == m_fileSeqByRequestId.constEnd()) {
+        return;
+    }
+    const qint64 seq = it.value();
+    m_fileSeqByRequestId.remove(requestId);
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+    if (code != static_cast<int>(ErrorCode::Ok)) {
+        m_fileTransfer->onDownloadTicket(seq, false, QString(), 0, 0, 0, QString(),
+                                         response.value("message").toString());
+        return;
+    }
+    const QJsonObject data = response.value("data").toObject();
+    m_fileTransfer->onDownloadTicket(seq, true, data.value("downloadTicket").toString(),
+                                     data.value("sizeBytes").toVariant().toLongLong(),
+                                     data.value("chunkSize").toVariant().toLongLong(),
+                                     data.value("chunkCount").toVariant().toInt(),
+                                     data.value("sha256").toString(), QString());
+}
+
+void NetworkManager::attachFileInfo(QJsonObject &message)
+{
+    if (message.value("undecryptable").toBool()) {
+        return;
+    }
+    const QString plain = message.value("content").toString();
+    // 先看正文形态再看 fileId：本地缓存表没有 file_id 列，从缓存回填的
+    // 消息不带该字段，若以它为前置条件就会漏登记并把清单渲染成正文
+    if (!XYChat::Protocol::looksLikeFileManifest(plain)) {
+        return;
+    }
+    bool ok = false;
+    const XYChat::Protocol::FileManifest manifest =
+        XYChat::Protocol::decodeFileManifest(plain, &ok);
+    if (!ok || !manifest.isValid()) {
+        return;
+    }
+    // fileId 以服务端字段为权威，缺失时回退到清单内的值（两者应一致）
+    qint64 fileId = message.value("fileId").toVariant().toLongLong();
+    if (fileId <= 0) {
+        fileId = manifest.fileId;
+    }
+    if (fileId <= 0 || (message.contains("fileId") && fileId != manifest.fileId)) {
+        return;
+    }
+    message["fileId"] = fileId;
+    const qint64 messageId = message.value("messageId").toVariant().toLongLong();
+    if (messageId > 0) {
+        // 清单（含文件密钥）只登记到传输引擎，不经 QML。这一句是离线补收、
+        // 历史翻页、本地缓存回填与本人发送四条路径唯一的登记入口
+        m_fileTransfer->registerIncomingFile(messageId, plain);
+    }
+    // 展示字段脱敏后交给 QML：给出去的字段不包含 key/iv
+    message["isFileMessage"] = true;
+    message["fileName"] = manifest.name;
+    message["fileMime"] = manifest.mime;
+    message["fileSizeBytes"] = manifest.plainSize;
+    message["fileSha256"] = manifest.sha256Hex;
+    // 密文体积与摘要都不是秘密（服务端也知道），UI 需要两者才能判定
+    // 本地密文缓存是否命中，以免每次渲染都去发起下载
+    message["fileCipherSize"] = manifest.cipherSize;
+}
+
+void NetworkManager::sanitizeForUi(QJsonObject &message)
+{
+    attachFileInfo(message);
+    // 兜底防线：即使 fileId 缺失、清单解析失败或字段不自洽，只要正文形态
+    // 像清单就一律置空。宁可不展示一个附件，也绝不把含密钥的 JSON 交给
+    // JS 引擎（字符串一旦进入 JS 堆就无法可靠清零，且会被截图/日志/调试器捕获）
+    const bool alreadyMarked = message.value("isFileMessage").toBool();
+    if (alreadyMarked
+        || XYChat::Protocol::looksLikeFileManifest(message.value("content").toString())) {
+        message["isFileMessage"] = true;
+        // 只在兜底命中时告警（形态像清单但 attachFileInfo 未能正常解析/登记）：
+        // 正常路径的脱敏是预期行为，记 Warning 会让告警失去指示意义
+        // 并淹没日志。不记正文本身（它含密钥），只记足以定位的元信息
+        if (!alreadyMarked && !message.value("content").toString().isEmpty()) {
+            qWarning() << "[NetMgr] Scrubbing an unparsed file manifest before it reaches QML,"
+                       << "messageId=" << message.value("messageId").toVariant().toLongLong();
+        }
+        message["content"] = QString();
+    }
+}
+
+QJsonArray NetworkManager::sanitizeArrayForUi(const QJsonArray &messages)
+{
+    QJsonArray result;
+    for (const QJsonValue &value : messages) {
+        QJsonObject msg = value.toObject();
+        sanitizeForUi(msg);
+        result.append(msg);
+    }
+    return result;
 }
 
 void NetworkManager::handleNewMessageNotification(const Packet &packet)
@@ -2373,19 +2732,29 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
 
     // M6: 实时推送的消息先解密再交给 UI
     decryptMessageObject(msg);
+    // M8.2: 文件消息：登记清单（含密钥，仅 C++ 侧）并补上脱敏展示字段
+    attachFileInfo(msg);
     // M6.5: 新消息写入本地缓存，并更新会话预览/未读数（仅更新已存在会话）
     m_localStore.upsertMessage(msg);
     {
         const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
         // M7a: 群系统消息预览用可读摘要，避免结构化 JSON 直接展示
         const bool isSystem = msg.value("contentType").toString() == "system";
+        // M8.2: 文件消息的正文是清单 JSON，预览必须用文件名摘要，
+        // 否则会话列表会展示一大段含密钥的 JSON
         const QString preview = msg.value("undecryptable").toBool()
             ? "[Encrypted message]"
-            : (isSystem ? systemMessageSummary(msg.value("content").toString())
-                        : msg.value("content").toString());
+            : (msg.value("isFileMessage").toBool()
+                   ? "[File] " + msg.value("fileName").toString()
+                   : (isSystem ? systemMessageSummary(msg.value("content").toString())
+                               : msg.value("content").toString()));
         m_localStore.bumpConversationPreview(convId, preview, true);
     }
-    emit newMessageReceived(msg);
+    // M8.2: 文件消息的正文（清单）含 32 字节文件密钥，绝不得进 QML/JS 引擎。
+    // 已落库的是原始清单（本地库加密），emit 前经统一脱敏出口取副本
+    QJsonObject uiMsg = msg;
+    sanitizeForUi(uiMsg);
+    emit newMessageReceived(uiMsg);
 
     // 自动发送已送达确认
     const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
@@ -2497,7 +2866,19 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
         const qint64 lastSeq = data.value("lastSeq").toVariant().toLongLong();
         const bool hasMore = data.value("hasMore").toBool();
         ingestSyncEvents(events, lastSeq, hasMore);
-        emit eventsSynced(events, lastSeq, hasMore);
+        // M8.2: 落库与游标推进用的是原始事件（保留清单），emit 给 UI 的用脱敏
+        // 副本：离线补收的文件消息正文同样是清单，不经此处就会把密钥渲染进气泡
+        QJsonArray uiEvents;
+        for (const QJsonValue &eventValue : events) {
+            QJsonObject event = eventValue.toObject();
+            QJsonObject payload = event.value("payload").toObject();
+            if (!payload.isEmpty()) {
+                sanitizeForUi(payload);
+                event["payload"] = payload;
+            }
+            uiEvents.append(event);
+        }
+        emit eventsSynced(uiEvents, lastSeq, hasMore);
     }
 }
 

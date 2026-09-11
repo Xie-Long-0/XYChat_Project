@@ -45,6 +45,11 @@ public:
     // 为空时所有文件请求一律回 FileStorageFailed，不让文件消息静默退化成文本消息
     void setObjectStorage(XYChat::Server::IObjectStorage *storage);
 
+    // M8.2: 文件传输数据面（HTTP(S)）的基地址，随登录响应下发。
+    // 为空表示数据面未启动，此时不下发该字段，客户端据此禁用文件能力
+    // （而不是自行猜端口，否则部署拓扑一变就要重发客户端）
+    void setFileTransferBaseUrl(const QString &url);
+
 signals:
     void finished();
     void userLoggedIn(qint64 userId, qint64 sessionId, const QString &deviceId);
@@ -151,6 +156,9 @@ private:
 
     // M8: 对象存储（Server 持有，各连接共享）；为空表示存储不可用
     XYChat::Server::IObjectStorage *m_objectStorage = nullptr;
+
+    // M8.2: 数据面基地址（Server 注入，例 https://host:12346/file）
+    QString m_fileTransferBaseUrl;
 
     // M5.5: 发送代理对象，线程亲和于 handler 线程，
     // 避免跨线程直接访问 QSslSocket

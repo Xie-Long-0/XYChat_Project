@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 import "../theme"
 import "../components"
@@ -37,6 +38,16 @@ Rectangle {
     property string currentPeerUsername: ""
     // M7a: 当前会话类型（"private"/"group"）
     property string currentConversationType: "private"
+
+    // M8.2: 文件传输的 UI 状态。引擎的进度信号只带任务 token，
+    // 而气泡需要 messageId，因此上传用单一在途 token（串行传输），
+    // 下载用 token -> messageId 映射
+    property string activeUploadToken: ""
+    property string activeUploadPhase: ""
+    property real activeUploadProgress: 0
+    property int pendingSaveMessageId: 0
+    property string fileNotice: ""
+    property var downloadTokens: ({})
     // M7a: 当前群成员数（群会话头部副标题）
     property int currentGroupMemberCount: 0
     // M7a: 用户搜索用途路由（"chat" 发起对话 / "invite" 群邀请）
@@ -191,6 +202,59 @@ Rectangle {
         }
 
         // 右侧聊天区域
+        // M8.2: 文件传输横幅（上传进度与取消、一次性提示）
+        Rectangle {
+            id: transferBanner
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? 46 : 0
+            visible: mainPage.activeUploadToken.length > 0 || mainPage.fileNotice.length > 0
+            color: Theme.inputBackground
+            radius: Theme.radiusMedium
+
+            Behavior on Layout.preferredHeight { NumberAnimation { duration: Theme.animationFast } }
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Theme.spacingMedium
+                anchors.rightMargin: Theme.spacingMedium
+                spacing: Theme.spacingSmall
+
+                Label {
+                    Layout.fillWidth: true
+                    text: mainPage.activeUploadToken.length > 0
+                          ? (mainPage.activeUploadPhase + " "
+                             + Math.round(mainPage.activeUploadProgress * 100) + "%")
+                          : mainPage.fileNotice
+                    elide: Text.ElideMiddle
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textSecondary
+                }
+
+                ProgressBar {
+                    visible: mainPage.activeUploadToken.length > 0
+                    Layout.preferredWidth: 120
+                    from: 0; to: 1
+                    value: mainPage.activeUploadProgress
+                }
+
+                Button {
+                    visible: mainPage.activeUploadToken.length > 0
+                    text: "取消"
+                    onClicked: {
+                        fileTransfer.cancelTask(mainPage.activeUploadToken)
+                        mainPage.activeUploadToken = ""
+                    }
+                }
+
+                Button {
+                    visible: mainPage.activeUploadToken.length === 0
+                              && mainPage.fileNotice.length > 0
+                    text: "关闭"
+                    onClicked: mainPage.fileNotice = ""
+                }
+            }
+        }
+
         ChatView {
             id: chatView
             Layout.fillWidth: true
@@ -227,6 +291,130 @@ Rectangle {
                 confirmDeleteDialog.messageId = messageId
                 confirmDeleteDialog.open()
             }
+
+            // M8.2: 附件上传。目标分流与 sendMessage 一致（群聊用 conversationId、
+            // 私聊用 peerUserId）；清单与文件密钥全程不经 QML
+            onAttachmentSelected: function(filePath) {
+                if (typeof fileTransfer === "undefined" || !fileTransfer.enabled) {
+                    mainPage.fileNotice = "服务端未开启文件传输能力"
+                    return
+                }
+                var isGroupChat = mainPage.currentConversationType === "group"
+                var convId = isGroupChat ? mainPage.currentConversationId : 0
+                var peerId = isGroupChat ? 0 : mainPage.currentPeerUserId
+                if (convId <= 0 && peerId <= 0) {
+                    mainPage.fileNotice = "请先选择一个会话"
+                    return
+                }
+                mainPage.fileNotice = ""
+                mainPage.activeUploadPhase = "准备中"
+                mainPage.activeUploadProgress = 0
+                mainPage.activeUploadToken = fileTransfer.uploadAndSend(filePath, convId, peerId)
+            }
+
+            onFileDownloadRequested: function(messageId) {
+                if (typeof fileTransfer === "undefined") {
+                    return
+                }
+                // 先置"下载中"再调用：download() 在缓存命中、清单缺失、未启用
+                // 等情况下会在返回前同步 emit 完成/失败信号，而 token 要到返回
+                // 后才知道，同步信号因此无法反查到 messageId。调用后再按引擎的
+                // 真实状态校准一次，避免气泡永久停在"下载中"
+                chatView.updateFileState(messageId, "downloading")
+                chatView.updateFileProgress(messageId, 0)
+                var token = fileTransfer.download(messageId)
+                var map = mainPage.downloadTokens
+                map[token] = messageId
+                mainPage.downloadTokens = map
+                if (fileTransfer.isMessageFileAvailable(messageId)) {
+                    chatView.updateFileState(messageId, "available")
+                    chatView.updateFileProgress(messageId, 1.0)
+                    delete mainPage.downloadTokens[token]
+                }
+            }
+
+            onFileSaveRequested: function(messageId) {
+                mainPage.pendingSaveMessageId = messageId
+                saveFileDialog.open()
+            }
+        }
+    }
+
+    // M8.2: 另存为。明文只写到用户显式选定的路径，缓存目录里
+    // 始终只有密文（与 SECURITY.md 的"磁盘无可读明文"口径一致）
+    FileDialog {
+        id: saveFileDialog
+        title: qsTr("保存文件到")
+        fileMode: FileDialog.SaveFile
+        onAccepted: {
+            if (mainPage.pendingSaveMessageId <= 0) {
+                return
+            }
+            // 用 Qt.urlToLocalFile 而不是正则剔前缀：后者对 UNC 路径
+            //（file://server/share/x）与含 %/#/? 的路径会给出错误结果，
+            // 保存时更会静默写到带 percent 转义的乱码文件名里
+            var path = Qt.urlToLocalFile(selectedFile)
+            if (typeof fileTransfer !== "undefined"
+                && fileTransfer.saveToFile(mainPage.pendingSaveMessageId, path)) {
+                mainPage.fileNotice = "已保存到 " + path
+            } else {
+                mainPage.fileNotice = "保存失败：文件未就绪或目标不可写"
+            }
+            mainPage.pendingSaveMessageId = 0
+        }
+        onRejected: mainPage.pendingSaveMessageId = 0
+    }
+
+    // M8.2: 传输引擎信号接线。进度只带 token，故下载需经映射回到 messageId
+    Connections {
+        target: typeof fileTransfer !== "undefined" ? fileTransfer : null
+
+        function onTaskProgress(token, phase, done, total) {
+            var ratio = total > 0 ? done / total : 0
+            if (token === mainPage.activeUploadToken) {
+                mainPage.activeUploadPhase = phase
+                mainPage.activeUploadProgress = ratio
+            }
+            var mid = mainPage.downloadTokens[token]
+            if (mid !== undefined) {
+                chatView.updateFileProgress(mid, ratio)
+            }
+        }
+
+        function onTaskFinished(token) {
+            if (token === mainPage.activeUploadToken) {
+                mainPage.activeUploadToken = ""
+                mainPage.fileNotice = "文件已发送"
+            }
+            var mid = mainPage.downloadTokens[token]
+            if (mid !== undefined) {
+                chatView.updateFileState(mid, "available")
+                chatView.updateFileProgress(mid, 1.0)
+                delete mainPage.downloadTokens[token]
+            }
+        }
+
+        function onTaskFailed(token, error) {
+            if (token === mainPage.activeUploadToken) {
+                mainPage.activeUploadToken = ""
+            }
+            var mid = mainPage.downloadTokens[token]
+            if (mid !== undefined) {
+                chatView.updateFileState(mid, "missing")
+                delete mainPage.downloadTokens[token]
+            }
+            mainPage.fileNotice = error
+        }
+        function onDownloadStateChanged(messageId, state) {
+            chatView.updateFileState(messageId, state)
+        }
+
+        function onFileSaved(messageId, path) {
+            mainPage.fileNotice = "已保存到 " + path
+        }
+
+        function onCacheCleared(removedCount) {
+            mainPage.fileNotice = "已清理 " + removedCount + " 个缓存文件"
         }
     }
 

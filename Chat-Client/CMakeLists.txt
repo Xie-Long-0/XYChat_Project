@@ -41,6 +41,7 @@ set(SOURCES
     core/NetworkManager.cpp
     core/KeyStorage.cpp
     core/LocalStore.cpp
+    core/FileTransferManager.cpp
 )
 
 # C++ 头文件
@@ -49,6 +50,7 @@ set(HEADERS
     core/ThemeSettings.h
     core/KeyStorage.h
     core/LocalStore.h
+    core/FileTransferManager.h
 )
 
 # 生成可执行文件

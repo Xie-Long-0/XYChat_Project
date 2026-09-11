@@ -16,7 +16,9 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(Qt6 COMPONENTS Core Network Sql REQUIRED)
+# M8.2: HttpServer 承载文件传输数据面（QHttpServer 自 Qt 6.4 起属 qtbase，
+# 随基础 Qt 安装提供，无需额外模块）
+find_package(Qt6 COMPONENTS Core Network Sql HttpServer REQUIRED)
 # OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
 include(XYChatOpenSSL)
 xychat_find_openssl()
@@ -31,6 +33,7 @@ set(SOURCES
     core/NonceCache.cpp
     database/DatabaseManager.cpp
     storage/LocalFileStorage.cpp
+    http/FileHttpService.cpp
 )
 
 # 头文件列表
@@ -42,6 +45,7 @@ set(HEADERS
     database/DatabaseManager.h
     storage/IObjectStorage.h
     storage/LocalFileStorage.h
+    http/FileHttpService.h
 )
 
 # 生成可执行文件
@@ -52,6 +56,7 @@ target_include_directories(Chat-Server PRIVATE
     core/
     database/
     storage/
+    http/
 )
 
 # 链接 Qt 和 OpenSSL 库
@@ -59,6 +64,7 @@ target_link_libraries(Chat-Server PUBLIC
     Qt6::Core
     Qt6::Network
     Qt6::Sql
+    Qt6::HttpServer
     OpenSSL::SSL
     XYChatCommon
 )
