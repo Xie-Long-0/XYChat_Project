@@ -280,6 +280,9 @@ Rectangle {
                 fileSizeBytes: model.fileSizeBytes || 0
                 fileState: model.fileState || "missing"
                 fileProgress: model.fileProgress || 0
+                fileWidth: model.fileWidth || 0
+                fileHeight: model.fileHeight || 0
+                fileThumb: model.fileThumb || ""
                 onDownloadRequested: chatView.fileDownloadRequested(model.messageId)
                 onSaveRequested: chatView.fileSaveRequested(model.messageId)
                 onEditRequested: chatView.editRequested(model.messageId, model.content)
@@ -454,7 +457,8 @@ Rectangle {
                 undecryptable: false,
                 // M8.2: ListModel 要求各条目角色一致，分隔线也带上文件字段
                 isFileMessage: false, fileName: "", fileSizeBytes: 0,
-                fileSha256: "", fileState: "missing", fileProgress: 0
+                fileSha256: "", fileState: "missing", fileProgress: 0,
+                fileWidth: 0, fileHeight: 0, fileThumb: ""
             })
         }
     }
@@ -488,7 +492,11 @@ Rectangle {
             fileState: msg.isFileMessage === true
                        ? (fileTransferAvailable(msg.fileSha256, msg.fileCipherSize) ? "available" : "missing")
                        : "missing",
-            fileProgress: 0
+            fileProgress: 0,
+            // M8.3: 图片尺寸与内联缩略图（base64 JPEG，不含密钥）
+            fileWidth: msg.fileWidth || 0,
+            fileHeight: msg.fileHeight || 0,
+            fileThumb: msg.fileThumb || ""
         }
     }
 

@@ -28,6 +28,11 @@ Item {
     // available=本地已就绪、downloading=下载中、missing=需下载
     property string fileState: "missing"
     property real fileProgress: 0
+    // M8.3: 图片元数据。fileThumb 为 base64 的 JPEG 缩略图，随清单经 E2EE
+    // 到达（不含任何密钥），因此可在下载原图之前直接展示预览
+    property int fileWidth: 0
+    property int fileHeight: 0
+    property string fileThumb: ""
 
     signal downloadRequested()
     signal saveRequested()
@@ -99,6 +104,31 @@ Item {
                     visible: isFileMessage && !deleted
                     width: Math.min(260, messageBubble.maxContentWidth)
                     spacing: Theme.spacingSmall
+
+                    // M8.3: 内联缩略图。仅在解码成功后显示（status === Ready），
+                    // 因此清单被截断或图像损坏时不会留下空白区域，
+                    // 下方的图标行依旧能完整展示文件名与大小
+                    Image {
+                        id: thumbImage
+                        source: fileThumb.length > 0
+                                ? "data:image/jpeg;base64," + fileThumb
+                                : ""
+                        visible: fileThumb.length > 0 && status === Image.Ready
+                        fillMode: Image.PreserveAspectFit
+                        width: filePanel.width
+                        height: 180
+                        asynchronous: true
+                        smooth: true
+                        cache: true
+                    }
+
+                    // M8.3: 图片像素尺寸（仅在清单带了尺寸时展示）
+                    Label {
+                        visible: fileWidth > 0 && fileHeight > 0
+                        text: fileWidth + " × " + fileHeight
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.textTertiary
+                    }
 
                     Row {
                         spacing: Theme.spacingSmall

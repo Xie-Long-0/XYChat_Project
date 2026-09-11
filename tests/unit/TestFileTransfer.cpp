@@ -8,6 +8,8 @@
 #include <QtTest>
 #include <QEventLoop>
 #include <QFile>
+#include <QImage>
+#include <QImageWriter>
 #include <QSignalSpy>
 #include <QSqlDatabase>
 #include <QTemporaryDir>
@@ -45,6 +47,9 @@ private slots:
     void clearCacheRemovesBytesAndFlipsState();
     void disabledWithoutBaseUrl();
     void resetClearsRegisteredManifests();
+    // M8.3: 图片上传后清单必须带上尺寸与内联缩略图（接收方靠它在下载
+    // 原图之前就能展示预览），而非图片文件不得携带缩略图
+    void imageUploadCarriesThumbnailMetadata();
     // 两个任务并存且其中一个在调度循环内同步失败（源文件被删）：
     // 失败路径会 erase 任务节点，旧实现直接在 QHash 上迭代会使当前
     // 迭代器失效（UB），并因 finishTask/failTask 递归调 pumpNext 而嵌套泵送
@@ -365,6 +370,53 @@ void TestFileTransfer::uploadedManifestIsSelfContained()
     // 文件名与 MIME 随清单走 E2EE，服务端不可见
     QCOMPARE(manifest.name, QString("source.bin"));
     QVERIFY(!manifest.mime.isEmpty());
+    // 非图片文件不得携带缩略图与尺寸（字段留空而不是塞垃圾）
+    QVERIFY(manifest.thumbnail.isEmpty());
+    QCOMPARE(manifest.width, 0);
+    QCOMPARE(manifest.height, 0);
+}
+
+void TestFileTransfer::imageUploadCarriesThumbnailMetadata()
+{
+    // 用 PNG（QtGui 内建编码器，无需插件）造一张测试图片
+    const QString imagePath = m_dir->path() + "/photo.png";
+    QImage image(640, 480, QImage::Format_RGB32);
+    image.fill(QColor(200, 80, 60));
+    QVERIFY(image.save(imagePath, "PNG"));
+
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(engine);
+
+    QSignalSpy sendSpy(&engine, &FileTransferManager::sendMessageRequested);
+    const QString token = engine.uploadAndSend(imagePath, 5, 0);
+    QVERIFY2(waitForTask(engine, token), "image upload did not finish");
+    QCOMPARE(sendSpy.count(), 1);
+
+    bool ok = false;
+    const Protocol::FileManifest manifest =
+        Protocol::decodeFileManifest(sendSpy.at(0).at(2).toString(), &ok);
+    QVERIFY(ok);
+    QVERIFY(manifest.isValid());
+    // 尺寸与原图一致
+    QCOMPARE(manifest.width, 640);
+    QCOMPARE(manifest.height, 480);
+    QCOMPARE(manifest.name, QString("photo.png"));
+
+    if (QImageWriter::supportedImageFormats().contains("jpeg")) {
+        QVERIFY(!manifest.thumbnail.isEmpty());
+        QVERIFY(manifest.thumbnail.size() <= Protocol::MaxThumbnailBytes);
+        // 缩略图必须是可解码的 JPEG（否则 UI 侧 data URL 会渲染失败）
+        QImage thumb;
+        QVERIFY(thumb.loadFromData(manifest.thumbnail, "JPEG"));
+        QVERIFY(!thumb.isNull());
+        QVERIFY(thumb.width() <= 160 && thumb.height() <= 160);
+    }
+
+    // 清单整体（含 base64 缩略图）仍受群消息正文长度上限约束，
+    // 否则图片消息会被服务端以超长为由拒收
+    QVERIFY(Protocol::encodeFileManifest(manifest).size() < 16384 / 2);
 }
 
 void TestFileTransfer::cachedFileSkipsSecondDownload()

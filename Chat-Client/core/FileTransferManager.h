@@ -148,6 +148,10 @@ private:
         QString sha256Hex;
         QString fileName;
         QString mime;
+        // M8.3: 图片元数据与内联缩略图（提取失败留空，不影响传输）
+        int mediaWidth = 0;
+        int mediaHeight = 0;
+        QByteArray thumbnail;
         QByteArray fileKey;  // 32B，用后清零
         QByteArray iv;       // 12B nonce 前缀
         qint64 fileId = 0;

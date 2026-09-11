@@ -1,4 +1,4 @@
-find_package(Qt6 COMPONENTS Test Sql Network HttpServer REQUIRED)
+find_package(Qt6 COMPONENTS Test Sql Network HttpServer Gui REQUIRED)
 # OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
 include(XYChatOpenSSL)
 xychat_find_openssl()
@@ -123,6 +123,8 @@ add_executable(TestNetworkManager
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.h
@@ -138,6 +140,7 @@ target_link_libraries(TestNetworkManager PRIVATE
     Qt6::Test
     Qt6::Sql
     Qt6::Network
+    Qt6::Gui
     XYChatCommon
 )
 
@@ -228,6 +231,8 @@ add_executable(TestFileTransfer
     unit/TestFileTransfer.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
     ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.h
     ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.cpp
@@ -252,6 +257,7 @@ target_link_libraries(TestFileTransfer PRIVATE
     Qt6::Network
     Qt6::Sql
     Qt6::HttpServer
+    Qt6::Gui
     XYChatCommon
 )
 
@@ -259,12 +265,37 @@ add_test(NAME TestFileTransfer COMMAND TestFileTransfer)
 
 xychat_copy_runtime_dlls(TestFileTransfer)
 
+# ── TestThumbnailMaker (M8.3 图片元数据与内联缩略图) ──
+# 纯 QtGui 图像编解码，不依赖平台多媒体后端，可在无头环境与 CI 中运行
+add_executable(TestThumbnailMaker
+    unit/TestThumbnailMaker.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
+)
+
+target_include_directories(TestThumbnailMaker PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Client
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core
+)
+
+target_link_libraries(TestThumbnailMaker PRIVATE
+    Qt6::Test
+    Qt6::Gui
+    XYChatCommon
+)
+
+add_test(NAME TestThumbnailMaker COMMAND TestThumbnailMaker)
+
+xychat_copy_runtime_dlls(TestThumbnailMaker)
+
 # ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
 add_executable(TestGroupRepro
     "e2e/TestGroupRepro.cpp"
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.h
@@ -279,6 +310,7 @@ target_include_directories(TestGroupRepro PRIVATE
 target_link_libraries(TestGroupRepro PRIVATE
     Qt6::Network
     Qt6::Sql
+    Qt6::Gui
     XYChatCommon
 )
 

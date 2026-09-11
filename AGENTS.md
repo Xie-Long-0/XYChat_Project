@@ -33,10 +33,11 @@ ctest --test-dir out/build/debug --output-on-failure
   - 设置 `$env:QT_FORCE_STDERR_LOGGING = "1"`（QTest/qDebug 转 stderr，不被丢弃）。
   - 直接运行用例可执行文件并重定向落盘：`TestXxx.exe -o result.txt,txt`。
 - 曾因此把 `latestSenderKeyId` 的同秒 tie-break（约 50% 概率失败）误归因为"沙箱 DPAPI 偶发"。审查类任务应实跑测试并落盘输出，而非止步静态阅读。
-- 单测均纳入 CTest（当前 11 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`。后两套为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
+- 单测均纳入 CTest（当前 12 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`/`TestThumbnailMaker`。`TestFileHttpService` 与 `TestFileTransfer` 为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）；`TestThumbnailMaker` 只依赖 QtGui 图像编解码，无需平台多媒体后端（JPEG 编码器缺失时相关断言会 QSKIP）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
 
 ## 代码风格约定
 
+- 文件编码统一为UTF-8，换行符为CRLF。
 - 字符串字面量用双引号（`"text"`）经隐式/显式 `QString` 转换，**禁用** `QStringLiteral`、`QString::fromUtf8` 包裹常量字面量（运行时拼接的 `QString("-%1 days").arg(...)` 等除外）。
 - 注释**不加**分隔线/装饰性横线（如 `// ──── ... ────`、`//====`），不用悬挂式空 TODO 框。
 - 遵循周边代码的命名与惯例；新增/修改密码学路径必须设步数与参数上限（见 `docs/SECURITY.md` DoS 教训）。
@@ -50,6 +51,7 @@ ctest --test-dir out/build/debug --output-on-failure
 - 重试预算不得被“恢复动作的成功”清零：否则当数据面持续故障而控制面正常时（每次查询都成功）会形成活锁；恢复轮次需单独封顶。
 - 异步回调里不得捕获容器元素的引用（用键重新查表）；`abort()` 会同步触发 `finished`，清理在途请求前先断开回调并立护栏，否则会在登出/重置途中发新请求。
 - QML 里把文件 URL 转本地路径用 `Qt.urlToLocalFile()`，不要用正则剔 `file://` 前缀（UNC 与含 `%`/`#`/`?` 的路径会错，保存时会静默写到乱码文件名）；引用 context property 前用 `typeof x !== "undefined"` 防御。
+- 元数据提取（缩略图/尺寸/时长）失败一律留空字段，**绝不阻断主流程**（文件仍应能正常上传与发送）；内联到消息正文的元数据受正文长度上限硬约束，压不进上限就不内联，绝不放宽上限。
 
 ## 里程碑完成定义（§9）
 

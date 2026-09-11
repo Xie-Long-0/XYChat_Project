@@ -2683,6 +2683,14 @@ void NetworkManager::attachFileInfo(QJsonObject &message)
     // 密文体积与摘要都不是秘密（服务端也知道），UI 需要两者才能判定
     // 本地密文缓存是否命中，以免每次渲染都去发起下载
     message["fileCipherSize"] = manifest.cipherSize;
+    // M8.3: 图片尺寸与内联缩略图。缩略图是 JPEG 字节，**不含任何密钥**，
+    // 因此可以进 QML：它随清单经 E2EE 到达（服务端不可见），UI 靠它
+    // 在下载原图之前就能展示预览。以 base64 交给 QML 拼 data URL
+    message["fileWidth"] = manifest.width;
+    message["fileHeight"] = manifest.height;
+    if (!manifest.thumbnail.isEmpty()) {
+        message["fileThumb"] = QString::fromLatin1(manifest.thumbnail.toBase64());
+    }
 }
 
 void NetworkManager::sanitizeForUi(QJsonObject &message)

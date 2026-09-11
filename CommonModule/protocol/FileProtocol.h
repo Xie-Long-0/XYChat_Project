@@ -31,10 +31,10 @@ inline constexpr qint64 MaxChunkSize = 4 * 1024 * 1024;         // 4 MiB
 inline constexpr qint64 MaxFileSize = 2LL * 1024 * 1024 * 1024; // 2 GiB 密文总量
 inline constexpr int MaxChunkCount = 4096;                      // 单文件分片数上限
 inline constexpr int MaxFileNameLength = 255;                   // 明文字符数
-// 内联缩略图密文上限。不能取大值：清单随消息正文走 envelope/Sender-Key，
+// 内联缩略图的字节上限。不能取大值：清单随消息正文走 envelope/Sender-Key，
 // 而群消息正文受 MaxGroupMessageLength(16384 字符) 约束，base64 后约 1.34 倍膨胀，
 // 加上 envelope 头部开销，清单明文必须控在万字符以内。更大的缩略图应作为
-// 独立文件上传并在清单里引用其 fileId（待多媒体元数据阶段实施）
+// 独立文件上传并在清单里引用其 fileId（待后续实施）
 inline constexpr int MaxThumbnailBytes = 4096;
 
 // 票据与生命周期
@@ -81,12 +81,17 @@ struct FileManifest
     QByteArray key;        // 32 字节 AES-256 文件密钥（原始字节，序列化时 base64）
     QByteArray iv;         // 12 字节 nonce 前缀，分片 nonce 由它与分片序号派生
 
-    // 预留字段：多媒体元数据。生成逻辑延后实施（需引入 QtMultimedia 与缩略图
-    // 管线），字段先行定义以免后续扩展清单时破坏已有消息的兼容性
+    // 多媒体元数据（M8.3 起图片部分已生成，音视频待实施）。字段先行定义
+    // 以免后续扩展清单时破坏已有消息的兼容性
     int width = 0;         // 图片/视频宽（像素），未知为 0
     int height = 0;        // 图片/视频高（像素），未知为 0
     qint64 durationMs = 0; // 音频/视频时长（毫秒），未知为 0
-    QByteArray thumbnail;  // 缩略图密文（小图内联，上限 MaxThumbnailBytes），空表示无
+    // 内联缩略图（JPEG 字节，上限 MaxThumbnailBytes），空表示无。
+    // 此处是**明文**字节而不是密文：清单整体会随消息正文经既有 E2EE
+    //（私聊 envelope / 群聊 Sender-Key）加密，再单独加一层只增加复杂度
+    // 而无安全收益。也因此它可以经脱敏出口交给 UI（不含任何密钥），
+    // 使接收方在下载原图之前就能展示预览
+    QByteArray thumbnail;
 
     // 结构与取值自检（字段齐备、长度合法、分片口径自洽）
     bool isValid() const;

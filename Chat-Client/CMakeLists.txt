@@ -42,6 +42,7 @@ set(SOURCES
     core/KeyStorage.cpp
     core/LocalStore.cpp
     core/FileTransferManager.cpp
+    core/ThumbnailMaker.cpp
 )
 
 # C++ 头文件
@@ -51,6 +52,7 @@ set(HEADERS
     core/KeyStorage.h
     core/LocalStore.h
     core/FileTransferManager.h
+    core/ThumbnailMaker.h
 )
 
 # 生成可执行文件

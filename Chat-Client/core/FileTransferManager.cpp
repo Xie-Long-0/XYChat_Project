@@ -12,6 +12,7 @@
 
 #include "FileCrypto.h"
 #include "SecureMemory.h"
+#include "ThumbnailMaker.h"
 
 namespace XYChat::Client
 {
@@ -282,6 +283,14 @@ QString FileTransferManager::uploadAndSend(const QString &localPath, qint64 conv
         t.fileName = t.fileName.right(Protocol::MaxFileNameLength);
     }
     t.mime = QMimeDatabase().mimeTypeForFile(localPath).name();
+    // M8.3: 图片尺寸与内联缩略图（纯 QtGui 同步提取，无平台多媒体后端依赖）。
+    // 非图片或提取失败时字段留空，UI 回退到文件图标：元数据缺失绝不阻断发送
+    const ThumbnailMaker::Result media = ThumbnailMaker::make(localPath);
+    if (media.isImage) {
+        t.mediaWidth = media.width;
+        t.mediaHeight = media.height;
+        t.thumbnail = media.thumb;
+    }
     t.phase = QLatin1String("hashing");
 
     QString error;
@@ -597,6 +606,11 @@ void FileTransferManager::onUploadCompleted(qint64 seq, bool ok, const QString &
     manifest.sha256Hex = task->sha256Hex;
     manifest.key = task->fileKey;
     manifest.iv = task->iv;
+    // M8.3: 多媒体元数据（图片尺寸与内联缩略图）。这些字段只存在于清单里，
+    // 随消息正文经 E2EE 分发，服务端全程不可见
+    manifest.width = task->mediaWidth;
+    manifest.height = task->mediaHeight;
+    manifest.thumbnail = task->thumbnail;
     const QString manifestJson = Protocol::encodeFileManifest(manifest);
     if (manifestJson.isEmpty()) {
         // 清单非法意味着上面的字段自相矛盾（如口径不自洽），宁可不发也不要

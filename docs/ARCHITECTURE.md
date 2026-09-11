@@ -23,8 +23,9 @@ TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；`FileProtocol`（M8.1：`FileManifest` 编解码、分片数学与体积/分片/票据常量，客户端与服务端共用同一组常量以免校验口径漂移）；
   - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码；M8.1 新增带 AAD 的 GCM 原语）、`GroupE2eeCrypto`（M7b：Sender-Key 生成/chain-key ratchet/群消息 AES-256-GCM + Ed25519 签名/分发消息 pairwise envelope 编解码；2026-09-09 新增跳序消息密钥缓存）、`FileCrypto`（M8.1：文件密钥/nonce 前缀生成、分片独立 AEAD 加解密、流式 SHA-256、票据与其摘要）；
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）、`StructuredLogger`（M11 前置：单行 JSON 结构化日志，统一字段 + 复用 LogSanitizer 脱敏）。
+- 客户端还包含 `core/FileTransferManager`（M8.2：文件上传下载引擎，不持有 socket，经信号/回调与控制面协作）与 `core/ThumbnailMaker`（M8.3a：图片尺寸与内联缩略图，纯 QtGui）。
 - `docs`：路线图、协议、安全和架构说明。
-- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层、V7-V10 迁移与 M8 文件元数据/票据/访问控制/回收）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b）、NetworkManager（2026-09-10：客户端链路层回归，friend 注入）、**FileProtocol 与 ObjectStorage（M8.1 新增）**，均纳入 CTest）；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
+- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层、V7-V10 迁移与 M8 文件元数据/票据/访问控制/回收）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b）、NetworkManager（2026-09-10：客户端链路层回归，friend 注入）、**FileProtocol 与 ObjectStorage（M8.1）、FileHttpService 与 FileTransfer（M8.2 集成测试，起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite）、ThumbnailMaker（M8.3a）**，共 12 套均纳入 CTest）；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
 
 ## 服务端运行模型
 
@@ -121,7 +122,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 客户端校验服务端证书，证书错误时断开；CA 缺失拒绝连接（`XYCHAT_ALLOW_PLAINTEXT=1` 显式开发开关）。
 - 业务请求强制携带 timestamp/nonce（缺失/格式错误/超时/重复一律拒绝），nonce 由服务端全局 TTL 缓存（`NonceCache`）跨连接去重。
 - 日志脱敏（`LogSanitizer`）；敏感内存清零（`SecureMemory`）；结构化日志（M11 前置 `StructuredLogger`：单行 JSON 统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段，`sendResponse` 中央审计 + 安全事件带 reason，敏感字段脱敏）。
-- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；文件传输只有控制面与存储层（M8.1），数据面 HTTP(S) 服务与客户端上传/下载尚未实施。
+- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；文件传输的控制面、数据面与客户端引擎均已落地（M8.1/M8.2），但上传 hashing 与保存解密在 GUI 线程同步执行、下载票据 TTL 对大文件不足且无断点续传（见 ROADMAP §3）。
 
 ### 文件与对象存储（M8.1，2026-09-10）
 
@@ -145,7 +146,13 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - **并发**：存储实例由各连接线程共享，同一 blobKey 的 `finalize`/`remove` 经固定条带锁（64 条）串行（同时组装会交错写入产出损坏对象；一边组装一边删除会产出“元数据 ready 而对象缺失”的不可自愈状态）；`putChunk` 不入锁（单片写入已原子，与组装交叠只会让 finalize 的长度/摘要关卡判失败）。
 - **回收**：`Server::pruneFileUploads` 三轮（超期未完成上传 → 终态行收尾 → 已就绪但无引用的行原子迁入终态），均遵循“先保证不产生孤儿数据、再销毁”；详见 `docs/PROTOCOL.md` M8 章节与 `docs/SECURITY.md`。
 - **回收与发送的竞态防护（两侧）**：“终态行不可能再被引用”并不成立——每连接一个线程，发送侧的文件校验与消息写入之间存在窗口，维护任务可在其中把无引用的 `ready` 文件迁入终态。因此发送侧把“文件仍为 `ready`”下推为 `INSERT` 的守卫子查询（`sendMessage` 单语句原子，SQLite 写者串行，守卫未命中则不写入并回 `FileNotReady`），回收侧终态那一轮在删盘前再判一次引用（宁可留下可修复的 `cancelled` 行 + 盘上对象，也不销毁仍被引用的数据）。
-- **尚未实施**：多媒体元数据生成（需 QtMultimedia，清单字段已预留）与应用内图片/视频/语音预览（属 M8.3）。
+- **尚未实施**：音视频时长与视频封面（需 QtMultimedia 与平台解码后端，属 M8.3b）、应用内大图查看器与音视频播放器。
+
+### 图片元数据与内联缩略图（M8.3a，2026-09-11）
+
+- `Chat-Client/core/ThumbnailMaker`：**纯 QtGui**（`QImageReader` 读尺寸 + 缩放解码，`QImage` 编码 JPEG），不依赖平台多媒体后端，因此在无头环境与 CI 中可稳定验证（音视频时长/封面需 Media Foundation 等后端，CI 不可验证，故拆为 M8.3b）。最长边 160px，逐步降质量 70/55/40/25/15，质量到底仍超限再折半降尺寸（下限 32px）；**压不进 `MaxThumbnailBytes`（4096）就不内联**（绝不放宽上限，否则清单撑破群消息正文长度会使整条文件消息被拒收）。`setAutoTransform` 校正 EXIF 方向并据此修正上报宽高；`setScaledSize` 先缩放再解码，避免把大图完整读进内存。
+- 接入路径：`FileTransferManager::uploadAndSend` 提取并写入清单 `width`/`height`/`thumb`（失败留空，**元数据缺失不阻断发送**）→ `NetworkManager::attachFileInfo` 补脱敏字段 `fileWidth`/`fileHeight`/`fileThumb`（base64 JPEG，不含密钥）→ `ChatView` 角色透传 → `MessageBubble` 以 `data:image/jpeg;base64,` 渲染（仅 `status === Image.Ready` 时显示，解码失败不留空白）。
+- 安全口径：缩略图是 JPEG **明文**字节（清单整体已经 E2EE），因不含密钥而可进 QML，使接收方**在下载原图之前**就能预览（零流量）；服务端仍全程不可见。
 
 ### 文件数据面与客户端传输引擎（M8.2，2026-09-11）
 
