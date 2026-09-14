@@ -1,4 +1,4 @@
-find_package(Qt6 COMPONENTS Test Sql Network HttpServer Gui REQUIRED)
+find_package(Qt6 COMPONENTS Test Sql Network HttpServer Gui Multimedia REQUIRED)
 # OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
 include(XYChatOpenSSL)
 xychat_find_openssl()
@@ -123,6 +123,8 @@ add_executable(TestNetworkManager
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/MediaMetadataExtractor.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/MediaMetadataExtractor.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.h
@@ -141,6 +143,7 @@ target_link_libraries(TestNetworkManager PRIVATE
     Qt6::Sql
     Qt6::Network
     Qt6::Gui
+    Qt6::Multimedia
     XYChatCommon
 )
 
@@ -233,6 +236,10 @@ add_executable(TestFileTransfer
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/MediaMetadataExtractor.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/MediaMetadataExtractor.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/DecryptingIODevice.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/DecryptingIODevice.h
     ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.h
     ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.cpp
@@ -258,6 +265,7 @@ target_link_libraries(TestFileTransfer PRIVATE
     Qt6::Sql
     Qt6::HttpServer
     Qt6::Gui
+    Qt6::Multimedia
     XYChatCommon
 )
 
@@ -294,6 +302,8 @@ add_executable(TestGroupRepro
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/FileTransferManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/MediaMetadataExtractor.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/MediaMetadataExtractor.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/ThumbnailMaker.h
     ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.h
@@ -311,6 +321,7 @@ target_link_libraries(TestGroupRepro PRIVATE
     Qt6::Network
     Qt6::Sql
     Qt6::Gui
+    Qt6::Multimedia
     XYChatCommon
 )
 

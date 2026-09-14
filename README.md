@@ -18,7 +18,7 @@ XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含�
 
 ```text
 .
-├── Chat-Client/          # Qt QML 客户端：登录/主窗口、NetworkManager、KeyStorage、LocalStore（M6.5 本地加密缓存）、FileTransferManager（M8.2 文件上传下载）、ThumbnailMaker（M8.3 图片缩略图）
+├── Chat-Client/          # Qt QML 客户端：登录/主窗口、NetworkManager、KeyStorage、LocalStore（M6.5 本地加密缓存）、FileTransferManager（M8.2 文件上传下载）、ThumbnailMaker（M8.3 图片缩略图）、FileImageProvider（M8.3c 大图查看）、MediaMetadataExtractor/DecryptingIODevice/MediaPlaybackManager（M8.3b 音视频元数据与播放）
 ├── Chat-Server/          # Qt Core/Network/Sql/HttpServer 服务端：TCP 监听、请求处理、SQLite、storage/（M8 对象存储）、http/（M8.2 数据面）
 ├── CommonModule/         # 客户端与服务端共用模块：协议编解码（含 M8 FileProtocol）、加密（PBKDF2/E2EE/群 E2EE/M8 FileCrypto）、安全工具
 ├── docs/                 # 架构、协议、安全与路线图文档
@@ -120,7 +120,7 @@ ctest --test-dir build --output-on-failure
 | `TestFileProtocol` | M8 清单编解码与 fail-closed、分片数学、边界与非法入参 |
 | `TestObjectStorage` | M8 对象存储（分片读写/组装校验/断点续传/幂等删除/崩溃残留清理/路径安全） |
 | `TestFileHttpService` | M8.2 数据面集成（真实 HTTP 回环：票据授权、分片长度/序号校验、Range 全语义、状态护栏、失败限流） |
-| `TestFileTransfer` | M8.2 客户端引擎端到端（上传→组装→下载→解密→另存字节级一致，并断言服务端只见密文、图片上传后清单携带缩略图） |
+| `TestFileTransfer` | M8.2 客户端引擎端到端（上传→组装→下载→解密→另存字节级一致，并断言服务端只见密文、图片上传后清单携带缩略图）；M8.3b/c 新增 `toLocalPath` 七形态、`decryptedFileBytes` 与 `DecryptingIODevice`（顺序读取/seek 跨分片/未下载 open 失败） |
 | `TestThumbnailMaker` | M8.3 图片尺寸与内联缩略图（体积上限收敛、EXIF 方向、非图片与非法入参安全返回） |
 
 另有 `tests/e2e/TestGroupRepro`：双客户端群 E2EE 端到端复现工具，**不纳入 CTest**，需先启动 `Chat-Server` 后手动运行：

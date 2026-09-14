@@ -780,7 +780,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 
 - 收发双方以 `messages.file_id > 0` 判别文件消息（服务端权威、随消息同步），**不靠正文内容猜测**，避免用户文本恰好是 JSON 时误判。
 - `decodeFileManifest` fail-closed：版本不符、`kind` 不匹配、字段缺失、base64 非法、长度越界或分片口径不自洽时置 `ok=false`，不渲染半截元数据；`encodeFileManifest` 对非法清单返回空串（调用方据此拒发）。
-- `width`/`height`/`durationMs`/`thumb` 为多媒体元数据：**图片部分自 M8.3a（2026-09-11）起已生成**（`width`/`height` 为原图像素尺寸，`thumb` 为最长边 ≤160px 的 JPEG），音视频的 `durationMs` 与视频封面仍待实施（需 QtMultimedia 与平台解码后端）。字段先行定义以免后续扩展清单时破坏已有消息的兼容性。
+- `width`/`height`/`durationMs`/`thumb` 为多媒体元数据：**图片部分自 M8.3a（2026-09-11）起已生成**（`width`/`height` 为原图像素尺寸，`thumb` 为最长边 ≤160px 的 JPEG）；**音视频部分自 M8.3b（2026-09-11）起已生成**（`durationMs` 为时长毫秒，视频另填 `width`/`height` 分辨率与 `thumb` 封面帧，由 `MediaMetadataExtractor` 经 QtMultimedia 异步提取）。提取依赖平台解码后端（Windows Media Foundation），失败/超时时字段留空（**元数据缺失绝不阻断发送**，UI 回退到文件图标）。
 - **`thumb` 是 JPEG 明文字节而不是密文**（早期文档与注释曾误作“缩略图密文”，已修正）：清单整体会随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）加密，对缩略图再单独加一层只增加复杂度而无安全收益。也正因为它**不含任何密钥**，客户端可以把它（base64）连同 `width`/`height` 经脱敏出口交给 UI，使接收方**在下载原图之前**就能展示预览；而文件密钥与 nonce 仍只留在 C++ 侧。
 - 内联缩略图上限 `MaxThumbnailBytes=4096`（字节）：清单随消息正文走群 Sender-Key 时受 `MaxGroupMessageLength`（16384 字符）约束，base64 约 1.34 倍膨胀。客户端逐步降质量与尺寸以压进上限，**压不进就不内联**（`thumb` 为空，UI 回退到文件图标），绝不放宽上限：清单超长会使整条文件消息被服务端以 `InvalidRequest` 拒收。更大的缩略图应作为独立文件上传并在清单里引用其 `fileId`（待后续实施）。
 

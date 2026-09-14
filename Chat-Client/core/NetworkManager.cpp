@@ -2688,9 +2688,20 @@ void NetworkManager::attachFileInfo(QJsonObject &message)
     // 在下载原图之前就能展示预览。以 base64 交给 QML 拼 data URL
     message["fileWidth"] = manifest.width;
     message["fileHeight"] = manifest.height;
-    if (!manifest.thumbnail.isEmpty()) {
-        message["fileThumb"] = QString::fromLatin1(manifest.thumbnail.toBase64());
+    // M8.3a 欠账补齐：清单 thumb 为空（M8.3a 之前发送的历史图片消息）且原图
+    // 已下载时，从本地密文缓存解密生成缩略图并缓存（首次生成后后续命中缓存）。
+    // 仅对图片做：音视频封面走上传时生成的清单 thumb，不在接收端补
+    QByteArray thumbBytes = manifest.thumbnail;
+    if (thumbBytes.isEmpty() && messageId > 0
+        && manifest.mime.startsWith(QLatin1String("image/"))) {
+        thumbBytes = m_fileTransfer->localThumbnailForMessage(messageId);
     }
+    if (!thumbBytes.isEmpty()) {
+        message["fileThumb"] = QString::fromLatin1(thumbBytes.toBase64());
+    }
+    // M8.3b: 音视频时长（毫秒）。同样不含密钥，可进 QML 供气泡展示时长标签。
+    // 为 0 表示未知（音频提取失败或非音视频），UI 据此隐藏时长标签
+    message["fileDurationMs"] = manifest.durationMs;
 }
 
 void NetworkManager::sanitizeForUi(QJsonObject &message)

@@ -18,6 +18,7 @@
 #include <memory>
 
 #include "core/FileTransferManager.h"
+#include "core/DecryptingIODevice.h"
 #include "database/DatabaseManager.h"
 #include "http/FileHttpService.h"
 #include "storage/LocalFileStorage.h"
@@ -61,6 +62,11 @@ private slots:
     // M8.3c: 应用内图片查看器的图像源经 decryptedFileBytes 取整份明文（内存解码，
     // 不落盘）。必须验：登记+缓存命中时逐字节还原、未登记/未下载/超上限时返回空
     void decryptedFileBytesRestoresPlainForRegisteredMessage();
+    // M8.3b: 播放器经 DecryptingIODevice 从密文缓存流式逐片解密（明文不落盘）。
+    // 必须验：顺序读取逐字节还原、seek 后读取正确、未下载/未登记时 open 失败
+    void decryptingIODeviceRestoresPlainBytes();
+    void decryptingIODeviceSupportsSeek();
+    void decryptingIODeviceFailsWithoutCache();
 
 private:
     // 迷你控制面：与 RequestHandler 的口径一致（创建即签上传票据、完成即
@@ -774,6 +780,107 @@ void TestFileTransfer::decryptedFileBytesRestoresPlainForRegisteredMessage()
     QVERIFY(!hugeJson.isEmpty());
     engine.registerIncomingFile(999999, hugeJson);
     QVERIFY(engine.decryptedFileBytes(999999).isEmpty());
+}
+
+void TestFileTransfer::decryptingIODeviceRestoresPlainBytes()
+{
+    // 沿用首个用例的清单（缓存里就是这份密文）；若被前序用例清空则先下载
+    QVERIFY(!m_firstManifestJson.isEmpty());
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(engine);
+
+    const qint64 messageId = 5150;
+    engine.registerIncomingFile(messageId, m_firstManifestJson);
+    if (!engine.isMessageFileAvailable(messageId)) {
+        const QString downloadToken = engine.download(messageId);
+        QVERIFY2(waitForTask(engine, downloadToken), "download did not finish");
+    }
+    QVERIFY(engine.isMessageFileAvailable(messageId));
+
+    // DecryptingIODevice 从密文缓存流式逐片解密：顺序读取应逐字节还原明文
+    DecryptingIODevice device(messageId, &engine);
+    QVERIFY(device.open(QIODevice::ReadOnly));
+    QCOMPARE(device.size(), m_sourceSize);
+    QVERIFY(!device.isSequential());
+    const QByteArray plain = device.readAll();
+    device.close();
+    QCOMPARE(static_cast<qint64>(plain.size()), m_sourceSize);
+    QCOMPARE(plain, readFile(m_sourcePath));
+}
+
+void TestFileTransfer::decryptingIODeviceSupportsSeek()
+{
+    QVERIFY(!m_firstManifestJson.isEmpty());
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(engine);
+
+    const qint64 messageId = 5151;
+    engine.registerIncomingFile(messageId, m_firstManifestJson);
+    if (!engine.isMessageFileAvailable(messageId)) {
+        const QString downloadToken = engine.download(messageId);
+        QVERIFY2(waitForTask(engine, downloadToken), "download did not finish");
+    }
+
+    const QByteArray original = readFile(m_sourcePath);
+    DecryptingIODevice device(messageId, &engine);
+    QVERIFY(device.open(QIODevice::ReadOnly));
+
+    // seek 到中间偏移读取后半段：分片是独立 AEAD，seek 后必须能定位到
+    // 正确分片并解密（播放器拖动进度条依赖此）
+    const qint64 mid = m_sourceSize / 2;
+    QVERIFY(device.seek(mid));
+    QCOMPARE(device.pos(), mid);
+    const QByteArray tail = device.read(m_sourceSize - mid);
+    QCOMPARE(tail, original.mid(static_cast<int>(mid)));
+
+    // seek 回开头再读：验证可重复定位
+    QVERIFY(device.seek(0));
+    const QByteArray head = device.read(1024);
+    QCOMPARE(head, original.left(1024));
+
+    // seek 到跨分片边界的非对齐位置：读取跨越两个分片，验证解密拼接正确
+    const qint64 plainChunk = Protocol::plainSizeOfChunk(Protocol::DefaultChunkSize);
+    if (m_sourceSize > plainChunk + 200) {
+        const qint64 crossBoundary = plainChunk - 50;
+        QVERIFY(device.seek(crossBoundary));
+        const QByteArray segment = device.read(200);
+        QCOMPARE(segment, original.mid(static_cast<int>(crossBoundary), 200));
+    }
+    device.close();
+}
+
+void TestFileTransfer::decryptingIODeviceFailsWithoutCache()
+{
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+
+    // 未登记清单：open 失败（不得凭空造数据）
+    DecryptingIODevice noManifest(999999, &engine);
+    QVERIFY(!noManifest.open(QIODevice::ReadOnly));
+
+    // 登记一份未下载的清单（随机摘要，缓存中不存在）：open 失败
+    const auto key = FileCrypto::generateFileKey();
+    Protocol::FileManifest missing;
+    missing.fileId = 1;
+    missing.name = "never-downloaded.bin";
+    missing.mime = "application/octet-stream";
+    missing.plainSize = 4096;
+    missing.cipherSize = 4112;
+    missing.chunkSize = Protocol::MinChunkSize;
+    missing.sha256Hex = FileCrypto::sha256Hex("never-downloaded-for-device");
+    missing.key = key.key;
+    missing.iv = key.iv;
+    const QString missingJson = Protocol::encodeFileManifest(missing);
+    QVERIFY(!missingJson.isEmpty());
+    engine.registerIncomingFile(31338, missingJson);
+    QVERIFY(!engine.isMessageFileAvailable(31338));
+    DecryptingIODevice noCache(31338, &engine);
+    QVERIFY(!noCache.open(QIODevice::ReadOnly));
 }
 
 QTEST_GUILESS_MAIN(TestFileTransfer)

@@ -3,6 +3,8 @@
 #include <QByteArray>
 #include <QString>
 
+class QImage;
+
 #include "FileProtocol.h"
 
 namespace XYChat::Client
@@ -38,6 +40,15 @@ public:
     // **元数据缺失绝不影响文件传输本身**（宁可不显示缩略图，也不阻断发送）。
     static Result make(const QString &filePath, int maxEdge = 160,
                        int maxBytes = XYChat::Protocol::MaxThumbnailBytes);
+
+    // 从已解码的 QImage 生成不超过 maxBytes 的 JPEG 缩略图（最长边 maxEdge 像素）。
+    // 复用 make 的压缩逻辑（逐步降质量 70/55/40/25/15、质量到底仍超限再折半降尺寸
+    // 至下限 32px），但不处理 EXIF 旋转（调用方若需要应自行校正后再传入）。
+    // image 为空或压不进上限时返回空 QByteArray。
+    // M8.3b: 供 MediaMetadataExtractor 压缩视频封面帧（从 QVideoFrame::toImage 获取，
+    // 尺寸可能为视频原生分辨率如 1920x1080，内部会先缩放到 maxEdge 再压缩）
+    static QByteArray encodeThumbnail(const QImage &image, int maxEdge = 160,
+                                      int maxBytes = XYChat::Protocol::MaxThumbnailBytes);
 };
 
 } // namespace XYChat::Client

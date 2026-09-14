@@ -6,6 +6,7 @@
 #include <QMutex>
 #include <QNetworkRequest>
 #include <QObject>
+#include <QQueue>
 #include <QSet>
 #include <QSslConfiguration>
 #include <QString>
@@ -13,6 +14,7 @@
 #include <QVariant>
 
 #include "FileProtocol.h"
+#include "MediaMetadataExtractor.h"
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -87,6 +89,20 @@ public:
     // 读进内存只对小文件可行，大文件应走 saveToFile（流式解密写盘）
     QByteArray decryptedFileBytes(qint64 messageId) const;
     static constexpr qint64 MaxInMemoryDecodeBytes = 64 * 1024 * 1024;
+
+    // M8.3b: 供 DecryptingIODevice（播放器）调用：一次性获取某消息的清单副本
+    //（含密钥）与密文缓存文件路径。与 decryptedFileBytes 不同，本方法不读文件、
+    // 不解密，只返回元信息，调用方自行流式逐片解密（明文不落盘）。
+    // 返回 false 表示未登记清单、messageId 非法或缓存未就绪
+    bool playbackInfoForMessage(qint64 messageId, XYChat::Protocol::FileManifest *manifestOut,
+                                QString *cachePathOut) const;
+
+    // M8.3a 欠账补齐：历史图片消息（M8.3a 之前发送，清单 thumb 为空）的本地
+    // 缩略图生成。若清单是图片、thumb 为空、原图密文缓存已就绪且未超内存
+    // 解码上限，则解密原图生成缩略图并缓存到 <cacheRoot>/thumbs/，返回 JPEG
+    // 字节；已缓存则直接读取返回。非图片/原图未就绪/超限/生成失败返回空。
+    // 供 NetworkManager::attachFileInfo 在清单 thumb 为空时回填 fileThumb
+    QByteArray localThumbnailForMessage(qint64 messageId);
 
 public slots:
     // 上传本地文件并在完成后请求发送。返回任务 token（参数非法也返回 token，
@@ -171,6 +187,8 @@ private:
         int mediaWidth = 0;
         int mediaHeight = 0;
         QByteArray thumbnail;
+        // M8.3b: 音视频时长（毫秒，异步提取，提取失败留空）
+        qint64 mediaDurationMs = 0;
         QByteArray fileKey;  // 32B，用后清零
         QByteArray iv;       // 12B nonce 前缀
         qint64 fileId = 0;
@@ -210,6 +228,15 @@ private:
     // 串行调度：一次只跑一个分片（避免带宽争抢、内存峰值与 per-IP 限流），
     // 当前分片完成后推进下一个可运行的任务
     void pumpNext();
+    // M8.3b: 上传入口拆为"元数据提取（图片同步/音视频异步）→ hashing → creating"
+    // 三阶段。beginHashing 从 uploadAndSend 抽出，供音视频元数据提取完成后回调
+    void beginHashing(const QString &token);
+    void startMetadataExtraction(const QString &token);
+    void onMetadataExtracted(const MediaMetadataExtractor::Result &result);
+    void processNextPendingExtraction();
+    // M8.3b: 清理某任务的元数据提取状态（正在提取则取消并处理下一个，
+    // 在队列中则移除）。cancelTask/finishTask/failTask 均调用，避免悬空 token
+    void clearExtractionStateForToken(const QString &token);
     void onPutFinished(Task &task, QNetworkReply *reply);
     void onGetFinished(Task &task, QNetworkReply *reply);
     // 下载收尾：校验整体摘要后原子改名进缓存（不通过则丢弃临时文件）
@@ -217,6 +244,9 @@ private:
     QNetworkRequest makeRequest(const QUrl &url) const;
 
     QString cachePathFor(const QString &sha256Hex) const;
+    // M8.3a 欠账补齐：本地生成的缩略图缓存路径 <cacheRoot>/thumbs/<sha256[0..1]>/<sha256>.jpg
+    //（与密文缓存分开：密文无后缀、缩略图是 JPEG 明文但可公开读取，不含密钥）
+    QString thumbnailCachePathFor(const QString &sha256Hex) const;
     bool ensureCacheRoot();
     // 清单表的线程安全读取：渲染线程会经 decryptedFileBytes 访问，因此所有
     // 读取都走这里（加锁拷贝后立即解锁，文件 IO 与解密均在锁外做）。
@@ -247,6 +277,18 @@ private:
     QString m_baseUrl;
     QString m_cacheRoot;
     QSslConfiguration m_sslConfig;
+
+    // M8.3b: 音视频元数据异步提取器（懒创建，GUI 线程）。同一时间只提取
+    // 一个文件，其余音视频上传任务排队等待（m_pendingExtractTokens）
+    MediaMetadataExtractor *m_metadataExtractor = nullptr;
+    QString m_extractingToken;
+    QQueue<QString> m_pendingExtractTokens;
+
+    // M8.3b: 历史图片缩略图本地生成的负缓存（按密文 sha256）。生成失败
+    //（内容不可解码/压不进上限）时记下，避免每次 attachFileInfo 都重复
+    // 全量解密同一份原图（无负缓存会退化为每次滚动/刷新都冻一下）。
+    // 仅 GUI 线程访问（attachFileInfo），clearCache/reset 时清空以允许重试
+    QSet<QString> m_thumbnailGenFailed;
 };
 
 } // namespace XYChat::Client

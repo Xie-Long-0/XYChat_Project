@@ -33,7 +33,7 @@ ctest --test-dir out/build/debug --output-on-failure
   - 设置 `$env:QT_FORCE_STDERR_LOGGING = "1"`（QTest/qDebug 转 stderr，不被丢弃）。
   - 直接运行用例可执行文件并重定向落盘：`TestXxx.exe -o result.txt,txt`。
 - 曾因此把 `latestSenderKeyId` 的同秒 tie-break（约 50% 概率失败）误归因为"沙箱 DPAPI 偶发"。审查类任务应实跑测试并落盘输出，而非止步静态阅读。
-- 单测均纳入 CTest（当前 12 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`/`TestThumbnailMaker`。`TestFileHttpService` 与 `TestFileTransfer` 为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）；`TestThumbnailMaker` 只依赖 QtGui 图像编解码，无需平台多媒体后端（JPEG 编码器缺失时相关断言会 QSKIP）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
+- 单测均纳入 CTest（当前 12 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`/`TestThumbnailMaker`。`TestFileHttpService` 与 `TestFileTransfer` 为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）；`TestFileTransfer` 另含 M8.3b/c 的 `DecryptingIODevice`（播放器解密设备：顺序读取/seek 跨分片/未下载 open 失败）与 `toLocalPath`/`decryptedFileBytes` 用例；`TestThumbnailMaker` 只依赖 QtGui 图像编解码，无需平台多媒体后端（JPEG 编码器缺失时相关断言会 QSKIP）。Chat-Client 自 M8.3b 起链接 `Qt6::Multimedia`（音视频元数据提取与播放依赖平台解码后端，CI/无头环境提取失败留空、播放报错，均不崩溃）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
 
 ## 代码风格约定
 

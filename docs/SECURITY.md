@@ -71,7 +71,7 @@
 - **取消顺序**：取消接口先落状态再删磁盘。反序会与并发的完成请求交错出“DB=ready 而 blob 已删”的不可自愈状态（下载票据能正常签发、数据面必然读失败）；本序最坏只留下“DB=cancelled 而分片仍在盘上”的隐形孤儿，由维护任务的终态回收兜底。已完成的文件不走取消接口（可能已被消息引用，撤回会让接收方的下载票据指向已消失的对象）。
 - **文件消息不得静默降级**：存储未注入时 `send_message` 携带 `fileId` 一律拒绝（`FileStorageFailed`）而非按普通消息投递——正文其实是清单 JSON，降级投递会让接收端把文件密钥当文本渲染。文件状态除前置校验（存在/本人/`ready`）外，还在插入语句内原子复核（守卫未命中则不写入并回 `FileNotReady`），避免产出一条指向已回收文件的消息。
 - **内联缩略图（M8.3a，2026-09-11）**：图片消息的清单携带原图尺寸与最长边 ≤160px 的 JPEG 缩略图。缩略图是**明文**字节（清单整体已经既有 E2EE 加密，再单独加一层无安全收益），也正因此它**不含任何密钥**，可以经 `sanitizeForUi` 交给 QML 以 base64 渲染（`data:image/jpeg;base64,`），使接收方在下载原图之前就能预览；文件密钥与 nonce 仍只留在 C++ 侧。提取只用 QtGui（`QImageReader`/`QImage`）而不依赖平台多媒体后端；`setAutoTransform` 校正 EXIF 方向（否则手机竖拍照片会得到横向缩略图）。体积硬约束：压不进 `MaxThumbnailBytes`（4096）就**不内联**（UI 回退到文件图标），绝不放宽上限，因为清单超长会使整条文件消息被服务端拒收。元数据提取失败（非图片/损坏/编码器缺失）一律留空字段，**绝不阻断文件发送**。
-- **尚未实施**：音视频时长与视频封面（需 QtMultimedia 与平台解码后端，属 M8.3b）、应用内大图查看器（当前看原图靠“另存为”，需 `QQuickImageProvider` 从密文缓存解码并注意渲染线程与密钥的跨线程访问）。
+- **音视频元数据与应用内播放（M8.3b/c，2026-09-11）**：音视频时长/分辨率/视频封面由 `MediaMetadataExtractor`（QtMultimedia `QMediaPlayer` + `QVideoSink`）异步提取，同样只在清单内随 E2EE 分发、服务端不可见，提取失败/超时留空绝不阻断发送。应用内大图查看器（`FileImageProvider`，`image://xyfile/<id>`）与音视频播放器（`MediaPlaybackManager` + `DecryptingIODevice`）均从密文缓存逐片解密后在内存中解码/播放，**明文不落盘**（与“磁盘上不存在可读明文”口径一致，看原图/播放不再必须“另存为”）；`DecryptingIODevice` 作为只读 `QIODevice` 喂给 `QMediaPlayer::setSourceDevice`，支持 seek（拖动进度条时按 plainPos 定位分片重新解密）；内存解码上限 64 MiB，超限回退“另存为”。渲染线程与密钥的跨线程访问经 `manifestFor` 加锁拷贝清单、IO 与 GCM 认证在锁外。历史图片消息（清单 thumb 为空）下载后由 `localThumbnailForMessage` 本地生成缩略图缓存到 `<cacheRoot>/thumbs/`（JPEG 明文，不含密钥，与密文缓存分目录）。**已知限制**：视频播放无动态画面（QML VideoOutput 无法绑定 C++ QVideoSink，只输出音频轨 + 静态封面）。
 
 ### 数据面与客户端缓存安全（M8.2，2026-09-11）
 

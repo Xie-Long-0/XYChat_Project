@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QImage>
 #include <QMimeDatabase>
 #include <QMutexLocker>
 #include <QNetworkAccessManager>
@@ -155,6 +156,17 @@ QString FileTransferManager::cachePathFor(const QString &sha256Hex) const
     return m_cacheRoot + QLatin1String("/") + sha256Hex.left(2) + QLatin1String("/") + sha256Hex;
 }
 
+QString FileTransferManager::thumbnailCachePathFor(const QString &sha256Hex) const
+{
+    // 与密文缓存分目录：密文无后缀（不可预测文件名兼作内容寻址），
+    // 缩略图是 JPEG 明文（不含密钥，可公开读取）故带 .jpg 后缀
+    if (!Protocol::isSha256Hex(sha256Hex)) {
+        return QString();
+    }
+    return m_cacheRoot + QLatin1String("/thumbs/") + sha256Hex.left(2)
+           + QLatin1String("/") + sha256Hex + QLatin1String(".jpg");
+}
+
 bool FileTransferManager::ensureCacheRoot()
 {
     QDir dir(m_cacheRoot);
@@ -282,6 +294,113 @@ QByteArray FileTransferManager::decryptedFileBytes(qint64 messageId) const
     return plain;
 }
 
+bool FileTransferManager::playbackInfoForMessage(qint64 messageId,
+                                                 XYChat::Protocol::FileManifest *manifestOut,
+                                                 QString *cachePathOut) const
+{
+    if (manifestOut == nullptr || cachePathOut == nullptr) {
+        return false;
+    }
+    if (!manifestFor(messageId, manifestOut)) {
+        return false;
+    }
+    // 缓存未就绪（未下载或已被清理）：播放器无法工作，调用方应先触发 download
+    if (!isCached(manifestOut->sha256Hex, manifestOut->cipherSize)) {
+        SecureMemory::wipe(manifestOut->key);
+        return false;
+    }
+    *cachePathOut = cachePathFor(manifestOut->sha256Hex);
+    if (cachePathOut->isEmpty()) {
+        SecureMemory::wipe(manifestOut->key);
+        return false;
+    }
+    return true;
+}
+
+QByteArray FileTransferManager::localThumbnailForMessage(qint64 messageId)
+{
+    FileManifest manifest;
+    if (!manifestFor(messageId, &manifest)) {
+        return {};
+    }
+    // 只补齐图片：音视频封面走清单 thumb（M8.3b 上传时生成），非图片无缩略图。
+    // 清单已带 thumb（M8.3a 之后发送的图片）也无需本地补齐
+    if (!manifest.mime.startsWith(QLatin1String("image/")) || !manifest.thumbnail.isEmpty()) {
+        SecureMemory::wipe(manifest.key);
+        return {};
+    }
+
+    const QString thumbPath = thumbnailCachePathFor(manifest.sha256Hex);
+    if (thumbPath.isEmpty()) {
+        SecureMemory::wipe(manifest.key);
+        return {};
+    }
+    // 负缓存命中：此前已尝试生成但失败（内容不可解码/压不进上限），不再重复
+    // 全量解密原图（否则每次滚动/刷新都会冻一下）
+    if (m_thumbnailGenFailed.contains(manifest.sha256Hex)) {
+        SecureMemory::wipe(manifest.key);
+        return {};
+    }
+    // 缩略图缓存命中：直接读取，避免重复解密原图
+    {
+        QFile cached(thumbPath);
+        if (cached.exists() && cached.open(QIODevice::ReadOnly)) {
+            const QByteArray data = cached.readAll();
+            cached.close();
+            SecureMemory::wipe(manifest.key);
+            if (!data.isEmpty()) {
+                return data;
+            }
+            return {};
+        }
+    }
+    // 原图密文缓存未就绪：无法生成（UI 应先触发 download）
+    if (!isCached(manifest.sha256Hex, manifest.cipherSize)) {
+        SecureMemory::wipe(manifest.key);
+        return {};
+    }
+    // 解密原图（内存）生成缩略图。decryptedFileBytes 有 64 MiB 上限，
+    // 超限的大图不补齐（UI 回退到文件图标），避免把进程打爆
+    const QByteArray plain = decryptedFileBytes(messageId);
+    SecureMemory::wipe(manifest.key);
+    if (plain.isEmpty()) {
+        return {};
+    }
+    const QImage image = QImage::fromData(plain);
+    if (image.isNull()) {
+        // 负缓存：内容不可解码（清单 mime 标称 image/* 但实际不是），避免每次
+        // 渲染都重复全量解密。sha256Hex 不受上面 key 的 wipe 影响
+        m_thumbnailGenFailed.insert(manifest.sha256Hex);
+        return {};
+    }
+    const QByteArray thumb = ThumbnailMaker::encodeThumbnail(image);
+    if (thumb.isEmpty()) {
+        m_thumbnailGenFailed.insert(manifest.sha256Hex);  // 负缓存：压不进上限
+        return {};
+    }
+    // 写入缩略图缓存（临时名 + 改名，避免半截文件被当作完整缓存）。
+    // 写失败不影响本次返回（下次会重试生成）
+    QDir().mkpath(QFileInfo(thumbPath).absolutePath());
+    const QString tmpPath = thumbPath + QLatin1String(".")
+        + QUuid::createUuid().toString(QUuid::Id128) + QLatin1String(".tmp");
+    QFile tmp(tmpPath);
+    if (tmp.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (tmp.write(thumb) == thumb.size()) {
+            tmp.close();
+            if (QFileInfo::exists(thumbPath)) {
+                QFile::remove(thumbPath);
+            }
+            if (!tmp.rename(thumbPath)) {
+                tmp.remove();
+            }
+        } else {
+            tmp.close();
+            tmp.remove();
+        }
+    }
+    return thumb;
+}
+
 qint64 FileTransferManager::cacheBytes() const
 {
     qint64 total = 0;
@@ -301,8 +420,28 @@ int FileTransferManager::clearCache()
 {
     int removed = 0;
     QDir root(m_cacheRoot);
+    // M8.3a 欠账补齐：先递归清理本地缩略图缓存（thumbs 目录）。缩略图是
+    // 密文的衍生副本，清掉后下次需要时会从原图重新生成
+    const QString thumbsDir = m_cacheRoot + QLatin1String("/thumbs");
+    if (QDir(thumbsDir).exists()) {
+        QDir thumbsRoot(thumbsDir);
+        const QStringList thumbBuckets =
+            thumbsRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &bucket : thumbBuckets) {
+            QDir dir(thumbsRoot.filePath(bucket));
+            removed += dir.entryList(QDir::Files | QDir::NoSymLinks).count();
+        }
+        // removeRecursively 是无参成员函数：删除 QDir 对象代表的目录及其全部内容
+        QDir(thumbsDir).removeRecursively();
+    }
+    // 缩略图负缓存一并清空：缓存已清，重新下载后应允许重试生成
+    m_thumbnailGenFailed.clear();
     const QStringList buckets = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
     for (const QString &bucket : buckets) {
+        // thumbs 已单独递归清理（且已删除），此处跳过以防万一
+        if (bucket == QLatin1String("thumbs")) {
+            continue;
+        }
         QDir dir(root.filePath(bucket));
         const QStringList files = dir.entryList(QDir::Files | QDir::NoSymLinks);
         for (const QString &name : files) {
@@ -413,20 +552,121 @@ QString FileTransferManager::uploadAndSend(const QVariant &localPathOrUrl,
             t.mediaHeight = media.height;
             t.thumbnail = media.thumb;
         }
+        // 图片同步提取完成，直接开始 hashing
+        beginHashing(token);
+        return token;
     }
+
+    // M8.3b: 音视频元数据异步提取（QMediaPlayer + QVideoSink，依赖平台解码后端）。
+    // 提取期间 phase="extracting"，UI 显示"提取元数据中 0%"；提取完成或超时后
+    // 继续 hashing。元数据缺失绝不阻断发送（与图片路径同口径）。同一时间只
+    // 提取一个文件，其余音视频上传任务排队等待
+    if (t.mime.startsWith(QLatin1String("audio/"))
+        || t.mime.startsWith(QLatin1String("video/"))) {
+        t.phase = QLatin1String("extracting");
+        emit taskProgress(token, t.phase, 0, t.plainSize);
+        if (m_extractingToken.isEmpty()) {
+            startMetadataExtraction(token);
+        } else {
+            m_pendingExtractTokens.enqueue(token);
+        }
+        return token;
+    }
+
+    // 其他文件（非图片非音视频）：无元数据可提取，直接开始 hashing
+    beginHashing(token);
+    return token;
+}
+
+// M8.3b: hashing → creating 阶段（从 uploadAndSend 抽出，供音视频元数据提取
+// 完成后回调）。computeCipherDigest 在 GUI 线程同步执行（大文件会冻屏，
+// 已登记为 §3 P3 欠账），与重构前行为一致
+void FileTransferManager::beginHashing(const QString &token)
+{
+    auto it = m_tasks.find(token);
+    if (it == m_tasks.end() || it->cancelled) {
+        return;
+    }
+    Task &t = it.value();
     t.phase = QLatin1String("hashing");
+    // computeCipherDigest 内部会 emit taskProgress（hashing 阶段，offset/plainSize）
 
     QString error;
     if (!computeCipherDigest(t, &error)) {
         failTask(token, error);
-        return token;
+        return;
     }
 
     t.phase = QLatin1String("creating");
     emit taskProgress(token, t.phase, 0, t.cipherSize);
     emit uploadCreateRequested(requestSeq(token), t.cipherSize, t.chunkSize, t.chunkCount,
                                t.sha256Hex);
-    return token;
+}
+
+// M8.3b: 开始音视频元数据提取（懒创建 extractor，连接 finished 信号）
+void FileTransferManager::startMetadataExtraction(const QString &token)
+{
+    auto it = m_tasks.find(token);
+    if (it == m_tasks.end() || it->cancelled) {
+        // 任务已被取消/失败，跳过并处理下一个
+        m_extractingToken.clear();
+        processNextPendingExtraction();
+        return;
+    }
+    if (!m_metadataExtractor) {
+        m_metadataExtractor = new MediaMetadataExtractor(this);
+        connect(m_metadataExtractor, &MediaMetadataExtractor::finished, this,
+                &FileTransferManager::onMetadataExtracted);
+    }
+    m_extractingToken = token;
+    m_metadataExtractor->extract(it->localPath);
+}
+
+// M8.3b: 元数据提取完成回调。提取失败或超时则元数据留空，继续 hashing
+//（绝不阻断发送）。然后处理队列中下一个等待提取的任务
+void FileTransferManager::onMetadataExtracted(const MediaMetadataExtractor::Result &result)
+{
+    const QString token = m_extractingToken;
+    m_extractingToken.clear();
+
+    auto it = m_tasks.find(token);
+    if (it != m_tasks.end() && !it->cancelled) {
+        Task &t = it.value();
+        if (result.ok) {
+            t.mediaDurationMs = result.durationMs;
+            t.mediaWidth = result.width;
+            t.mediaHeight = result.height;
+            t.thumbnail = result.thumbnail;
+        }
+        beginHashing(token);
+    }
+
+    processNextPendingExtraction();
+}
+
+// M8.3b: 从队列取出下一个待提取的任务（跳过已取消/失败的）
+void FileTransferManager::processNextPendingExtraction()
+{
+    while (!m_pendingExtractTokens.isEmpty()) {
+        const QString nextToken = m_pendingExtractTokens.dequeue();
+        if (m_tasks.contains(nextToken) && !m_tasks[nextToken].cancelled) {
+            startMetadataExtraction(nextToken);
+            return;
+        }
+    }
+}
+
+void FileTransferManager::clearExtractionStateForToken(const QString &token)
+{
+    if (m_extractingToken == token) {
+        if (m_metadataExtractor) {
+            m_metadataExtractor->cancel();
+        }
+        m_extractingToken.clear();
+        processNextPendingExtraction();
+    } else {
+        m_pendingExtractTokens.removeAll(token);
+    }
 }
 
 bool FileTransferManager::computeCipherDigest(Task &task, QString *error)
@@ -729,10 +969,11 @@ void FileTransferManager::onUploadCompleted(qint64 seq, bool ok, const QString &
     manifest.sha256Hex = task->sha256Hex;
     manifest.key = task->fileKey;
     manifest.iv = task->iv;
-    // M8.3: 多媒体元数据（图片尺寸与内联缩略图）。这些字段只存在于清单里，
-    // 随消息正文经 E2EE 分发，服务端全程不可见
+    // M8.3: 多媒体元数据（图片尺寸与内联缩略图；M8.3b 音视频时长与视频封面）。
+    // 这些字段只存在于清单里，随消息正文经 E2EE 分发，服务端全程不可见
     manifest.width = task->mediaWidth;
     manifest.height = task->mediaHeight;
+    manifest.durationMs = task->mediaDurationMs;
     manifest.thumbnail = task->thumbnail;
     const QString manifestJson = Protocol::encodeFileManifest(manifest);
     if (manifestJson.isEmpty()) {
@@ -775,6 +1016,8 @@ void FileTransferManager::cancelTask(const QString &token)
     }
     task.cancelled = true;
     task.phase = QLatin1String("cancelling");
+    // M8.3b: 如果取消的任务正在提取元数据或在队列中，清理提取状态
+    clearExtractionStateForToken(token);
 
     // 立即中止在途请求，不等它自然结束
     if (m_activeReply && m_activeToken == token) {
@@ -1152,6 +1395,14 @@ void FileTransferManager::reset()
     m_activeToken.clear();
     m_tasks.clear();
     m_seqToToken.clear();
+    // M8.3b: 清理元数据提取状态（extractor 取消、队列清空），避免悬空 token
+    if (m_metadataExtractor) {
+        m_metadataExtractor->cancel();
+    }
+    m_extractingToken.clear();
+    m_pendingExtractTokens.clear();
+    // 缩略图负缓存也属于会话态，登出/断线时清空
+    m_thumbnailGenFailed.clear();
     // 已登记清单同样含密钥，不得跨会话驻留
     {
         QMutexLocker locker(&m_manifestMutex);
@@ -1188,6 +1439,9 @@ void FileTransferManager::finishTask(const QString &token)
     // erase 之后它会悬垂，而随后的 emit 还要读它。必须先取一份独立副本
     // （拷贝构造使引用计数 +1，节点销毁后数据仍活）再销毁节点
     const QString tokenCopy = token;
+    // M8.3b: 清理提取状态（防御性：finishTask 通常在任务完成后调用，
+    // 此时已过 extracting 阶段，但意外路径下可能仍有悬空 token）
+    clearExtractionStateForToken(tokenCopy);
     SecureMemory::wipe(it->fileKey);
     if (!it->tmpPath.isEmpty()) {
         QFile::remove(it->tmpPath);
@@ -1207,6 +1461,8 @@ void FileTransferManager::failTask(const QString &token, const QString &error)
     }
     // 同 finishTask：先取 token 副本再 erase，避开悬垂引用
     const QString tokenCopy = token;
+    // M8.3b: 同 finishTask，清理提取状态
+    clearExtractionStateForToken(tokenCopy);
     SecureMemory::wipe(it->fileKey);
     if (!it->tmpPath.isEmpty()) {
         QFile::remove(it->tmpPath);

@@ -34,14 +34,21 @@ Item {
     property int fileWidth: 0
     property int fileHeight: 0
     property string fileThumb: ""
+    // M8.3b: 音视频时长（毫秒，不含密钥）。为 0 表示未知，UI 隐藏时长标签
+    property real fileDurationMs: 0
 
     signal downloadRequested()
     signal saveRequested()
     // M8.3: 点击缩略图/图标请求应用内大图预览（仅当本地已就绪时有意义）
     signal previewRequested()
+    // M8.3b: 点击播放按钮请求应用内音视频播放（仅当本地已就绪时有意义）
+    signal playRequested()
 
     // 是否图片类型：只有图片能在应用内解码预览（清单里的 MIME 经 E2EE 到达）
     readonly property bool isImageFile: fileMime.indexOf("image/") === 0
+    // M8.3b: 音视频类型判定（清单里的 MIME 经 E2EE 到达，服务端不可见）
+    readonly property bool isAudioFile: fileMime.indexOf("audio/") === 0
+    readonly property bool isVideoFile: fileMime.indexOf("video/") === 0
 
     // M9 特性栈：右键菜单操作（由 ChatView 转发到 MainPage）
     signal editRequested()
@@ -127,14 +134,48 @@ Item {
                         smooth: true
                         cache: true
 
-                        // M8.3: 点击看大图。图像源 image://xyfile/<messageId> 由 C++
-                        // 从密文缓存逐片解密并在内存中解码（明文不落盘），
-                        // 因此仅在本地已就绪时可点，否则先走下载
+                        // M8.3: 图片点击看大图；M8.3b: 视频点击播放。
+                        // 图像源 image://xyfile/<messageId> 由 C++ 从密文缓存
+                        // 逐片解密并在内存中解码（明文不落盘），仅在本地已就绪时可点
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            enabled: isImageFile && fileState === "available"
-                            onClicked: messageBubble.previewRequested()
+                            enabled: (isImageFile || isVideoFile) && fileState === "available"
+                            onClicked: isVideoFile ? messageBubble.playRequested()
+                                                   : messageBubble.previewRequested()
+                        }
+
+                        // M8.3b: 视频封面中央叠加播放按钮（半透明圆形 + ▶）
+                        Rectangle {
+                            anchors.centerIn: parent
+                            visible: isVideoFile && fileState === "available"
+                            width: 48; height: 48; radius: 24
+                            color: "#80000000"
+                            Label {
+                                anchors.centerIn: parent
+                                text: "▶"
+                                color: "white"
+                                font.pixelSize: 20
+                            }
+                        }
+
+                        // M8.3b: 右下角时长标签（音视频，半透明背景）
+                        Rectangle {
+                            anchors.right: parent.right
+                            anchors.bottom: parent.bottom
+                            anchors.margins: 6
+                            visible: fileDurationMs > 0
+                            color: "#80000000"
+                            radius: Theme.radiusSmall
+                            width: thumbDurationLabel.implicitWidth + 12
+                            height: thumbDurationLabel.implicitHeight + 6
+                            Label {
+                                id: thumbDurationLabel
+                                anchors.centerIn: parent
+                                text: messageBubble.formatDuration(fileDurationMs)
+                                color: "white"
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                            }
                         }
                     }
 
@@ -155,18 +196,21 @@ Item {
                             color: Theme.primaryColor
                             Label {
                                 anchors.centerIn: parent
-                                text: "📎"
+                                // M8.3b: 音视频显示播放图标，其他显示回形针
+                                text: (isAudioFile || isVideoFile) ? "▶" : "📎"
                                 color: Theme.textOnPrimary
                                 font.pixelSize: Theme.fontSizeMedium
                             }
-                            // M8.3: 无内联缩略图的图片（压不进上限或历史消息）
-                            // 也可从图标处点开大图预览
+                            // M8.3: 无内联缩略图的图片点击预览；M8.3b: 音视频点击播放
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                enabled: isImageFile && fileState === "available"
+                                enabled: fileState === "available"
+                                         && (isImageFile || isAudioFile || isVideoFile)
                                          && thumbImage.status !== Image.Ready
-                                onClicked: messageBubble.previewRequested()
+                                onClicked: (isAudioFile || isVideoFile)
+                                           ? messageBubble.playRequested()
+                                           : messageBubble.previewRequested()
                             }
                         }
 
@@ -181,6 +225,14 @@ Item {
                             }
                             Label {
                                 text: messageBubble.formatSize(fileSizeBytes)
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                color: Theme.textTertiary
+                            }
+                            // M8.3b: 音视频时长（无封面时在文件名下方展示，
+                            // 有封面时已在缩略图右下角叠加，此处隐藏避免重复）
+                            Label {
+                                visible: fileDurationMs > 0 && thumbImage.status !== Image.Ready
+                                text: messageBubble.formatDuration(fileDurationMs)
                                 font.pixelSize: Theme.fontSizeSmall - 1
                                 color: Theme.textTertiary
                             }
@@ -302,5 +354,22 @@ Item {
             return (bytes / (1024 * 1024)).toFixed(1) + " MB"
         }
         return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB"
+    }
+
+    // M8.3b: 毫秒转可读时长（mm:ss 或 h:mm:ss）。为 0 返回空串（UI 隐藏标签）
+    function formatDuration(ms) {
+        if (ms <= 0) {
+            return ""
+        }
+        var totalSeconds = Math.floor(ms / 1000)
+        var hours = Math.floor(totalSeconds / 3600)
+        var minutes = Math.floor((totalSeconds % 3600) / 60)
+        var seconds = totalSeconds % 60
+        var mm = (minutes < 10 ? "0" : "") + minutes
+        var ss = (seconds < 10 ? "0" : "") + seconds
+        if (hours > 0) {
+            return hours + ":" + mm + ":" + ss
+        }
+        return mm + ":" + ss
     }
 }

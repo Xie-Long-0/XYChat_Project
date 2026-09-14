@@ -23,7 +23,7 @@ TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；`FileProtocol`（M8.1：`FileManifest` 编解码、分片数学与体积/分片/票据常量，客户端与服务端共用同一组常量以免校验口径漂移）；
   - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码；M8.1 新增带 AAD 的 GCM 原语）、`GroupE2eeCrypto`（M7b：Sender-Key 生成/chain-key ratchet/群消息 AES-256-GCM + Ed25519 签名/分发消息 pairwise envelope 编解码；2026-09-09 新增跳序消息密钥缓存）、`FileCrypto`（M8.1：文件密钥/nonce 前缀生成、分片独立 AEAD 加解密、流式 SHA-256、票据与其摘要）；
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）、`StructuredLogger`（M11 前置：单行 JSON 结构化日志，统一字段 + 复用 LogSanitizer 脱敏）。
-- 客户端还包含 `core/FileTransferManager`（M8.2：文件上传下载引擎，不持有 socket，经信号/回调与控制面协作）与 `core/ThumbnailMaker`（M8.3a：图片尺寸与内联缩略图，纯 QtGui）。
+- 客户端还包含 `core/FileTransferManager`（M8.2：文件上传下载引擎，不持有 socket，经信号/回调与控制面协作）、`core/ThumbnailMaker`（M8.3a：图片尺寸与内联缩略图，纯 QtGui；M8.3b 抽出 `encodeThumbnail` 供视频封面复用）、`core/FileImageProvider`（M8.3c：应用内大图查看器图像源 `image://xyfile/<id>`）、`core/MediaMetadataExtractor`（M8.3b：音视频时长/分辨率/封面异步提取，QtMultimedia）、`core/DecryptingIODevice` 与 `core/MediaPlaybackManager`（M8.3b：密文缓存流式逐片解密播放，明文不落盘）。
 - `docs`：路线图、协议、安全和架构说明。
 - `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层、V7-V10 迁移与 M8 文件元数据/票据/访问控制/回收）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b）、NetworkManager（2026-09-10：客户端链路层回归，friend 注入）、**FileProtocol 与 ObjectStorage（M8.1）、FileHttpService 与 FileTransfer（M8.2 集成测试，起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite）、ThumbnailMaker（M8.3a）**，共 12 套均纳入 CTest）；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
 
@@ -146,13 +146,21 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - **并发**：存储实例由各连接线程共享，同一 blobKey 的 `finalize`/`remove` 经固定条带锁（64 条）串行（同时组装会交错写入产出损坏对象；一边组装一边删除会产出“元数据 ready 而对象缺失”的不可自愈状态）；`putChunk` 不入锁（单片写入已原子，与组装交叠只会让 finalize 的长度/摘要关卡判失败）。
 - **回收**：`Server::pruneFileUploads` 三轮（超期未完成上传 → 终态行收尾 → 已就绪但无引用的行原子迁入终态），均遵循“先保证不产生孤儿数据、再销毁”；详见 `docs/PROTOCOL.md` M8 章节与 `docs/SECURITY.md`。
 - **回收与发送的竞态防护（两侧）**：“终态行不可能再被引用”并不成立——每连接一个线程，发送侧的文件校验与消息写入之间存在窗口，维护任务可在其中把无引用的 `ready` 文件迁入终态。因此发送侧把“文件仍为 `ready`”下推为 `INSERT` 的守卫子查询（`sendMessage` 单语句原子，SQLite 写者串行，守卫未命中则不写入并回 `FileNotReady`），回收侧终态那一轮在删盘前再判一次引用（宁可留下可修复的 `cancelled` 行 + 盘上对象，也不销毁仍被引用的数据）。
-- **尚未实施**：音视频时长与视频封面（需 QtMultimedia 与平台解码后端，属 M8.3b）、应用内大图查看器与音视频播放器。
+- **已知限制**：视频播放无动态画面（QML VideoOutput 无法绑定 C++ QVideoSink，只输出音频轨 + 静态封面，需自定义 QSGNode）；音视频元数据提取与播放依赖平台解码后端（Windows Media Foundation），CI/无头不可验证。
 
 ### 图片元数据与内联缩略图（M8.3a，2026-09-11）
 
 - `Chat-Client/core/ThumbnailMaker`：**纯 QtGui**（`QImageReader` 读尺寸 + 缩放解码，`QImage` 编码 JPEG），不依赖平台多媒体后端，因此在无头环境与 CI 中可稳定验证（音视频时长/封面需 Media Foundation 等后端，CI 不可验证，故拆为 M8.3b）。最长边 160px，逐步降质量 70/55/40/25/15，质量到底仍超限再折半降尺寸（下限 32px）；**压不进 `MaxThumbnailBytes`（4096）就不内联**（绝不放宽上限，否则清单撑破群消息正文长度会使整条文件消息被拒收）。`setAutoTransform` 校正 EXIF 方向并据此修正上报宽高；`setScaledSize` 先缩放再解码，避免把大图完整读进内存。
 - 接入路径：`FileTransferManager::uploadAndSend` 提取并写入清单 `width`/`height`/`thumb`（失败留空，**元数据缺失不阻断发送**）→ `NetworkManager::attachFileInfo` 补脱敏字段 `fileWidth`/`fileHeight`/`fileThumb`（base64 JPEG，不含密钥）→ `ChatView` 角色透传 → `MessageBubble` 以 `data:image/jpeg;base64,` 渲染（仅 `status === Image.Ready` 时显示，解码失败不留空白）。
 - 安全口径：缩略图是 JPEG **明文**字节（清单整体已经 E2EE），因不含密钥而可进 QML，使接收方**在下载原图之前**就能预览（零流量）；服务端仍全程不可见。
+
+### 音视频元数据与应用内播放（M8.3b/c，2026-09-11）
+
+- `Chat-Client/core/MediaMetadataExtractor`：QtMultimedia（`QMediaPlayer` + `QVideoSink`）异步提取音频时长、视频时长/分辨率与封面帧（seek 到 min(1000,duration/2)ms 抓 `QVideoFrame::toImage` → `ThumbnailMaker::encodeThumbnail` 压缩）；5 秒超时护栏，失败/超时留空。依赖平台解码后端（Windows Media Foundation），CI 不可验证。
+- `uploadAndSend` 异步三阶段（extracting → hashing → creating）：图片同步提取，音视频走 `extracting` 阶段异步提取（同一时间一个，其余排队 `m_pendingExtractTokens`），完成后 `beginHashing` 回调继续；元数据缺失绝不阻断发送。
+- 应用内查看/播放（**明文不落盘**）：`FileImageProvider`（`image://xyfile/<id>`，图片大图）与 `MediaPlaybackManager` + `DecryptingIODevice`（音视频，`QMediaPlayer::setSourceDevice` 流式逐片解密，支持 seek 拖动进度）。`DecryptingIODevice` 按 plainPos 定位分片解密，明文只在内存；`MediaPlaybackManager` 经 context property `mediaPlayer` 暴露给 QML 播放器对话框。
+- 历史图片缩略图补齐：`localThumbnailForMessage` 在清单 thumb 为空且原图就绪时本地生成缩略图缓存到 `<cacheRoot>/thumbs/`，`attachFileInfo` 回填 `fileThumb`，`clearCache` 递归清理。
+- 已知限制：视频播放无动态画面（QML VideoOutput 无法绑定 C++ QVideoSink，只输出音频轨 + 静态封面）。
 
 ### 文件数据面与客户端传输引擎（M8.2，2026-09-11）
 

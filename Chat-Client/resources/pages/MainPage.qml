@@ -50,6 +50,8 @@ Rectangle {
     property var downloadTokens: ({})
     // M8.3: 当前预览的图片消息（作为 image://xyfile/<id> 的路径段）
     property int previewMessageId: 0
+    // M8.3b: 当前播放的音视频消息（mediaPlayer.play 的目标）
+    property int playMessageId: 0
     // M7a: 当前群成员数（群会话头部副标题）
     property int currentGroupMemberCount: 0
     // M7a: 用户搜索用途路由（"chat" 发起对话 / "invite" 群邀请）
@@ -346,6 +348,30 @@ Rectangle {
                 mainPage.previewMessageId = messageId
                 imagePreviewDialog.open()
             }
+
+            // M8.3b: 应用内音视频播放。mediaPlayer 从密文缓存流式解密播放
+            //（明文不落盘）；未就绪时先走下载（与图片预览同口径）
+            onFilePlayRequested: function(messageId) {
+                if (typeof mediaPlayer === "undefined") {
+                    return
+                }
+                if (typeof fileTransfer !== "undefined"
+                    && !fileTransfer.isMessageFileAvailable(messageId)) {
+                    mainPage.fileNotice = "文件未就绪，请先下载后再播放"
+                    return
+                }
+                mainPage.playMessageId = messageId
+                // 先打开对话框（创建 positionSlider 等 contentItem）再 play：
+                // 否则 play 后 positionChanged 触发时 positionSlider 尚未创建，
+                // Connections.onPositionChanged 访问它会报 id 未定义
+                mediaPlaybackDialog.open()
+                if (!mediaPlayer.play(messageId)) {
+                    mainPage.fileNotice = "无法播放：文件未就绪、不是音视频，或缓存损坏"
+                    mediaPlaybackDialog.close()
+                    mainPage.playMessageId = 0
+                    return
+                }
+            }
         }
     }
 
@@ -419,6 +445,155 @@ Rectangle {
                     }
                 }
             }
+            Button {
+                text: qsTr("关闭")
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
+        }
+    }
+
+    // M8.3b: 应用内音视频播放器。mediaPlayer（C++ MediaPlaybackManager）从密文
+    // 缓存流式解密播放（setSourceDevice + DecryptingIODevice），明文不落盘。
+    // 视频展示静态封面（动态画面渲染需自定义 QSGNode，QML VideoOutput 无法
+    // 绑定 C++ QVideoSink，已登记为欠账），音频展示音乐图标
+    Dialog {
+        id: mediaPlaybackDialog
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(parent.width * 0.7, 480)
+        padding: Theme.spacingLarge
+        readonly property bool hasPlayer: typeof mediaPlayer !== "undefined"
+        title: {
+            var info = mainPage.playMessageId > 0
+                       ? chatView.getMessageById(mainPage.playMessageId) : null
+            return (info && info.fileName && info.fileName.length > 0)
+                   ? info.fileName : qsTr("播放")
+        }
+        standardButtons: Dialog.NoButton
+        onRejected: {
+            if (hasPlayer) {
+                mediaPlayer.stop()
+            }
+            mainPage.playMessageId = 0
+        }
+
+        background: Rectangle {
+            radius: Theme.radiusLarge
+            color: Theme.windowBackground
+            border.width: 1
+            border.color: Theme.borderColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.spacingMedium
+
+            // 视频封面（静态）或音频图标
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 200
+                radius: Theme.radiusMedium
+                color: Theme.inputBackground
+                clip: true
+
+                Image {
+                    anchors.fill: parent
+                    visible: mediaPlaybackDialog.hasPlayer && mediaPlayer.hasVideo
+                    source: {
+                        var info = mainPage.playMessageId > 0
+                                   ? chatView.getMessageById(mainPage.playMessageId) : null
+                        return (info && info.fileThumb && info.fileThumb.length > 0)
+                               ? "data:image/jpeg;base64," + info.fileThumb : ""
+                    }
+                    fillMode: Image.PreserveAspectFit
+                    asynchronous: true
+                    smooth: true
+                }
+
+                Label {
+                    anchors.centerIn: parent
+                    visible: !mediaPlaybackDialog.hasPlayer || !mediaPlayer.hasVideo
+                    text: "🎵"
+                    font.pixelSize: 64
+                    color: Theme.textTertiary
+                }
+            }
+
+            // 播放/暂停 + 进度条 + 位置/时长
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+
+                Button {
+                    text: (mediaPlaybackDialog.hasPlayer && mediaPlayer.playbackState === 1)
+                          ? qsTr("暂停") : qsTr("播放")
+                    onClicked: {
+                        if (!mediaPlaybackDialog.hasPlayer) {
+                            return
+                        }
+                        if (mediaPlayer.playbackState === 1) {
+                            mediaPlayer.pause()
+                        } else if (mediaPlayer.playbackState === 2) {
+                            mediaPlayer.resume()
+                        } else if (mainPage.playMessageId > 0) {
+                            // Stopped（播放到末尾或出错）：重新开始
+                            mediaPlayer.play(mainPage.playMessageId)
+                        }
+                    }
+                }
+
+                Label {
+                    text: mainPage.formatMs(mediaPlaybackDialog.hasPlayer ? mediaPlayer.position : 0)
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textSecondary
+                }
+
+                Slider {
+                    id: positionSlider
+                    Layout.fillWidth: true
+                    from: 0
+                    to: (mediaPlaybackDialog.hasPlayer && mediaPlayer.duration > 0)
+                        ? mediaPlayer.duration : 1
+                    // value 不绑定 position：改由 Connections.onPositionChanged 在
+                    // 非拖动时更新，避免拖动期间 position 回流覆盖用户位置（回跳）
+                    enabled: mediaPlaybackDialog.hasPlayer && mediaPlayer.duration > 0
+                    onMoved: {
+                        if (mediaPlaybackDialog.hasPlayer) {
+                            mediaPlayer.setPosition(positionSlider.value)
+                        }
+                    }
+                }
+
+                Label {
+                    text: mainPage.formatMs(mediaPlaybackDialog.hasPlayer ? mediaPlayer.duration : 0)
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textSecondary
+                }
+            }
+
+            // 音量
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+                Label {
+                    text: qsTr("音量")
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.textSecondary
+                }
+                Slider {
+                    id: volumeSlider
+                    Layout.fillWidth: true
+                    from: 0; to: 100
+                    value: mediaPlaybackDialog.hasPlayer ? mediaPlayer.volume : 100
+                    onMoved: {
+                        if (mediaPlaybackDialog.hasPlayer) {
+                            mediaPlayer.setVolume(volumeSlider.value)
+                        }
+                    }
+                }
+            }
+        }
+
+        footer: DialogButtonBox {
             Button {
                 text: qsTr("关闭")
                 DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
@@ -507,6 +682,32 @@ Rectangle {
 
         function onCacheCleared(removedCount) {
             mainPage.fileNotice = "已清理 " + removedCount + " 个缓存文件"
+        }
+    }
+
+    // M8.3b: 播放器错误接线。播放失败（缓存损坏/格式不支持/平台后端错误）
+    // 时用现有提示横幅告知用户，并关闭播放器对话框
+    Connections {
+        target: typeof mediaPlayer !== "undefined" ? mediaPlayer : null
+
+        function onErrorOccurred(error) {
+            mainPage.fileNotice = "播放失败：" + error
+            // 显式 stop：close() 不触发 onRejected，不会走 teardown，否则
+            // DecryptingIODevice 仍 open、文件密钥与明文缓冲滞留内存
+            if (typeof mediaPlayer !== "undefined") {
+                mediaPlayer.stop()
+            }
+            if (mediaPlaybackDialog.visible) {
+                mediaPlaybackDialog.close()
+            }
+            mainPage.playMessageId = 0
+        }
+        // 进度滑块跟随播放位置，但拖动期间不覆盖用户位置（避免回跳）。
+        // to 仍绑定 duration（自动更新），故无需 onDurationChanged
+        function onPositionChanged() {
+            if (!positionSlider.pressed && mediaPlaybackDialog.hasPlayer) {
+                positionSlider.value = mediaPlayer.position
+            }
         }
     }
 
@@ -1630,5 +1831,23 @@ Rectangle {
         if (conversationId == currentConversationId) {
             chatView.markMessageDeleted(messageId)
         }
+    }
+
+    // M8.3b: 毫秒转可读时长（播放器位置/时长标签）。与 MessageBubble.formatDuration
+    // 同口径（超 1 小时走 h:mm:ss）
+    function formatMs(ms) {
+        if (ms <= 0) {
+            return "00:00"
+        }
+        var totalSeconds = Math.floor(ms / 1000)
+        var hours = Math.floor(totalSeconds / 3600)
+        var minutes = Math.floor((totalSeconds % 3600) / 60)
+        var seconds = totalSeconds % 60
+        var mm = (minutes < 10 ? "0" : "") + minutes
+        var ss = (seconds < 10 ? "0" : "") + seconds
+        if (hours > 0) {
+            return hours + ":" + mm + ":" + ss
+        }
+        return mm + ":" + ss
     }
 }

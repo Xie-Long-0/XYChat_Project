@@ -28,6 +28,8 @@ Rectangle {
     signal fileSaveRequested(int messageId)
     // M8.3: 图片消息的应用内大图预览（由 MainPage 打开预览对话框）
     signal filePreviewRequested(int messageId)
+    // M8.3b: 音视频消息的应用内播放（由 MainPage 打开播放器对话框）
+    signal filePlayRequested(int messageId)
     // M8.2: 附件选择上转（由 MainPage 按会话类型分流到群聊/私聊，与 sendMessage 一致）。
     // 用 var 保留 QUrl，避免转字符串引入编解码歧义
     signal attachmentSelected(var fileUrl)
@@ -287,9 +289,11 @@ Rectangle {
                 fileWidth: model.fileWidth || 0
                 fileHeight: model.fileHeight || 0
                 fileThumb: model.fileThumb || ""
+                fileDurationMs: model.fileDurationMs || 0
                 onDownloadRequested: chatView.fileDownloadRequested(model.messageId)
                 onSaveRequested: chatView.fileSaveRequested(model.messageId)
                 onPreviewRequested: chatView.filePreviewRequested(model.messageId)
+                onPlayRequested: chatView.filePlayRequested(model.messageId)
                 onEditRequested: chatView.editRequested(model.messageId, model.content)
                 onDeleteRequested: chatView.deleteRequested(model.messageId)
             }
@@ -463,7 +467,8 @@ Rectangle {
                 // M8.2: ListModel 要求各条目角色一致，分隔线也带上文件字段
                 isFileMessage: false, fileName: "", fileSizeBytes: 0,
                 fileSha256: "", fileState: "missing", fileProgress: 0,
-                fileWidth: 0, fileHeight: 0, fileThumb: "", fileMime: ""
+                fileWidth: 0, fileHeight: 0, fileThumb: "", fileMime: "",
+                fileDurationMs: 0
             })
         }
     }
@@ -502,7 +507,9 @@ Rectangle {
             // M8.3: 图片尺寸与内联缩略图（base64 JPEG，不含密钥）
             fileWidth: msg.fileWidth || 0,
             fileHeight: msg.fileHeight || 0,
-            fileThumb: msg.fileThumb || ""
+            fileThumb: msg.fileThumb || "",
+            // M8.3b: 音视频时长（毫秒，不含密钥），UI 据此展示时长标签
+            fileDurationMs: msg.fileDurationMs || 0
         }
     }
 
