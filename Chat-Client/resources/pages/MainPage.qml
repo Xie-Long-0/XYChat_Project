@@ -48,6 +48,8 @@ Rectangle {
     property int pendingSaveMessageId: 0
     property string fileNotice: ""
     property var downloadTokens: ({})
+    // M8.3: 当前预览的图片消息（作为 image://xyfile/<id> 的路径段）
+    property int previewMessageId: 0
     // M7a: 当前群成员数（群会话头部副标题）
     property int currentGroupMemberCount: 0
     // M7a: 用户搜索用途路由（"chat" 发起对话 / "invite" 群邀请）
@@ -294,7 +296,7 @@ Rectangle {
 
             // M8.2: 附件上传。目标分流与 sendMessage 一致（群聊用 conversationId、
             // 私聊用 peerUserId）；清单与文件密钥全程不经 QML
-            onAttachmentSelected: function(filePath) {
+            onAttachmentSelected: function(fileUrl) {
                 if (typeof fileTransfer === "undefined" || !fileTransfer.enabled) {
                     mainPage.fileNotice = "服务端未开启文件传输能力"
                     return
@@ -309,7 +311,8 @@ Rectangle {
                 mainPage.fileNotice = ""
                 mainPage.activeUploadPhase = "准备中"
                 mainPage.activeUploadProgress = 0
-                mainPage.activeUploadToken = fileTransfer.uploadAndSend(filePath, convId, peerId)
+                // 直接把 file URL 交给引擎（内部经 toLocalPath 转本地路径）
+                mainPage.activeUploadToken = fileTransfer.uploadAndSend(fileUrl, convId, peerId)
             }
 
             onFileDownloadRequested: function(messageId) {
@@ -337,6 +340,89 @@ Rectangle {
                 mainPage.pendingSaveMessageId = messageId
                 saveFileDialog.open()
             }
+
+            // M8.3: 应用内大图预览
+            onFilePreviewRequested: function(messageId) {
+                mainPage.previewMessageId = messageId
+                imagePreviewDialog.open()
+            }
+        }
+    }
+
+    // M8.3: 应用内大图预览。图像源 image://xyfile/<messageId> 由 C++ 从密文
+    // 缓存逐片解密并在内存中解码，明文不落盘（看原图不再必须“另存为”）。
+    // M8.3c: 标题带文件名与像素尺寸；footer 提供“另存为”，免得用户为了保存
+    // 原图还得先关预览、再回气泡里点“另存为”
+    Dialog {
+        id: imagePreviewDialog
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(parent.width * 0.85, 900)
+        height: parent.height * 0.85
+        // 查不到消息时回退到通用标题（缓存被清或已登出时会走到这条分支）
+        title: {
+            var info = mainPage.previewMessageId > 0
+                       ? chatView.getMessageById(mainPage.previewMessageId) : null
+            if (!info || !info.fileName || info.fileName.length === 0) {
+                return qsTr("图片预览")
+            }
+            var suffix = (info.fileWidth > 0 && info.fileHeight > 0)
+                         ? "  ·  " + info.fileWidth + "×" + info.fileHeight : ""
+            return info.fileName + suffix
+        }
+        standardButtons: Dialog.NoButton
+        onRejected: mainPage.previewMessageId = 0
+
+        contentItem: Item {
+            Image {
+                id: previewImage
+                anchors.fill: parent
+                // cache 关掉：每次打开都重新请求，以免缓存被清理或重新下载
+                // 后仍展示旧图
+                source: mainPage.previewMessageId > 0
+                        ? "image://xyfile/" + mainPage.previewMessageId : ""
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                smooth: true
+                cache: false
+            }
+
+            BusyIndicator {
+                anchors.centerIn: parent
+                running: previewImage.status === Image.Loading
+                visible: running
+            }
+
+            Label {
+                anchors.centerIn: parent
+                width: parent.width * 0.8
+                visible: previewImage.status === Image.Error
+                         || previewImage.status === Image.Null
+                text: qsTr("无法预览：文件未就绪、不是图片，或已超过内存解码上限（64 MB）。可改用“另存为”。")
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSizeSmall
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+            }
+        }
+
+        footer: DialogButtonBox {
+            // 另存为：复用气泡上的保存链路（弹 FileDialog，用户选定路径后
+            // C++ 侧流式解密写盘）。预览对话框不关闭，保存完可接着看
+            Button {
+                text: qsTr("另存为")
+                DialogButtonBox.buttonRole: DialogButtonBox.ActionRole
+                onClicked: {
+                    if (mainPage.previewMessageId > 0) {
+                        mainPage.pendingSaveMessageId = mainPage.previewMessageId
+                        saveFileDialog.open()
+                    }
+                }
+            }
+            Button {
+                text: qsTr("关闭")
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
         }
     }
 
@@ -347,15 +433,21 @@ Rectangle {
         title: qsTr("保存文件到")
         fileMode: FileDialog.SaveFile
         onAccepted: {
-            if (mainPage.pendingSaveMessageId <= 0) {
+            if (mainPage.pendingSaveMessageId <= 0
+                || typeof fileTransfer === "undefined") {
+                mainPage.pendingSaveMessageId = 0
                 return
             }
-            // 用 Qt.urlToLocalFile 而不是正则剔前缀：后者对 UNC 路径
-            //（file://server/share/x）与含 %/#/? 的路径会给出错误结果，
-            // 保存时更会静默写到带 percent 转义的乱码文件名里
-            var path = Qt.urlToLocalFile(selectedFile)
-            if (typeof fileTransfer !== "undefined"
-                && fileTransfer.saveToFile(mainPage.pendingSaveMessageId, path)) {
+            // 转换交给 C++（QUrl::toLocalFile）：QML 的全局 Qt 对象并无
+            // urlToLocalFile，而正则剔 file:// 前缀对 UNC 与含 %/#/? 的路径会
+            // 静默写到乱码文件名里
+            var path = fileTransfer.toLocalPath(selectedFile)
+            if (path.length === 0) {
+                mainPage.fileNotice = "无法解析所选路径"
+                mainPage.pendingSaveMessageId = 0
+                return
+            }
+            if (fileTransfer.saveToFile(mainPage.pendingSaveMessageId, selectedFile)) {
                 mainPage.fileNotice = "已保存到 " + path
             } else {
                 mainPage.fileNotice = "保存失败：文件未就绪或目标不可写"

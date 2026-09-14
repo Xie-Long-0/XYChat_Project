@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QMimeDatabase>
+#include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -174,11 +175,111 @@ bool FileTransferManager::isCached(const QString &sha256Hex, qint64 cipherSize) 
 
 bool FileTransferManager::isMessageFileAvailable(qint64 messageId) const
 {
+    FileManifest manifest;
+    if (!manifestFor(messageId, &manifest)) {
+        return false;
+    }
+    return isCached(manifest.sha256Hex, manifest.cipherSize);
+}
+
+QString FileTransferManager::toLocalPath(const QVariant &urlOrPath) const
+{
+    // QML 的 url 类型经 QVariant 传来时保留为 QUrl，直接取 toLocalFile 最准确：
+    // 经字符串中转会引入 percent-encoding 的二次编解码歧义（QUrl::toString 默认
+    // PrettyDecoded，对 % 会转成 %25）
+    if (urlOrPath.typeId() == QMetaType::QUrl) {
+        const QUrl url = urlOrPath.toUrl();
+        return url.isLocalFile() ? url.toLocalFile() : QString();
+    }
+    const QString text = urlOrPath.toString().trimmed();
+    if (text.isEmpty()) {
+        return QString();
+    }
+    // 字符串形态：以 "scheme:" 开头即当 URL 解析，只有 file: 协议才接受。
+    // 不把非 file 协议的字符串当路径原样返回：否则 "https://x/y" 会被
+    // QFileInfo 当作相对路径拿去 open，错误现场更难定位（用户看到的是
+    // "文件不存在"，而不是 "这不是本地路径"）。
+    // 但需让开 Windows 盘符路径（C:/... 与 C:\...）：冒号前只有一个字母时
+    // 是盘符而不是 URL scheme（URL scheme 至少 2 个字符）
+    const int colon = text.indexOf(QLatin1Char(':'));
+    const bool looksLikeDriveLetter = colon == 1 && text.at(0).isLetter();
+    if (colon > 0 && !looksLikeDriveLetter && colon < text.indexOf(QLatin1Char('/'))) {
+        const QUrl url(text);
+        return url.isLocalFile() ? url.toLocalFile() : QString();
+    }
+    // 已是本地路径（包括 UNC 的 \\server\share 形式、相对路径与 Windows 盘符路径）
+    return text;
+}
+
+bool FileTransferManager::manifestFor(qint64 messageId,
+                                      XYChat::Protocol::FileManifest *out) const
+{
+    if (out == nullptr || messageId <= 0) {
+        return false;
+    }
+    // 加锁只为了拷贝一份清单：文件 IO 与解密均在锁外做，避免渲染线程
+    // 长时间持锁堵住主线程的登记/reset
+    QMutexLocker locker(&m_manifestMutex);
     const auto it = m_incoming.constFind(messageId);
     if (it == m_incoming.constEnd() || !it->isValid()) {
         return false;
     }
-    return isCached(it->sha256Hex, it->cipherSize);
+    *out = it.value();
+    return true;
+}
+
+QByteArray FileTransferManager::decryptedFileBytes(qint64 messageId) const
+{
+    FileManifest manifest;
+    if (!manifestFor(messageId, &manifest)) {
+        return {};
+    }
+    // 只服务应用内图片查看：把整个明文读进内存仅对小文件可行，大文件应走
+    // saveToFile（流式解密写盘），否则一个 2 GiB 附件就能把进程打爆
+    if (manifest.plainSize <= 0 || manifest.plainSize > MaxInMemoryDecodeBytes) {
+        SecureMemory::wipe(manifest.key);
+        return {};
+    }
+
+    QFile file(cachePathFor(manifest.sha256Hex));
+    if (!file.open(QIODevice::ReadOnly)) {
+        SecureMemory::wipe(manifest.key);
+        return {};  // 未下载或缓存已清：UI 应回退到“需下载”状态
+    }
+
+    QByteArray plain;
+    plain.reserve(manifest.plainSize);
+    qint64 offset = 0;
+    int index = 0;
+    bool corrupt = false;
+    while (offset < manifest.cipherSize) {
+        const qint64 want = qMin(manifest.chunkSize, manifest.cipherSize - offset);
+        const QByteArray cipher = file.read(want);
+        if (cipher.size() != want) {
+            corrupt = true;
+            break;
+        }
+        const QByteArray chunk =
+            FileCrypto::decryptChunk(manifest.key, manifest.iv, index, cipher);
+        // 密文分片恰好只有一个标签长时，明文为空是合法结果；其余情况下
+        // 空返回值意味着 GCM 认证失败（缓存损坏或密钥不符）
+        if (chunk.isEmpty() && want > GcmTagSize) {
+            corrupt = true;
+            break;
+        }
+        plain += chunk;
+        offset += want;
+        ++index;
+    }
+    file.close();
+    SecureMemory::wipe(manifest.key);
+
+    // 长度不符或 GCM 认证失败都归为损坏：宁可返回空让 UI 提示重新下载，
+    // 也不把半截数据当图片解码
+    if (corrupt || plain.size() != manifest.plainSize) {
+        plain.clear();
+    }
+    return plain;
 }
 
 qint64 FileTransferManager::cacheBytes() const
@@ -214,9 +315,15 @@ int FileTransferManager::clearCache()
             root.rmdir(bucket);
         }
     }
-    // 缓存已清空，所有已登记的文件消息回到"缺失"态（可重新下载）
-    for (auto it = m_incoming.constBegin(); it != m_incoming.constEnd(); ++it) {
-        emit downloadStateChanged(it.key(), QLatin1String("missing"));
+    // 缓存已清空，所有已登记的文件消息回到"缺失"态（可重新下载）。
+    // 先加锁拷贝键再在锁外发信号：接收方可能回调本类，持锁发信号会死锁
+    QList<qint64> registered;
+    {
+        QMutexLocker locker(&m_manifestMutex);
+        registered = m_incoming.keys();
+    }
+    for (qint64 messageId : registered) {
+        emit downloadStateChanged(messageId, QLatin1String("missing"));
     }
     emit cacheCleared(removed);
     return removed;
@@ -235,17 +342,25 @@ void FileTransferManager::registerIncomingFile(qint64 messageId, const QString &
         return;
     }
     const bool already = m_incoming.contains(messageId);
-    m_incoming.insert(messageId, manifest);
+    Q_UNUSED(already);
+    {
+        QMutexLocker locker(&m_manifestMutex);
+        m_incoming.insert(messageId, manifest);
+    }
+    // 发信号在锁外（接收方可能回调本类）
     emit downloadStateChanged(messageId,
                               isCached(manifest.sha256Hex, manifest.cipherSize)
                                   ? QLatin1String("available")
                                   : QLatin1String("missing"));
-    Q_UNUSED(already);
 }
 
-QString FileTransferManager::uploadAndSend(const QString &localPath, qint64 conversationId,
-                                           qint64 peerUserId)
+QString FileTransferManager::uploadAndSend(const QVariant &localPathOrUrl,
+                                           qint64 conversationId, qint64 peerUserId)
 {
+    // QML 的 FileDialog 给的是 file URL，而引擎需要本地路径：统一在此转换，
+    // 不把转换责任下放给 QML（QML 侧无可靠的 url → 本地路径手段）
+    const QString localPath = toLocalPath(localPathOrUrl);
+
     Task task;
     task.token = makeToken();
     task.isUpload = true;
@@ -259,6 +374,10 @@ QString FileTransferManager::uploadAndSend(const QString &localPath, qint64 conv
 
     if (!isEnabled()) {
         failTask(token, QLatin1String("File transfer is not available on this server"));
+        return token;
+    }
+    if (localPath.isEmpty()) {
+        failTask(token, QLatin1String("Not a local file path"));
         return token;
     }
     const QFileInfo info(localPath);
@@ -284,12 +403,16 @@ QString FileTransferManager::uploadAndSend(const QString &localPath, qint64 conv
     }
     t.mime = QMimeDatabase().mimeTypeForFile(localPath).name();
     // M8.3: 图片尺寸与内联缩略图（纯 QtGui 同步提取，无平台多媒体后端依赖）。
+    // **先按 MIME 过滤再探测**：对任意二进制文件跑图像格式探测既浪费，也会
+    // 让解码器读到垃圾数据（随机字节可能偶然命中某格式的魔数）。
     // 非图片或提取失败时字段留空，UI 回退到文件图标：元数据缺失绝不阻断发送
-    const ThumbnailMaker::Result media = ThumbnailMaker::make(localPath);
-    if (media.isImage) {
-        t.mediaWidth = media.width;
-        t.mediaHeight = media.height;
-        t.thumbnail = media.thumb;
+    if (t.mime.startsWith(QLatin1String("image/"))) {
+        const ThumbnailMaker::Result media = ThumbnailMaker::make(localPath);
+        if (media.isImage) {
+            t.mediaWidth = media.width;
+            t.mediaHeight = media.height;
+            t.thumbnail = media.thumb;
+        }
     }
     t.phase = QLatin1String("hashing");
 
@@ -684,12 +807,11 @@ QString FileTransferManager::download(qint64 messageId)
         failTask(token, QLatin1String("File transfer is not available on this server"));
         return token;
     }
-    const auto it = m_incoming.constFind(messageId);
-    if (it == m_incoming.constEnd() || !it->isValid()) {
+    FileManifest manifest;
+    if (!manifestFor(messageId, &manifest)) {
         failTask(token, QLatin1String("File metadata is not available for this message"));
         return token;
     }
-    const FileManifest manifest = it.value();
 
     Task &t = m_tasks[token];
     t.sha256Hex = manifest.sha256Hex;
@@ -786,13 +908,13 @@ void FileTransferManager::pumpDownload(Task &task)
     }
     // 清单可能在传输期间被 reset 清掉（登出/断线），此时 fileId 为 0，
     // 不得拼出一个指向 /file/0 的请求
-    const auto manifestIt = m_incoming.constFind(task.messageId);
-    if (manifestIt == m_incoming.constEnd() || manifestIt->fileId <= 0) {
+    FileManifest taskManifest;
+    if (!manifestFor(task.messageId, &taskManifest) || taskManifest.fileId <= 0) {
         emit downloadStateChanged(task.messageId, QLatin1String("missing"));
         failTask(task.token, QLatin1String("File metadata is no longer available"));
         return;
     }
-    const QUrl url(m_baseUrl + QLatin1String("/") + QString::number(manifestIt->fileId));
+    const QUrl url(m_baseUrl + QLatin1String("/") + QString::number(taskManifest.fileId));
     QNetworkRequest request = makeRequest(url);
     request.setRawHeader(TicketHeader, task.downloadTicket.toLatin1());
     request.setRawHeader("Range",
@@ -922,13 +1044,14 @@ bool FileTransferManager::finalizeDownload(Task &task, QString *error)
     return true;
 }
 
-bool FileTransferManager::saveToFile(qint64 messageId, const QString &destPath)
+bool FileTransferManager::saveToFile(qint64 messageId, const QVariant &destPathOrUrl)
 {
-    const auto it = m_incoming.constFind(messageId);
-    if (it == m_incoming.constEnd() || !it->isValid()) {
+    // 同 uploadAndSend：保存对话框给的也是 file URL
+    const QString destPath = toLocalPath(destPathOrUrl);
+    FileManifest manifest;
+    if (!manifestFor(messageId, &manifest)) {
         return false;
     }
-    const FileManifest manifest = it.value();
     const QString cachePath = cachePathFor(manifest.sha256Hex);
     if (!isCached(manifest.sha256Hex, manifest.cipherSize)) {
         return false;  // UI 应先触发 download
@@ -1030,10 +1153,13 @@ void FileTransferManager::reset()
     m_tasks.clear();
     m_seqToToken.clear();
     // 已登记清单同样含密钥，不得跨会话驻留
-    for (auto it = m_incoming.begin(); it != m_incoming.end(); ++it) {
-        SecureMemory::wipe(it->key);
+    {
+        QMutexLocker locker(&m_manifestMutex);
+        for (auto it = m_incoming.begin(); it != m_incoming.end(); ++it) {
+            SecureMemory::wipe(it->key);
+        }
+        m_incoming.clear();
     }
-    m_incoming.clear();
     m_resetting = false;
     emit tasksChanged();
 }

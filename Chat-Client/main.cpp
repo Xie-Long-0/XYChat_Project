@@ -6,6 +6,8 @@
 #include <QWKQuick/qwkquickglobal.h>
 
 #include "core/NetworkManager.h"
+#include "core/FileImageProvider.h"
+#include "core/FileTransferManager.h"
 #include "core/ThemeSettings.h"
 
 int main(int argc, char *argv[])
@@ -35,6 +37,13 @@ int main(int argc, char *argv[])
     // M8.2: 文件传输引擎（数据面 HTTP + 分片加解密 + 密文缓存）单独暴露，
     // QML 直接连其进度/状态信号并调用上传/下载/保存；文件密钥与清单不经 QML
     engine.rootContext()->setContextProperty("fileTransfer", networkManager.fileTransfer());
+
+    // M8.3: 应用内图片查看器的图像源（image://xyfile/<messageId>）：从密文缓存
+    // 逐片解密后在内存中解码，明文不落盘。provider 的所有权交给引擎
+    engine.addImageProvider(
+        "xyfile",
+        new XYChat::Client::FileImageProvider(
+            static_cast<XYChat::Client::FileTransferManager *>(networkManager.fileTransfer())));
 
     // 注册 QWindowKit QML 类型
     QWK::registerTypes(&engine);

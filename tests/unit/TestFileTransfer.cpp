@@ -54,6 +54,13 @@ private slots:
     // 失败路径会 erase 任务节点，旧实现直接在 QHash 上迭代会使当前
     // 迭代器失效（UB），并因 finishTask/failTask 递归调 pumpNext 而嵌套泵送
     void taskFailingDuringPumpKeepsSchedulerConsistent();
+    // M8.3c: QML 侧无可靠的 url→本地路径手段（全局 Qt 对象并无 urlToLocalFile），
+    // 因此引擎必须自己吃下 file:// URL。这条用例覆盖 QUrl/字符串/UNC/纯本地路径/
+    // 非 file 协议/空值六种输入形态，确保 uploadAndSend 与 saveToFile 拿到正确路径
+    void toLocalPathAcceptsUrlsAndPlainPaths();
+    // M8.3c: 应用内图片查看器的图像源经 decryptedFileBytes 取整份明文（内存解码，
+    // 不落盘）。必须验：登记+缓存命中时逐字节还原、未登记/未下载/超上限时返回空
+    void decryptedFileBytesRestoresPlainForRegisteredMessage();
 
 private:
     // 迷你控制面：与 RequestHandler 的口径一致（创建即签上传票据、完成即
@@ -668,6 +675,105 @@ void TestFileTransfer::taskFailingDuringPumpKeepsSchedulerConsistent()
     QCOMPARE(doneSpy.at(0).at(0).toString().length(), 32);
     QCOMPARE(failSpy.at(0).at(0).toString().length(), 32);
     QCOMPARE(engine.activeTaskCount(), 0);
+}
+
+void TestFileTransfer::toLocalPathAcceptsUrlsAndPlainPaths()
+{
+    FileTransferManager engine;
+    // 未设基地址不影响纯函数行为（toLocalPath 不走网络）
+
+    // ① QML 的 FileDialog.selectedFile 以 QUrl 形态传入（signal 参数用 var
+    // 保留）：QVariant 内部 typeId 为 QMetaType::QUrl，引擎直接取 toLocalFile
+    const QUrl fileUrl = QUrl::fromLocalFile(m_sourcePath);
+    QCOMPARE(engine.toLocalPath(fileUrl), m_sourcePath);
+
+    // ② 以字符串形态传入的 file:// URL：走 QUrl(text).toLocalFile() 分支
+    QCOMPARE(engine.toLocalPath(fileUrl.toString()), m_sourcePath);
+
+    // ③ UNC 路径：正则剔前缀对 file://server/share/x 会错，
+    // QUrl::toLocalFile 会正确还原为 \\server\share\x（Windows 上）
+    const QUrl uncUrl("file://server/share/doc.txt");
+    const QString unc = engine.toLocalPath(uncUrl);
+    QVERIFY(!unc.isEmpty());
+    QVERIFY(unc.contains("server"));
+    QVERIFY(unc.contains("share"));
+    QVERIFY(unc.contains("doc.txt"));
+
+    // ④ 已是本地路径（QML 也可能直接传字符串）：原样返回
+    QCOMPARE(engine.toLocalPath(m_sourcePath), m_sourcePath);
+
+    // ⑤ 非 file 协议的 URL：返回空串（不得当成路径拿去打开）
+    QVERIFY(engine.toLocalPath(QUrl("https://example.com/x.png")).isEmpty());
+    QVERIFY(engine.toLocalPath(QString("https://example.com/x.png")).isEmpty());
+
+    // ⑥ 空值与空白：返回空串（避免 QFileInfo("").exists() 之类的无意义查询）
+    QVERIFY(engine.toLocalPath(QVariant()).isEmpty());
+    QVERIFY(engine.toLocalPath(QString("")).isEmpty());
+    QVERIFY(engine.toLocalPath(QString("   ")).isEmpty());
+
+    // ⑦ Windows 盘符路径（C:/... 与 C:\...）：冒号前只有一个字母时是盘符
+    // 而不是 URL scheme，必须原样返回（否则在 Windows 上会把所有绝对路径都误判为 URL）
+    QCOMPARE(engine.toLocalPath(QString("C:/Users/test/photo.png")),
+             QString("C:/Users/test/photo.png"));
+    QCOMPARE(engine.toLocalPath(QString("C:\\Users\\test\\photo.png")),
+             QString("C:\\Users\\test\\photo.png"));
+}
+
+void TestFileTransfer::decryptedFileBytesRestoresPlainForRegisteredMessage()
+{
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(engine);
+
+    // 未登记清单：不得凭空返回字节（否则会绕过下载流程与 GCM 校验）
+    QVERIFY(engine.decryptedFileBytes(1234567).isEmpty());
+
+    // 登记一份未下载的清单（用随机摘要，确保缓存中不存在）：
+    // 即使登记了也不得返回字节，否则大图预览会读到旧文件或垃圾数据
+    const auto key = FileCrypto::generateFileKey();
+    Protocol::FileManifest missing;
+    missing.fileId = 1;
+    missing.name = "never-downloaded.bin";
+    missing.mime = "application/octet-stream";
+    missing.plainSize = 4096;
+    missing.cipherSize = 4112;
+    missing.chunkSize = Protocol::MinChunkSize;
+    missing.sha256Hex = FileCrypto::sha256Hex("never-downloaded-bytes");
+    missing.key = key.key;
+    missing.iv = key.iv;
+    const QString missingJson = Protocol::encodeFileManifest(missing);
+    QVERIFY(!missingJson.isEmpty());
+    engine.registerIncomingFile(31337, missingJson);
+    QVERIFY(!engine.isMessageFileAvailable(31337));
+    QVERIFY(engine.decryptedFileBytes(31337).isEmpty());
+
+    // 走完整上传→登记→下载链路，再断言 decryptedFileBytes 逐字节还原
+    QSignalSpy sendSpy(&engine, &FileTransferManager::sendMessageRequested);
+    const QString uploadToken = engine.uploadAndSend(m_sourcePath, 0, 42);
+    QVERIFY2(waitForTask(engine, uploadToken), "upload did not finish");
+    QCOMPARE(sendSpy.count(), 1);
+    const qint64 messageId = 424242;
+    engine.registerIncomingFile(messageId, sendSpy.at(0).at(2).toString());
+    const QString downloadToken = engine.download(messageId);
+    QVERIFY2(waitForTask(engine, downloadToken), "download did not finish");
+    QVERIFY(engine.isMessageFileAvailable(messageId));
+
+    const QByteArray plain = engine.decryptedFileBytes(messageId);
+    const QByteArray original = readFile(m_sourcePath);
+    QCOMPARE(plain.size(), original.size());
+    QCOMPARE(plain, original);
+
+    // 超过内存解码上限的清单（伪造 plainSize > MaxInMemoryDecodeBytes）：
+    // 引擎必须直接返回空，而不是把整份明文读进内存把进程打爆
+    Protocol::FileManifest huge = missing;
+    huge.plainSize = FileTransferManager::MaxInMemoryDecodeBytes + 1;
+    huge.cipherSize = huge.plainSize + 16;
+    huge.sha256Hex = FileCrypto::sha256Hex("huge-manifest");
+    const QString hugeJson = Protocol::encodeFileManifest(huge);
+    QVERIFY(!hugeJson.isEmpty());
+    engine.registerIncomingFile(999999, hugeJson);
+    QVERIFY(engine.decryptedFileBytes(999999).isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TestFileTransfer)

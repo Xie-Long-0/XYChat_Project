@@ -26,8 +26,11 @@ Rectangle {
     // M8.2: 文件消息的下载/另存请求（由 MainPage 接到传输引擎）
     signal fileDownloadRequested(int messageId)
     signal fileSaveRequested(int messageId)
-    // M8.2: 附件选择上转（由 MainPage 按会话类型分流到群聊/私聊，与 sendMessage 一致）
-    signal attachmentSelected(string filePath)
+    // M8.3: 图片消息的应用内大图预览（由 MainPage 打开预览对话框）
+    signal filePreviewRequested(int messageId)
+    // M8.2: 附件选择上转（由 MainPage 按会话类型分流到群聊/私聊，与 sendMessage 一致）。
+    // 用 var 保留 QUrl，避免转字符串引入编解码歧义
+    signal attachmentSelected(var fileUrl)
 
     // 顶部标题栏
     Rectangle {
@@ -277,6 +280,7 @@ Rectangle {
                 // M8.2: 文件消息的脱敏展示与下载/保存交互
                 isFileMessage: model.isFileMessage === true
                 fileName: model.fileName || ""
+                fileMime: model.fileMime || ""
                 fileSizeBytes: model.fileSizeBytes || 0
                 fileState: model.fileState || "missing"
                 fileProgress: model.fileProgress || 0
@@ -285,6 +289,7 @@ Rectangle {
                 fileThumb: model.fileThumb || ""
                 onDownloadRequested: chatView.fileDownloadRequested(model.messageId)
                 onSaveRequested: chatView.fileSaveRequested(model.messageId)
+                onPreviewRequested: chatView.filePreviewRequested(model.messageId)
                 onEditRequested: chatView.editRequested(model.messageId, model.content)
                 onDeleteRequested: chatView.deleteRequested(model.messageId)
             }
@@ -344,8 +349,8 @@ Rectangle {
             chatView.sendMessage(text)
         }
         // M8.2: 选定附件后上转，上传进度横幅由 MainPage 统一展示
-        onAttachmentSelected: function(filePath) {
-            chatView.attachmentSelected(filePath)
+        onAttachmentSelected: function(fileUrl) {
+            chatView.attachmentSelected(fileUrl)
         }
     }
 
@@ -458,7 +463,7 @@ Rectangle {
                 // M8.2: ListModel 要求各条目角色一致，分隔线也带上文件字段
                 isFileMessage: false, fileName: "", fileSizeBytes: 0,
                 fileSha256: "", fileState: "missing", fileProgress: 0,
-                fileWidth: 0, fileHeight: 0, fileThumb: ""
+                fileWidth: 0, fileHeight: 0, fileThumb: "", fileMime: ""
             })
         }
     }
@@ -487,6 +492,7 @@ Rectangle {
             // fileState 由本地缓存情况初始化，下载进度由引擎信号推进
             isFileMessage: msg.isFileMessage === true,
             fileName: msg.fileName || "",
+            fileMime: msg.fileMime || "",
             fileSizeBytes: msg.fileSizeBytes || 0,
             fileSha256: msg.fileSha256 || "",
             fileState: msg.isFileMessage === true
@@ -525,6 +531,18 @@ Rectangle {
                 return
             }
         }
+    }
+
+    // M8.3c: 按 messageId 取一条消息的完整字段（供图预览对话框拼标题/尺寸/
+    // 另存为）。未命中返回 null，调用方需自行容错
+    function getMessageById(messageId) {
+        for (var i = 0; i < msgModel.count; i++) {
+            var item = msgModel.get(i)
+            if (item.messageId === messageId) {
+                return item
+            }
+        }
+        return null
     }
 
     // ── 公共方法 ──

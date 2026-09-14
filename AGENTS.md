@@ -50,7 +50,7 @@ ctest --test-dir out/build/debug --output-on-failure
 - 把引用传给会销毁容器的函数时先取副本：`erase` 之后再 `emit` 一个指向已销毁节点的 `QString&` 是 use-after-free。同理，遍历容器时若循环体可能删除元素，必须先取键快照；会递归推进自己的调度器必须有重入护栏。
 - 重试预算不得被“恢复动作的成功”清零：否则当数据面持续故障而控制面正常时（每次查询都成功）会形成活锁；恢复轮次需单独封顶。
 - 异步回调里不得捕获容器元素的引用（用键重新查表）；`abort()` 会同步触发 `finished`，清理在途请求前先断开回调并立护栏，否则会在登出/重置途中发新请求。
-- QML 里把文件 URL 转本地路径用 `Qt.urlToLocalFile()`，不要用正则剔 `file://` 前缀（UNC 与含 `%`/`#`/`?` 的路径会错，保存时会静默写到乱码文件名）；引用 context property 前用 `typeof x !== "undefined"` 防御。
+- QML 的全局 `Qt` 对象**没有** `urlToLocalFile`（那是 C++ `QUrl` 的方法），运行时调用会抛 `TypeError: Property 'urlToLocalFile' of object Qt(...) is not a function`。把 `file://` URL 转本地路径只有两条可靠出路：① 直接把 `QUrl`（signal 参数用 `var`）传给 C++，由 C++ 侧 `QUrl::toLocalFile()` 转换（本仓统一走 `fileTransfer.toLocalPath(urlOrPath)`）；② 在 C++ 侧完成整段路径处理，QML 不参与。**禁止**在 QML 里用正则剔 `file://` 前缀——对 UNC（`file://server/share/x`）与含 `%`/`#`/`?` 的路径会给出错误结果，保存时甚至会静默写到带 percent 转义的乱码文件名里。引用 context property 前用 `typeof x !== "undefined"` 防御。
 - 元数据提取（缩略图/尺寸/时长）失败一律留空字段，**绝不阻断主流程**（文件仍应能正常上传与发送）；内联到消息正文的元数据受正文长度上限硬约束，压不进上限就不内联，绝不放宽上限。
 
 ## 里程碑完成定义（§9）

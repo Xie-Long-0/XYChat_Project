@@ -24,6 +24,7 @@ Item {
     // 不包含文件密钥与 nonce；正文 content 对文件消息已被置空）
     property bool isFileMessage: false
     property string fileName: ""
+    property string fileMime: ""
     property real fileSizeBytes: 0
     // available=本地已就绪、downloading=下载中、missing=需下载
     property string fileState: "missing"
@@ -36,6 +37,11 @@ Item {
 
     signal downloadRequested()
     signal saveRequested()
+    // M8.3: 点击缩略图/图标请求应用内大图预览（仅当本地已就绪时有意义）
+    signal previewRequested()
+
+    // 是否图片类型：只有图片能在应用内解码预览（清单里的 MIME 经 E2EE 到达）
+    readonly property bool isImageFile: fileMime.indexOf("image/") === 0
 
     // M9 特性栈：右键菜单操作（由 ChatView 转发到 MainPage）
     signal editRequested()
@@ -120,6 +126,16 @@ Item {
                         asynchronous: true
                         smooth: true
                         cache: true
+
+                        // M8.3: 点击看大图。图像源 image://xyfile/<messageId> 由 C++
+                        // 从密文缓存逐片解密并在内存中解码（明文不落盘），
+                        // 因此仅在本地已就绪时可点，否则先走下载
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: isImageFile && fileState === "available"
+                            onClicked: messageBubble.previewRequested()
+                        }
                     }
 
                     // M8.3: 图片像素尺寸（仅在清单带了尺寸时展示）
@@ -142,6 +158,15 @@ Item {
                                 text: "📎"
                                 color: Theme.textOnPrimary
                                 font.pixelSize: Theme.fontSizeMedium
+                            }
+                            // M8.3: 无内联缩略图的图片（压不进上限或历史消息）
+                            // 也可从图标处点开大图预览
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                enabled: isImageFile && fileState === "available"
+                                         && thumbImage.status !== Image.Ready
+                                onClicked: messageBubble.previewRequested()
                             }
                         }
 

@@ -3,11 +3,14 @@
 #include <QByteArray>
 #include <QFile>
 #include <QHash>
+#include <QMutex>
 #include <QNetworkRequest>
 #include <QObject>
 #include <QSet>
 #include <QSslConfiguration>
 #include <QString>
+#include <QUrl>
+#include <QVariant>
 
 #include "FileProtocol.h"
 
@@ -71,16 +74,32 @@ public:
     // 已登记清单的消息是否已就绪（缓存命中或下载完成）
     Q_INVOKABLE bool isMessageFileAvailable(qint64 messageId) const;
 
+    // 把 QML 传来的 file URL（或已是本地路径的字符串）转为本地路径。
+    // QML 的全局 Qt 对象**没有** urlToLocalFile（那是 QUrl 的 C++ API），而用
+    // 正则剔 file:// 前缀对 UNC（file://server/share/x）与含 %/#/? 的路径会给出
+    // 错误结果，保存时甚至会静默写到带 percent 转义的乱码文件名里。
+    // 无法转为本地路径（空值、非 file 协议）时返回空串
+    Q_INVOKABLE QString toLocalPath(const QVariant &urlOrPath) const;
+
+    // 供**渲染线程**调用（`QQuickImageProvider::requestImage` 不在 GUI 线程执行）：
+    // 返回解密后的完整明文字节，仅用于应用内图片查看。明文只存在于返回值与
+    // QImage 里，不落盘。超过 MaxInMemoryDecodeBytes 直接返回空：把整个明文
+    // 读进内存只对小文件可行，大文件应走 saveToFile（流式解密写盘）
+    QByteArray decryptedFileBytes(qint64 messageId) const;
+    static constexpr qint64 MaxInMemoryDecodeBytes = 64 * 1024 * 1024;
+
 public slots:
     // 上传本地文件并在完成后请求发送。返回任务 token（参数非法也返回 token，
-    // 便于 UI 统一挂进度并收到 taskFailed）
-    QString uploadAndSend(const QString &localPath, qint64 conversationId, qint64 peerUserId);
+    // 便于 UI 统一挂进度并收到 taskFailed）。路径参数接受 QML 的 url 或本地
+    // 路径字符串，内部经 toLocalPath 统一转换
+    QString uploadAndSend(const QVariant &localPathOrUrl, qint64 conversationId,
+                          qint64 peerUserId);
     // 取消任务：上传中会一并请求控制面取消（回收服务端已收分片）
     void cancelTask(const QString &token);
     // 下载收到的文件消息（清单须已由 registerIncomingFile 登记）
     QString download(qint64 messageId);
     // 把已缓存的文件解密保存到用户指定路径（明文只在此处落盘）
-    bool saveToFile(qint64 messageId, const QString &destPath);
+    bool saveToFile(qint64 messageId, const QVariant &destPathOrUrl);
     // 清理全部缓存，返回删除条数（缓存只是副本，清理后可重新下载）
     int clearCache();
     // 登出/断线时重置会话态：中止在途任务并清零已登记的清单密钥。
@@ -199,6 +218,10 @@ private:
 
     QString cachePathFor(const QString &sha256Hex) const;
     bool ensureCacheRoot();
+    // 清单表的线程安全读取：渲染线程会经 decryptedFileBytes 访问，因此所有
+    // 读取都走这里（加锁拷贝后立即解锁，文件 IO 与解密均在锁外做）。
+    // 发信号也必须在锁外：接收方可能回调本类，否则会死锁
+    bool manifestFor(qint64 messageId, XYChat::Protocol::FileManifest *out) const;
     void finishTask(const QString &token);
     void failTask(const QString &token, const QString &error);
     Task *taskBySeq(qint64 seq);
@@ -217,6 +240,8 @@ private:
     QHash<QString, Task> m_tasks;
     QHash<qint64, QString> m_seqToToken;
     QHash<qint64, XYChat::Protocol::FileManifest> m_incoming;  // messageId -> 清单
+    // 保护 m_incoming：主线程写入（登记/reset），渲染线程读取（图片解码）
+    mutable QMutex m_manifestMutex;
     qint64 m_nextSeqValue = 1;
 
     QString m_baseUrl;

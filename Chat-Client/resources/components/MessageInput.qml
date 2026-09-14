@@ -11,9 +11,10 @@ Rectangle {
     color: Theme.inputBackground
 
     signal messageSent(string text)
-    // M8.2: 用户选定附件后上报本地路径（上传与清单封装全在 C++ 侧完成，
-    // 文件密钥不经 QML）
-    signal attachmentSelected(string filePath)
+    // M8.2: 用户选定附件后上报 file URL（上传与清单封装全在 C++ 侧完成，
+    // 文件密钥不经 QML）。类型用 var 以保留 QUrl：转成字符串会引入
+    // percent-encoding 的二次编解码歧义
+    signal attachmentSelected(var fileUrl)
 
     // M8.2: 附件选择器。fileMode 为 OpenFile（单选），路径以本地文件形式传给引擎
     FileDialog {
@@ -22,9 +23,9 @@ Rectangle {
         fileMode: FileDialog.OpenFile
         onAccepted: {
             if (selectedFile.toString().length > 0) {
-                // 用 Qt.urlToLocalFile 而不是正则剔 file:// 前缀：后者对 UNC
-                // 路径与含 %/#/? 的文件名会给出错误结果，上传时表现为"文件不存在"
-                attachmentSelected(Qt.urlToLocalFile(selectedFile))
+                // 直接把 file URL 交给 C++：QML 侧没有可靠的 url → 本地路径手段
+                //（全局 Qt 对象并无 urlToLocalFile，正则剔前缀对 UNC 与含 % 的路径会错）
+                attachmentSelected(selectedFile)
             }
         }
     }
