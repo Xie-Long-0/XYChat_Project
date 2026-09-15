@@ -33,6 +33,7 @@ ctest --test-dir out/build/debug --output-on-failure
   - 设置 `$env:QT_FORCE_STDERR_LOGGING = "1"`（QTest/qDebug 转 stderr，不被丢弃）。
   - 直接运行用例可执行文件并重定向落盘：`TestXxx.exe -o result.txt,txt`。
 - 曾因此把 `latestSenderKeyId` 的同秒 tie-break（约 50% 概率失败）误归因为"沙箱 DPAPI 偶发"。审查类任务应实跑测试并落盘输出，而非止步静态阅读。
+- QML 错误只在运行时暴露，改完 QML 应按「静态 → 无头 → 起进程」三步验证：① 静态扫描 `qmllint.exe -I D:/Qt/6.8.3/msvc2022_64/qml <全部 .qml>`（能报 `Label is not a type`、`Cannot assign to non-existent property` 这类硬错误；`QWindowKit` 模块解析失败属正常误报——该模块由 CMake target 注册、无 qmldir）；② 无头加载验证用 `QT_QPA_PLATFORM=offscreen qml.exe <probe.qml>`，probe 需放在 `Chat-Client/resources/` 下才能解析相对 `import`，**不要**写进 `resources.qrc`，验完即删；③ 最终以 `QT_QPA_PLATFORM=offscreen timeout 12 ./Chat-Client.exe` 输出中不出现任何 `.qml` 行与 `TypeError`/`ReferenceError` 为准（该 exe 为 console 子系统，stderr 可直接落盘）。
 - 单测均纳入 CTest（当前 12 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`/`TestThumbnailMaker`。`TestFileHttpService` 与 `TestFileTransfer` 为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）；`TestFileTransfer` 另含 M8.3b/c 的 `DecryptingIODevice`（播放器解密设备：顺序读取/seek 跨分片/未下载 open 失败）与 `toLocalPath`/`decryptedFileBytes` 用例；`TestThumbnailMaker` 只依赖 QtGui 图像编解码，无需平台多媒体后端（JPEG 编码器缺失时相关断言会 QSKIP）。Chat-Client 自 M8.3b 起链接 `Qt6::Multimedia`（音视频元数据提取与播放依赖平台解码后端，CI/无头环境提取失败留空、播放报错，均不崩溃）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
 
 ## 代码风格约定
@@ -51,6 +52,7 @@ ctest --test-dir out/build/debug --output-on-failure
 - 重试预算不得被“恢复动作的成功”清零：否则当数据面持续故障而控制面正常时（每次查询都成功）会形成活锁；恢复轮次需单独封顶。
 - 异步回调里不得捕获容器元素的引用（用键重新查表）；`abort()` 会同步触发 `finished`，清理在途请求前先断开回调并立护栏，否则会在登出/重置途中发新请求。
 - QML 的全局 `Qt` 对象**没有** `urlToLocalFile`（那是 C++ `QUrl` 的方法），运行时调用会抛 `TypeError: Property 'urlToLocalFile' of object Qt(...) is not a function`。把 `file://` URL 转本地路径只有两条可靠出路：① 直接把 `QUrl`（signal 参数用 `var`）传给 C++，由 C++ 侧 `QUrl::toLocalFile()` 转换（本仓统一走 `fileTransfer.toLocalPath(urlOrPath)`）；② 在 C++ 侧完成整段路径处理，QML 不参与。**禁止**在 QML 里用正则剔 `file://` 前缀——对 UNC（`file://server/share/x`）与含 `%`/`#`/`?` 的路径会给出错误结果，保存时甚至会静默写到带 percent 转义的乱码文件名里。引用 context property 前用 `typeof x !== "undefined"` 防御。
+- Qt 6 QML 必须用 Qt 6 的 API，写成 Qt 5 的写法会在运行时以“编译期”错误暴露：① 控件（`Label`/`Button`/`Dialog`/`TextField` 等）来自 `QtQuick.Controls`，只 `import QtQuick` 会报 `Label is not a type`；② 图标着色用 `QtQuick.Effects` 的 `MultiEffect`（`colorizationColor: <颜色>` + `colorization: 1.0`），Qt 5 的 `ColorOverlay.colorizationStrength` 在 Qt 6 不存在，且 `colorization` 是 0~1 的 real 而**不是**颜色；③ 内边距命名为 `padding`/`topPadding`/`bottomPadding`/`leftPadding`/`rightPadding`，**没有** `paddingBottom`。
 - 元数据提取（缩略图/尺寸/时长）失败一律留空字段，**绝不阻断主流程**（文件仍应能正常上传与发送）；内联到消息正文的元数据受正文长度上限硬约束，压不进上限就不内联，绝不放宽上限。
 
 ## 里程碑完成定义（§9）

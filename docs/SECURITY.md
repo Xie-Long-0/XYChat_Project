@@ -1,6 +1,6 @@
 # XYChat 安全文档
 
-## 当前安全状态（M8.2 完成后，2026-09-11 对齐）
+## 当前安全状态（M10 完成后，2026-09-14 对齐）
 
 ### 端到端加密（M6）
 
@@ -52,6 +52,23 @@
 - **解密缓存一致性（客户端）**：编辑/删除事件与响应处理时，先失效该 messageId 的旧解密缓存（内存 `m_decryptCache` + LocalStore `clearDecryptedContent`）再解密新密文或标记删除，避免编辑后仍显示编辑前明文；本端编辑以乐观明文落库并覆盖解密缓存。
 - **多端与离线一致性**：`conversation_prefs`/`message_edited`/`message_deleted` 事件经 `sync_events` 与实时推送双通道投递，离线设备上线经 `ingestSyncEvents` 补偿；编辑正文仍为密文传输，服务端不接触明文。**推送覆盖操作者本人（2026-09-09）**：旧实现在服务端按 `memberId != 操作者` 排除整个用户，使操作者名下其他设备得不到实时推送（仅能等下次增量同步），与已读游标/会话偏好的推送策略不一致；现改为推送给全体成员，由客户端按 `originDeviceId` 去重（实时推送与 `sync_events` 补偿两路径均去重），既保障多端实时一致又避免发起设备回显自身操作（群聊下回显会用已推进的 ratchet 状态重试解密并误清正文）。
 - **并发响应匹配完整性（M9 欠账修复，2026-09-10）**：旧客户端实现用单发槽位 `m_pendingEditMessageRequestId`/`m_pendingDeleteMessageRequestId` 只保存最后一个 requestId，连续编辑/删除时前一条响应因 `requestId != pending` 被静默丢弃（无失败信号/重试/outbox 兜底 → 本地与服务端分歧直到下次全量同步）；私聊编辑走 `fetch_keys` 异步回调，等待期间再次编辑会覆盖在途上下文（可能用错 messageId 或丢失前一次编辑）。现改为多槽 `m_pendingEdits`（requestId→上下文，镜像已验证的 `m_pendingSendByRequestId`）+ `m_pendingDeleteRequestIds` 集合，私聊编辑经 `m_privateEditQueue` 队列串行消费 `fetch_keys` 传输槽（`m_editFetchInFlight` 占位，与 healing 队列同范式），异步回调按 requestId 取对应上下文不再互相覆盖；登出经 `resetAuthState`、断线经 `onDisconnected` 两路径均清空这些容器并复位 `m_editFetchInFlight`（自动重连不经过 `resetAuthState`，故断线路径必须单独清理，否则在途标记恒真会永久堵死编辑泵），并对已入队/已发出但未收到响应的编辑/删除上报失败以便 UI 回退乐观态。同时新增专用推送类型 `MessageEditedNotification (88)`/`MessageDeletedNotification (89)`，响应与推送彻底分离，消除靠 `requestId==0` 区分带来的误处理风险。
+
+### 会话整表删除安全（M10，2026-09-14）
+
+- **权限收紧（群聊仅群主）**：删除会话是**不可逆的破坏性操作**，仅会话成员可发起；**群聊额外要求发起者为群主**（`groupRole == owner`），普通成员整表删除全群会销毁其他成员的数据，故拒绝并提示改用“退出群聊”（`PermissionDenied`）；私聊任一方可删除整个会话。越权（非成员）同样回 `PermissionDenied`（成员关系已是前置门，不以枚举防护为首要目标）。
+- **硬删除的原子性与 FK 安全顺序**：`DatabaseManager::deleteConversation` 在单事务内**显式按 FK 安全顺序**删除回执（`message_receipts`）→消息（`messages`）→成员（`conversation_members`）→会话（`conversations`）四步，任一步失败即 `rollback` 返回 false。**刻意不依赖 `PRAGMA foreign_keys` 的 CASCADE**——该 pragma 是连接级设置，若某连接未开启，CASCADE 会静默失效而遗留孤儿行；显式有序删除使正确性不受连接配置影响。
+- **fail-closed 广播**：仅当 `deleteConversation` 返回 true（库内确已删除）才向成员广播删除事件；失败时回 `InternalError`、**不广播**、记 `conversation.delete_failed` 结构化日志（与 M9 `message.delete_failed` 同范式，避免“库内未变却广播删除”的服务端与事件流分歧）。
+- **通知全体前成员避免幽灵会话**：删除前先取全体成员 ID（成员行删除后无法再取），成功后向**全体前成员**（含操作者本人的其他设备）推 `ConversationDeletedNotification` + 各自写 `conversation_deleted` 事件到 `sync_events`（离线补偿）；发起设备按 `originDeviceId` 自行忽略推送（已凭响应本地清理），其余设备经推送或增量同步移除本地会话，避免“服务端已删而某端仍显示”的幽灵会话。
+- **本地缓存清理**：客户端 `LocalStore::deleteConversation` 清除该会话的本地消息/会话缓存行；存储密钥与 E2EE 密钥材料按既有策略保留（会话删除不销毁密钥材料）。
+- **文件对象的兜底回收**：会话删除**不直接触碰对象存储**——消息引用的 `files` 行随 `messages` 删除而失去引用，由 M8 维护任务按“已就绪但无引用”原子迁入终态、下一轮销毁磁盘对象（见“文件与媒体传输安全”节的回收竞态防护）。因此删除会话不会立即抹掉密文字节，但也不产生新引用，回收链路照常收敛。
+- **限流**：与 `edit_message`/`delete_message` 共用 `m_editDeleteWindow`（每连接 60 秒 20 次），先校验入参形态后消费配额；破坏性且触发 O(N) 成员事件写入，必须限流防刷。
+
+### “正在输入”指示安全与隐私（M10，2026-09-14）
+
+- **成员校验**：仅会话成员可发 typing（鉴权 + 限流通过后回查 `isConversationMember`），非成员回 `PermissionDenied`；入参 `conversationId <= 0` 先回 `InvalidRequest`（形态校验先于限流消费，畸形请求不占额度，与 send/edit/prefs 一致）。
+- **限流防刷屏放大**：连接级 `m_typingWindow` 限流 10/10s（`MaxTypingPerWindow=10`/`TypingWindowSeconds=10`）。typing 是高频信号且服务端按会话成员数 fan-out（O(N) 放大），未限流可被用于刷屏/放大攻击；客户端另有 `sendTyping` 每会话 4s 节流（`TypingThrottleMs=4000`）作为第一道闸。
+- **不落库、不写 sync_events**：typing 是纯瞬时状态，服务端**不写数据库、不写 `sync_events`**（无需离线补偿），仅在线直推给会话其他成员；接收端 5s 无新信号自动隐藏。因此 typing 不产生持久化足迹，也不进入增量同步流。
+- **隐私考量（username 与实时行为暴露）**：`TypingNotification` payload 携带发起者 `userId` 与 `username`（`usernameById`），仅推送给**同会话成员**——会话成员本就能看到彼此用户名，故不构成额外泄露；但需注意 typing 会暴露“某成员当前在线且正在输入”这一**实时行为信号**（与主流 IM 一致的产品取舍，本次未提供关闭开关）。
 
 ### 文件与媒体传输安全（M8.1，2026-09-10）
 
@@ -151,8 +168,9 @@
 - **发消息**（M11 前置）：`send_message`（私聊/群聊同一入口）每连接 10 秒内最多 30 条，超限返回 `RateLimited (1003)`；客户端视为瞬时失败保留 outbox 并短退避重刷，不丢消息。抑制刷消息/DoS。
 - **搜索**（M11 前置）：`search_users` 每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`，抑制用户名枚举/刷库。
 - **密钥拉取**：`fetch_keys` 与 `fetch_group_keys` 共享窗口，每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`（原用 `LoginRateLimited`，M11 迁至通用码），防预密钥池耗尽。
-- **消息编辑/删除**（M9 欠账修复）：`edit_message` 与 `delete_message` 共享窗口，每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`。此类操作每次按会话成员数写 `sync_events` + fan-out（O(N) 放大）且事件 30 天才清理，未限流前可被用于刷库/DB 膨胀；编辑仅需重放已捕获的合法 envelope，攻击成本低，故必须限流。
+- **消息编辑/删除**（M9 欠账修复）：`edit_message` 与 `delete_message` 共享窗口，每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`。此类操作每次按会话成员数写 `sync_events` + fan-out（O(N) 放大）且事件 30 天才清理，未限流前可被用于刷库/DB 膨胀；编辑仅需重放已捕获的合法 envelope，攻击成本低，故必须限流。M10 的 `delete_conversation`（破坏性、按成员数写 `conversation_deleted` 事件）也共用此窗口。
 - **会话偏好**（M9 欠账修复）：`set_conversation_prefs` 每连接 60 秒内最多 30 次，超限返回 `RateLimited (1003)`。
+- **“正在输入”**（M10）：`typing` 每连接 10 秒内最多 10 次（`m_typingWindow`），超限返回 `RateLimited (1003)`。typing 高频且服务端按成员数 fan-out（O(N) 放大），需独立紧窗口防刷屏；客户端另有每会话 4s 节流作为第一道闸。
 - **文件上传**（M8.1）：`file_upload_create` 每连接 60 秒内最多 20 次（每次新建都会在 DB 写入元数据行与票据行，并占用并发上传配额），超限返回 `RateLimited (1003)`。
 - **文件操作**（M8.1）：`file_upload_query`/`file_upload_complete`/`file_upload_cancel`/`file_download_ticket` 共用一个窗口，每连接 60 秒内最多 60 次，超限返回 `RateLimited (1003)`。`complete` 会触发服务端流式读盘与整体 SHA-256 计算（IO 密集），`download_ticket` 会写票据行，两者均需限流。入参形态校验先于限流消费，畸形请求不占额度。
 - **并发上传配额**（M8.1）：每用户最多 8 个 `uploading` 状态的文件（`MaxConcurrentUploadsPerUser`），超限返回 `FileQuotaExceeded (3021)`；配额与插入在单条 `INSERT...SELECT` 内原子完成，避开“先读计数后插入”的 TOCTOU。
@@ -177,7 +195,7 @@
 
 - 开发环境使用自签证书，生产环境必须替换为正式 CA 证书。
 - Session token 认证已加固（2026-09-02）：逐包携带并校验 token + `validateSession()` 回查 `sessions` 表，过期/终止/续期换代即时失效（此前仅连接级内存态、除续期外不逐包校验、不回查 DB，存量连接在 token 失效后仍可能通过校验——现已闭环，详见“会话与认证加固”节）。会话失效的客户端自动续期与自动重登 UX 已于 2026-09-04 落地（过期前自动续期、失效回登录页提示），无残留。
-- 文件传输只有控制面与存储层（M8.1，2026-09-10）：文件字节的客户端加密、分片 AEAD、清单编解码、服务端元数据/票据/访问控制与回收均已落地并有单测覆盖；**数据面 HTTP(S) 上传下载服务、客户端上传/下载与多媒体元数据生成尚未实施**，因此尚不具备可用的文件消息端到端路径（见“后续要求”）。群聊已经 M7b 实现 Sender-Key E2EE，成员变更的密钥 healing 与失权回收已于 2026-09-02 实施（`member_added/removed/left` 触发轮换+重分发，被移除成员失去后续消息解密能力）；残留：大群单条分发消息可能超 16384 字符上限、轮换“先落盘后分发”的失败窗口（P2）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。群组接口均遵循先授权再操作（仅成员可发言/邀请/查询，踢人带角色层级保护），输入长度与批量大小受限（群名 ≤64、单批邀请 ≤100、群成员 ≤200、群消息 ≤16384 字符）；客户端本地缓存的群消息/群会话与 sender-key 同样经存储密钥加密落库。
+- 文件传输控制面与存储层（M8.1）、数据面 HTTP(S) 上传下载服务与客户端上传/下载引擎（M8.2，2026-09-11）、多媒体元数据与应用内预览（M8.3，2026-09-11）均已落地并有单测覆盖，具备可用的文件消息端到端路径；M10（2026-09-14）进一步把上传 hashing 与“另存为”解密改为单线程时间片增量泵（不再阻塞 GUI 线程、进度可见可取消）。残留：下载票据 TTL（300s）对大文件不足且中途不续期、`QHttpServer` 进 handler 前已缓冲整个请求体（见 ROADMAP §3）。群聊已经 M7b 实现 Sender-Key E2EE，成员变更的密钥 healing 与失权回收已于 2026-09-02 实施（`member_added/removed/left` 触发轮换+重分发，被移除成员失去后续消息解密能力）；残留：大群单条分发消息可能超 16384 字符上限、轮换“先落盘后分发”的失败窗口（P2）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。群组接口均遵循先授权再操作（仅成员可发言/邀请/查询，踢人带角色层级保护），输入长度与批量大小受限（群名 ≤64、单批邀请 ≤100、群成员 ≤200、群消息 ≤16384 字符）；客户端本地缓存的群消息/群会话与 sender-key 同样经存储密钥加密落库。
 - 设备信任为 TOFU，首次通信无法抵抗服务端中间人；需后续引入安全码带外验证。
 - 客户端私钥文件在非 Windows 平台为明文存储（仅 Windows 有 DPAPI 保护）；LocalStore 存储密钥与解密缓存同受此限制。
 - 本地缓存（M6.5）含经存储密钥加密的消息明文，拥有本机用户权限者可经 DPAPI 还原后读取，与主流 IM 本地存储模型一致。
@@ -189,7 +207,7 @@
 - 认证加固：`validateSession()` 回查 `sessions` 表 + 逐包验 token 已于 2026-09-02 实施（撤销/过期即时生效）；客户端自动续期与失效自动重登 UX 已于 2026-09-04 实施（`renewToken()` 定时续期 + `sessionExpired` 回登录页）。后续可选 TLS channel 绑定进一步加固。
 - 设备信任升级：安全码/二维码带外验证；密钥备份与设备间迁移策略。
 - 群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（后向安全闭环）；后续：大群分片分发/提高分发上限、轮换改为 ACK 后启用（消除分发失败窗口）、群路径收紧为拒绝 `text` 明文。
-- 媒体文件客户端加密上传：协议、加密原语、服务端控制面与存储层已于 M8.1（2026-09-10）落地；后续：① 数据面 HTTP(S) 上传下载服务（`QHttpServer`，凭 `fileId` + 票据授权、校验分片长度、支持 `Range`）；② 客户端上传/下载引擎与进度/重试/取消 UI、已下载文件的本地缓存与清理；③ 多媒体元数据（缩略图/尺寸/时长，需 QtMultimedia 与缩略图管线，清单字段已预留）。
+- 媒体文件客户端加密上传：协议、加密原语、服务端控制面与存储层（M8.1）、数据面 HTTP(S) 上传下载服务与客户端上传/下载引擎（M8.2）、多媒体元数据与应用内预览（M8.3）均已落地；M10 补齐上传 hashing 与“另存为”解密的异步化（单线程时间片泵）。后续可选：下载票据大文件续期、数据面请求体大小上限（反向代理）。
 - 后续可考虑将 PBKDF2 升级为 Argon2id。
 - 生产部署时应启用证书自动续期或 ACME 协议。
 - 可考虑增加 HSTS 或证书固定 (Certificate Pinning) 策略。

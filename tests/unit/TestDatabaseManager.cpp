@@ -85,6 +85,8 @@ private slots:
     void prefsBackfillInConversationsList();
     void editMessageUpdatesContentAndTimestamp();
     void deleteMessageSoftDeletesIdempotently();
+    // M10: 会话整表硬删除（回执/消息/成员/会话行全部清除）
+    void deleteConversationRemovesAllRelatedRows();
 
     // M8 文件元数据、票据与访问控制
     void v10TablesAndColumnsExist();
@@ -1307,6 +1309,58 @@ void TestDatabaseManager::deleteMessageSoftDeletesIdempotently()
     auto stillDeleted = m_db->getMessage(msgId);
     QVERIFY(stillDeleted.has_value());
     QVERIFY(stillDeleted->deleted);
+}
+
+// M10: 会话整表硬删除——回执、消息、成员、会话行按 FK 安全顺序全部清除；
+// 非法 ID 返回 false；删除后同一对用户再发消息新建全新会话（旧数据不复现）
+void TestDatabaseManager::deleteConversationRemovesAllRelatedRows()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    QVERIFY(convId > 0);
+    const qint64 m1 = m_db->sendMessage(convId, user1->id, "doomed 1");
+    const qint64 m2 = m_db->sendMessage(convId, user2->id, "doomed 2");
+    QVERIFY(m1 > 0 && m2 > 0);
+    QVERIFY(m_db->recordMessageReceipt(m1, user2->id, "devB", "delivered"));
+
+    // 前置：成员/消息均存在
+    QVERIFY(m_db->isConversationMember(convId, user1->id));
+    QVERIFY(m_db->isConversationMember(convId, user2->id));
+    QVERIFY(m_db->getConversationMemberIds(convId).size() == 2);
+    QVERIFY(m_db->getMessage(m1).has_value());
+
+    QVERIFY(m_db->deleteConversation(convId));
+
+    // 会话行、成员、消息全部消失
+    QVERIFY(!m_db->getConversation(convId).has_value());
+    QVERIFY(!m_db->isConversationMember(convId, user1->id));
+    QVERIFY(!m_db->isConversationMember(convId, user2->id));
+    QVERIFY(m_db->getConversationMemberIds(convId).isEmpty());
+    QVERIFY(!m_db->getMessage(m1).has_value());
+    QVERIFY(!m_db->getMessage(m2).has_value());
+
+    // 回执经显式子查询删除（直接查库确认，不依赖 foreign_keys 级联）
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT COUNT(*) FROM message_receipts WHERE message_id = ?");
+    q.addBindValue(m1);
+    QVERIFY(q.exec() && q.next());
+    QCOMPARE(q.value(0).toInt(), 0);
+
+    // 非法 ID 返回 false；重复删除已删会话仍成功（0 行，事务提交）
+    QVERIFY(!m_db->deleteConversation(0));
+    QVERIFY(!m_db->deleteConversation(-1));
+    QVERIFY(m_db->deleteConversation(convId));
+
+    // 删除后同一对用户再建会话：全新 ID、无历史消息
+    const qint64 freshConvId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    QVERIFY(freshConvId > 0);
+    QVERIFY(freshConvId != convId);
+    QVERIFY(m_db->getMessages(freshConvId).isEmpty());
 }
 
 namespace

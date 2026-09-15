@@ -50,9 +50,12 @@ Item {
     readonly property bool isAudioFile: fileMime.indexOf("audio/") === 0
     readonly property bool isVideoFile: fileMime.indexOf("video/") === 0
 
-    // M9 特性栈：右键菜单操作（由 ChatView 转发到 MainPage）
     signal editRequested()
     signal deleteRequested()
+    signal resendRequested()
+    signal copyRequested()
+
+    property string clientMessageId: ""
 
     // 气泡内容区可用宽度上限
     readonly property int maxContentWidth: Theme.messageMaxWidth - Theme.spacingMedium * 2
@@ -96,19 +99,26 @@ Item {
                 spacing: Theme.spacingXSmall
 
                 // 消息内容：短消息单行自然宽度，长消息在最大宽度内自动换行。
-                // 文件消息不展示正文（正文是清单，已置空），改走下方文件面板
-                Label {
+                // P2.2: 用只读 TextEdit 替代 Label，让正文可鼠标选中并 Ctrl+C
+                // 复制，不显示闪烁光标；文件消息不展示正文（正文是清单，已置空）
+                TextEdit {
                     id: contentLabel
                     visible: !isFileMessage || deleted
                     width: Math.min(implicitWidth, messageBubble.maxContentWidth)
                     text: deleted ? "此消息已删除"
-                                  : (undecryptable ? "⚠ 无法解密此消息" : content)
-                    wrapMode: Text.Wrap
+                                  : (undecryptable ? "无法解密此消息" : content)
+                    wrapMode: TextEdit.Wrap
                     font.pixelSize: Theme.fontSizeMedium
                     font.italic: undecryptable || deleted
                     color: deleted ? Theme.textTertiary
                                    : (undecryptable ? Theme.textTertiary : Theme.textPrimary)
-                    textFormat: Text.PlainText
+                    textFormat: TextEdit.PlainText
+                    readOnly: true
+                    selectByMouse: true
+                    selectionColor: Theme.primaryColor
+                    selectedTextColor: Theme.textOnPrimary
+                    activeFocusOnPress: true
+                    cursorVisible: false
                 }
 
                 // M8.2: 文件消息面板（图标 + 文件名 + 大小 + 下载/保存）
@@ -151,11 +161,11 @@ Item {
                             visible: isVideoFile && fileState === "available"
                             width: 48; height: 48; radius: 24
                             color: "#80000000"
-                            Label {
+                            Icon {
                                 anchors.centerIn: parent
-                                text: "▶"
-                                color: "white"
-                                font.pixelSize: 20
+                                name: "play"
+                                size: 20
+                                iconColor: "white"
                             }
                         }
 
@@ -194,12 +204,11 @@ Item {
                             width: 34; height: 34
                             radius: Theme.radiusSmall
                             color: Theme.primaryColor
-                            Label {
+                            Icon {
                                 anchors.centerIn: parent
-                                // M8.3b: 音视频显示播放图标，其他显示回形针
-                                text: (isAudioFile || isVideoFile) ? "▶" : "📎"
-                                color: Theme.textOnPrimary
-                                font.pixelSize: Theme.fontSizeMedium
+                                name: (isAudioFile || isVideoFile) ? "play" : "attach"
+                                size: 16
+                                iconColor: Theme.textOnPrimary
                             }
                             // M8.3: 无内联缩略图的图片点击预览；M8.3b: 音视频点击播放
                             MouseArea {
@@ -291,32 +300,113 @@ Item {
                         color: Theme.textTertiary
                     }
 
-                    // 消息状态图标（仅自己的消息）
-                    Label {
+                    Icon {
                         visible: isMine && status !== "" && !deleted
-                        text: {
+                        name: {
                             switch (status) {
-                                case "sending": return "⏳"
-                                case "sent": return "✓"
-                                case "delivered": return "✓✓"
-                                case "read": return "✓✓"
-                                case "failed": return "⚠"
+                                case "sending": return "clock"
+                                case "sent": return "check"
+                                case "delivered": return "check-double"
+                                case "read": return "check-double"
+                                case "failed": return "warning"
                                 default: return ""
                             }
                         }
-                        font.pixelSize: Theme.fontSizeSmall - 1
-                        color: status === "read" ? Theme.primaryColor : Theme.textTertiary
+                        size: 12
+                        iconColor: {
+                            if (status === "read") return Theme.primaryColor
+                            if (status === "failed") return Theme.errorColor
+                            return Theme.textTertiary
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: parent.status === "failed" ? Qt.PointingHandCursor : Qt.ArrowCursor
+                            enabled: parent.status === "failed"
+                            onClicked: messageBubble.resendRequested()
+                        }
                     }
                 }
             }
 
-            // M9: 右键菜单（仅自己的、未删除的消息可编辑/删除）
             MouseArea {
+                id: bubbleMouse
                 anchors.fill: parent
-                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                onClicked: function(mouse) {
-                    if (mouse.button === Qt.RightButton && isMine && !deleted) {
-                        contextMenu.popup()
+                hoverEnabled: true
+                acceptedButtons: Qt.RightButton
+                onClicked: {
+                    if (isMine && !deleted) contextMenu.popup()
+                }
+            }
+
+            Row {
+                id: actionButtons
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: Theme.spacingXSmall
+                spacing: 2
+                // P2.2: 悬浮显示。同时监听气泡与各操作按钮的 hover，避免光标
+                // 从气泡移到按钮时因兄弟节点 hover 不传递而闪烁消失
+                visible: !deleted && (bubbleMouse.containsMouse
+                                      || copyMouseArea.containsMouse
+                                      || editMouseArea.containsMouse
+                                      || deleteMouseArea.containsMouse)
+                opacity: visible ? 1 : 0
+                Behavior on opacity { NumberAnimation { duration: Theme.animationFast } }
+
+                Rectangle {
+                    width: 22; height: 22; radius: 11
+                    color: copyMouseArea.containsMouse ? Theme.hoverColor : "transparent"
+                    MouseArea {
+                        id: copyMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: messageBubble.copyRequested()
+                    }
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "copy"
+                        size: 11
+                        iconColor: Theme.textSecondary
+                    }
+                }
+
+                Rectangle {
+                    visible: isMine && !isFileMessage
+                    width: 22; height: 22; radius: 11
+                    color: editMouseArea.containsMouse ? Theme.hoverColor : "transparent"
+                    MouseArea {
+                        id: editMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: messageBubble.editRequested()
+                    }
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "edit"
+                        size: 11
+                        iconColor: Theme.textSecondary
+                    }
+                }
+
+                Rectangle {
+                    visible: isMine
+                    width: 22; height: 22; radius: 11
+                    color: deleteMouseArea.containsMouse ? Theme.hoverColor : "transparent"
+                    MouseArea {
+                        id: deleteMouseArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: messageBubble.deleteRequested()
+                    }
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "delete"
+                        size: 11
+                        iconColor: Theme.textSecondary
                     }
                 }
             }
@@ -324,15 +414,27 @@ Item {
             Menu {
                 id: contextMenu
                 MenuItem {
+                    text: "复制"
+                    icon.source: "qrc:/icons/copy.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.textPrimary
+                    onTriggered: messageBubble.copyRequested()
+                }
+                MenuItem {
                     text: "编辑"
-                    // M8.2: 文件消息不可编辑正文（服务端也会拒）：编辑只能改写
-                    // 正文而 messages.file_id 不变，会使清单里的 fileId/密钥与
-                    // 服务端授权失配。正确做法是删除后重发
+                    icon.source: "qrc:/icons/edit.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.textPrimary
                     enabled: !isFileMessage
                     onTriggered: messageBubble.editRequested()
+                    ToolTip.visible: hovered && !enabled
+                    ToolTip.text: "文件消息不可编辑，请删除后重发"
                 }
                 MenuItem {
                     text: "删除"
+                    icon.source: "qrc:/icons/delete.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.errorColor
                     onTriggered: messageBubble.deleteRequested()
                 }
             }

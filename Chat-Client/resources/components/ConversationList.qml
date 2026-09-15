@@ -11,10 +11,10 @@ Rectangle {
     signal conversationClicked(int index)
     signal searchClicked()
     signal refreshClicked()
-    // M7a: 打开建群对话框
     signal createGroupClicked()
-    // M9 特性栈：右键菜单设置会话偏好（置顶/免打扰）
     signal conversationPrefsRequested(int conversationId, bool pinned, bool muted)
+    signal markReadRequested(int conversationId)
+    signal deleteConversationRequested(int conversationId)
 
     // M4.5: 当前选中会话索引（修复原先错误的判断条件）
     property int selectedIndex: -1
@@ -58,23 +58,11 @@ Rectangle {
                     onClicked: conversationList.searchClicked()
                 }
 
-                // 搜索图标（放大镜）
-                Canvas {
+                Icon {
                     anchors.centerIn: parent
-                    width: 16; height: 16
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-                        ctx.strokeStyle = Theme.textSecondary
-                        ctx.lineWidth = 1.5
-                        ctx.beginPath()
-                        ctx.arc(6, 6, 5, 0, Math.PI * 2)
-                        ctx.stroke()
-                        ctx.beginPath()
-                        ctx.moveTo(10, 10)
-                        ctx.lineTo(15, 15)
-                        ctx.stroke()
-                    }
+                    name: "search"
+                    size: 16
+                    iconColor: Theme.textSecondary
                 }
             }
 
@@ -102,22 +90,11 @@ Rectangle {
                     onClicked: conversationList.createGroupClicked()
                 }
 
-                // 加号图标
-                Canvas {
+                Icon {
                     anchors.centerIn: parent
-                    width: 14; height: 14
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-                        ctx.strokeStyle = Theme.textSecondary
-                        ctx.lineWidth = 1.8
-                        ctx.beginPath()
-                        ctx.moveTo(7, 1)
-                        ctx.lineTo(7, 13)
-                        ctx.moveTo(1, 7)
-                        ctx.lineTo(13, 7)
-                        ctx.stroke()
-                    }
+                    name: "plus"
+                    size: 14
+                    iconColor: Theme.textSecondary
                 }
             }
 
@@ -136,27 +113,11 @@ Rectangle {
                     onClicked: conversationList.refreshClicked()
                 }
 
-                // 刷新图标
-                Canvas {
+                Icon {
                     anchors.centerIn: parent
-                    width: 16; height: 16
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-                        ctx.strokeStyle = Theme.textSecondary
-                        ctx.lineWidth = 1.5
-                        ctx.beginPath()
-                        ctx.arc(8, 8, 6, 0.3, Math.PI * 1.7)
-                        ctx.stroke()
-                        // 箭头
-                        ctx.beginPath()
-                        ctx.moveTo(13, 3)
-                        ctx.lineTo(14, 7)
-                        ctx.lineTo(10, 5)
-                        ctx.closePath()
-                        ctx.fillStyle = Theme.textSecondary
-                        ctx.fill()
-                    }
+                    name: "refresh"
+                    size: 16
+                    iconColor: Theme.textSecondary
                 }
             }
         }
@@ -199,18 +160,38 @@ Rectangle {
                 }
             }
 
-            // M9 特性栈：会话右键菜单（置顶/免打扰）
             Menu {
                 id: convContextMenu
                 MenuItem {
                     text: model.pinned === true ? "取消置顶" : "置顶会话"
+                    icon.source: "qrc:/icons/pin.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.textPrimary
                     onTriggered: conversationList.conversationPrefsRequested(
                         model.conversationId, model.pinned !== true, model.muted === true)
                 }
                 MenuItem {
                     text: model.muted === true ? "取消免打扰" : "开启免打扰"
+                    icon.source: model.muted === true ? "qrc:/icons/bell.svg" : "qrc:/icons/mute.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.textPrimary
                     onTriggered: conversationList.conversationPrefsRequested(
                         model.conversationId, model.pinned === true, model.muted !== true)
+                }
+                MenuItem {
+                    text: "标记为已读"
+                    icon.source: "qrc:/icons/check.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.textPrimary
+                    onTriggered: conversationList.markReadRequested(model.conversationId)
+                }
+                MenuSeparator {}
+                MenuItem {
+                    text: "删除会话"
+                    icon.source: "qrc:/icons/delete.svg"
+                    icon.width: 14; icon.height: 14
+                    icon.color: Theme.errorColor
+                    onTriggered: conversationList.deleteConversationRequested(model.conversationId)
                 }
             }
 
@@ -231,27 +212,12 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Theme.spacingSmall
 
-                // 头像（按用户/会话 ID 取色，同一会话颜色稳定；避免 delegate
-                // 移除时 index 为 undefined 导致 "Unable to assign [undefined] to QColor"）
-                Rectangle {
-                    width: Theme.avatarSize
-                    height: Theme.avatarSize
-                    // M7a: 群会话用圆角方形头像区分
-                    radius: model.type === "group" ? Theme.radiusMedium : Theme.avatarSize / 2
-                    color: {
-                        var colors = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7", "#DDA0DD", "#98D8C8"]
-                        var id = model.type === "group" ? (model.conversationId || 0)
-                                                        : (model.peerUserId || 0)
-                        return colors[id % colors.length]
-                    }
-
-                    Label {
-                        anchors.centerIn: parent
-                        text: model.displayName.length > 0 ? model.displayName[0].toUpperCase() : "?"
-                        font.pixelSize: Theme.fontSizeXLarge
-                        font.weight: Font.Bold
-                        color: Theme.textOnPrimary
-                    }
+                Avatar {
+                    userId: model.type === "group" ? (model.conversationId || 0)
+                                                  : (model.peerUserId || 0)
+                    name: model.displayName
+                    size: Theme.avatarSize
+                    isGroup: model.type === "group"
                 }
 
                 // 信息区域
@@ -285,11 +251,11 @@ Rectangle {
                         }
 
                         // M9 特性栈：免打扰标识
-                        Label {
+                        Icon {
                             visible: model.muted === true
-                            text: "🔕"
-                            font.pixelSize: Theme.fontSizeSmall - 1
-                            color: delegateItem.isSelected
+                            name: "mute"
+                            size: 12
+                            iconColor: delegateItem.isSelected
                                  ? Theme.selectedConversationSecondaryColor
                                  : Theme.textTertiary
                         }
@@ -303,11 +269,11 @@ Rectangle {
                         }
 
                         // M9 特性栈：置顶标识
-                        Label {
+                        Icon {
                             visible: model.pinned === true
-                            text: "📌"
-                            font.pixelSize: Theme.fontSizeSmall - 1
-                            color: delegateItem.isSelected
+                            name: "pin"
+                            size: 12
+                            iconColor: delegateItem.isSelected
                                  ? Theme.selectedConversationSecondaryColor
                                  : Theme.primaryColor
                         }
@@ -349,14 +315,25 @@ Rectangle {
             }
         }
 
-        // 空状态提示
-        Label {
+        // 空状态提示（加载中显示 spinner）
+        Column {
             anchors.centerIn: parent
-            text: "暂无会话\n搜索用户开始聊天"
-            horizontalAlignment: Text.AlignHCenter
-            font.pixelSize: Theme.fontSizeMedium
-            color: Theme.textTertiary
+            spacing: Theme.spacingMedium
             visible: convModel.count === 0
+
+            LoadingIndicator {
+                anchors.horizontalCenter: parent.horizontalCenter
+                size: 24
+                running: visible
+            }
+
+            Label {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "加载中..."
+                horizontalAlignment: Text.AlignHCenter
+                font.pixelSize: Theme.fontSizeMedium
+                color: Theme.textTertiary
+            }
         }
     }
 
@@ -498,6 +475,20 @@ Rectangle {
     function reset() {
         convModel.clear()
         selectedIndex = -1
+    }
+
+    // P3.1: 会话整表删除后从列表移除该项（并修正选中索引）
+    function removeConversation(conversationId) {
+        var idx = findIndexByConversationId(conversationId)
+        if (idx < 0) {
+            return
+        }
+        convModel.remove(idx, 1)
+        if (selectedIndex === idx) {
+            selectedIndex = -1
+        } else if (selectedIndex > idx) {
+            selectedIndex = selectedIndex - 1
+        }
     }
 
     // M9 特性栈：本地应用会话偏好（服务端推送 conversation_prefs 后回填），

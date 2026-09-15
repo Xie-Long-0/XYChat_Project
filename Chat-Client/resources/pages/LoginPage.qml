@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import QtQuick.Effects
 
 import "../theme"
+import "../components"
 
 Item {
     id: loginPage
@@ -213,12 +214,23 @@ Item {
                     Behavior on color { ColorAnimation { duration: Theme.animationFast } }
                 }
 
-                contentItem: Label {
-                    text: mainButton.text
-                    font: mainButton.font
-                    color: Theme.textOnPrimary
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
+                contentItem: Item {
+                    Label {
+                        anchors.centerIn: parent
+                        text: mainButton.text
+                        font: mainButton.font
+                        color: Theme.textOnPrimary
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        visible: !loginPage.isLoading
+                    }
+                    LoadingIndicator {
+                        anchors.centerIn: parent
+                        size: 20
+                        running: loginPage.isLoading
+                        visible: loginPage.isLoading
+                        iconColor: Theme.textOnPrimary
+                    }
                 }
 
                 onClicked: {

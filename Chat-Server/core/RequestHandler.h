@@ -101,6 +101,10 @@ private:
     void processSetConversationPrefsRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
     void processEditMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
     void processDeleteMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    // M10：“正在输入”指示（仅会话成员可发，fan-out 到其他成员，不写 sync_events）
+    void processTypingRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    // M10：会话整表删除（仅成员可删；群聊仅群主；硬删除 + 全体前成员通知）
+    void processDeleteConversationRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
 
     // M8: 媒体、文件与对象存储的控制面处理器（数据面走独立 HTTP(S) 服务，不在此处）。
     // 控制面以会话 token 鉴权 + 上传者归属校验；票据只给无会话的 HTTP 数据面使用
@@ -178,6 +182,8 @@ private:
     // + fan-out，O(N) 放大且事件 30 天才清理，需与 send/search 一致限流防刷库）
     XYChat::Server::RateWindow m_editDeleteWindow;
     XYChat::Server::RateWindow m_prefsWindow;
+    // M10：“正在输入”限流（typing 高频且按成员数 fan-out，需防刷屏放大）
+    XYChat::Server::RateWindow m_typingWindow;
     // M8: 文件控制面限流。新建上传会分配磁盘与 DB 行，配额更紧；
     // 查询/完成/取消/下载票据为廉价读写，共用一个较宽窗口
     XYChat::Server::RateWindow m_fileUploadWindow;
@@ -216,6 +222,10 @@ private:
     // M9 欠账修复：会话偏好设置限流（置顶/免打扰高频切换无意义，放宽上限）
     static constexpr int MaxPrefsPerWindow = 30;      // 窗口内偏好设置上限
     static constexpr int PrefsWindowSeconds = 60;     // 窗口长度（秒）
+    // M10：“正在输入”限流（连接级固定窗口）。客户端已节流 3-5s，
+    // 服务端再限 10/10s 兑底，防恶意刷屏造成 O(N) fan-out 放大
+    static constexpr int MaxTypingPerWindow = 10;     // 窗口内 typing 信号上限
+    static constexpr int TypingWindowSeconds = 10;    // 窗口长度（秒）
 
     // M7a: 群消息明文长度上限（单条 UTF-8 字符数；M7b E2EE / M8 媒体另行调整）
     static constexpr int MaxGroupMessageLength = 16384;

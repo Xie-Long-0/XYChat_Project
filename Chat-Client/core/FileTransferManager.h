@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
 #include <QMutex>
@@ -18,6 +19,7 @@
 
 class QNetworkAccessManager;
 class QNetworkReply;
+class QTimer;
 // 全局命名空间的测试类：friend 声明需先有声明，且必须用 :: 限定，
 // 否则会被当成本命名空间内的同名类而失效
 class TestNetworkManager;
@@ -48,6 +50,10 @@ class FileTransferManager : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(int activeTaskCount READ activeTaskCount NOTIFY tasksChanged)
+    // P4.1: 活动任务快照（token/fileName/phase/isUpload/messageId），供 UI 以
+    // Repeater 渲染多任务传输横幅。相位/进度经 taskProgress 增量更新，本属性
+    // 仅在任务增删（tasksChanged）时刷新条目集合
+    Q_PROPERTY(QVariantList tasks READ tasks NOTIFY tasksChanged)
     Q_PROPERTY(bool enabled READ isEnabled NOTIFY baseUrlChanged)
 
 public:
@@ -69,6 +75,8 @@ public:
     void setSslConfiguration(const QSslConfiguration &config);
 
     int activeTaskCount() const;
+    // P4.1: 活动任务快照（见 tasks 属性）
+    QVariantList tasks() const;
 
     // 缓存查询与清理（QML 设置页与文件气泡可用，故标 Q_INVOKABLE）
     Q_INVOKABLE bool isCached(const QString &sha256Hex, qint64 cipherSize) const;
@@ -114,8 +122,11 @@ public slots:
     void cancelTask(const QString &token);
     // 下载收到的文件消息（清单须已由 registerIncomingFile 登记）
     QString download(qint64 messageId);
-    // 把已缓存的文件解密保存到用户指定路径（明文只在此处落盘）
-    bool saveToFile(qint64 messageId, const QVariant &destPathOrUrl);
+    // P4.3: 把已缓存的文件解密保存到用户指定路径（明文只在此处落盘）。改为异步：
+    // 返回任务 token，解密写盘经时间片增量泵送，进度/结果经 taskProgress/
+    // taskFinished/taskFailed 与 fileSaved 反馈（大文件不再冻结 GUI）。参数非法
+    // 也返回 token 并同步发 taskFailed，便于 UI 统一挂进度与收失败
+    QString saveToFile(qint64 messageId, const QVariant &destPathOrUrl);
     // 清理全部缓存，返回删除条数（缓存只是副本，清理后可重新下载）
     int clearCache();
     // 登出/断线时重置会话态：中止在途任务并清零已登记的清单密钥。
@@ -220,9 +231,19 @@ private:
     qint64 requestSeq(const QString &token);
     QString makeToken();
 
-    // 第一遍：流式加密以计算密文整体摘要（不落临时文件，代价是多一遍 AES 运算，
-    // 换来的是磁盘占用不翻倍、也没有崩溃残留需要清理）
-    bool computeCipherDigest(Task &task, QString *error);
+    // P4.4/P4.3: 本地 CPU/磁盘密集工作（上传前 hashing、另存为解密写盘）的时间片
+    // 增量泵送。全程在 GUI 线程（无工作线程 → 无数据竞争 → 密文逐字节不变），
+    // QTimer(0) 每轮事件循环推进一个受时间预算约束的批次后交还事件循环，从而
+    // 大文件不再冻结界面。串行：一次只推进一个本地任务，其余排队
+    void startLocalPump();
+    void enqueueLocalWork(const QString &token);
+    void advanceLocalWork();
+    void runLocalSlice();
+    void runHashSlice(Task &task);
+    void runSaveSlice(Task &task);
+    // 释放某任务的本地中间态（关闭并删除 HashState/SaveState、抹零保存密钥、
+    // 复位 m_localToken 并推进队列）。cancelTask/finishTask/failTask/reset 均调用
+    void clearLocalStateForToken(const QString &token);
     void pumpUpload(Task &task);
     void pumpDownload(Task &task);
     // 串行调度：一次只跑一个分片（避免带宽争抢、内存峰值与 per-IP 限流），
@@ -289,6 +310,20 @@ private:
     // 全量解密同一份原图（无负缓存会退化为每次滚动/刷新都冻一下）。
     // 仅 GUI 线程访问（attachFileInfo），clearCache/reset 时清空以允许重试
     QSet<QString> m_thumbnailGenFailed;
+
+    // P4.4/P4.3: 本地工作时间片泵（见上方方法注释）。QTimer(0) 惰性创建，
+    // 无本地工作时停泵以免空转
+    QTimer *m_localPump = nullptr;
+    QString m_localToken;                 // 当前正在做本地工作的任务
+    QQueue<QString> m_pendingLocalTokens; // 等待做本地工作的任务
+    QElapsedTimer m_sliceTimer;           // 单个时间片的耗时预算计时
+
+    // hashing/save 的中间态含不可拷贝的 QFile，故堆分配、按 token 索引；
+    // 结构体定义在 .cpp（此处仅前向声明，避免把 FileCrypto 细节带进头文件）
+    struct HashState;
+    struct SaveState;
+    QHash<QString, HashState *> m_hashStates;
+    QHash<QString, SaveState *> m_saveStates;
 };
 
 } // namespace XYChat::Client

@@ -67,6 +67,12 @@ private slots:
     void decryptingIODeviceRestoresPlainBytes();
     void decryptingIODeviceSupportsSeek();
     void decryptingIODeviceFailsWithoutCache();
+    // P4.4: 上传 hashing 异步化——uploadAndSend 返回时 hashing 尚未同步跑完，
+    // 由本地泵在事件循环里增量推进（大文件不再冻结 GUI）
+    void uploadAndSendDefersHashingToEventLoop();
+    // P4.3: saveToFile 异步化——返回 token，解密写盘经本地泵增量推进，
+    // 期间发 saving 相位进度，完成后发 fileSaved，逐字节还原
+    void saveToFileIsAsyncWithProgress();
 
 private:
     // 迷你控制面：与 RequestHandler 的口径一致（创建即签上传票据、完成即
@@ -327,7 +333,10 @@ void TestFileTransfer::uploadThenDownloadRestoresBytesExactly()
     QVERIFY(stateSpy.count() >= 1);
 
     // 保存并逐字节比对：这是整条链路唯一的最终判据
-    QVERIFY(engine.saveToFile(messageId, m_savedPath));
+    // P4.3: 保存改为异步（返回 token，经本地泵解密写盘）——事件循环驱动至完成
+    const QString saveToken = engine.saveToFile(messageId, m_savedPath);
+    QVERIFY(!saveToken.isEmpty());
+    QVERIFY2(waitForTask(engine, saveToken), "save did not finish");
     const QByteArray original = readFile(m_sourcePath);
     const QByteArray saved = readFile(m_savedPath);
     QCOMPARE(saved.size(), original.size());
@@ -472,9 +481,10 @@ void TestFileTransfer::cachedFileSkipsSecondDownload()
     }
     QVERIFY(sawCachedPhase);
 
-    // 命中缓存后仍可正确保存
+    // 命中缓存后仍可正确保存（P4.3: 异步，事件循环驱动至完成）
     const QString second = m_dir->path() + "/saved-from-cache.bin";
-    QVERIFY(engine.saveToFile(messageId, second));
+    const QString secondSaveToken = engine.saveToFile(messageId, second);
+    QVERIFY2(waitForTask(engine, secondSaveToken), "save did not finish");
     QCOMPARE(readFile(second), readFile(m_sourcePath));
 }
 
@@ -537,8 +547,12 @@ void TestFileTransfer::saveRefusesWithoutDownloadOrManifest()
     engine.setCacheRoot(m_cacheRoot);
     engine.setBaseUrl(m_http->baseUrl());
 
-    // 未登记清单的消息：拒绝保存（不得凭空造文件）
-    QVERIFY(!engine.saveToFile(123456, m_dir->path() + "/nope.bin"));
+    // 未登记清单的消息：拒绝保存（不得凭空造文件）。P4.3: saveToFile 现返回 token，
+    // 校验失败经同步 taskFailed 反馈（先连 spy 再调用，避免漏接同步信号）
+    QSignalSpy refuseSpy(&engine, &FileTransferManager::taskFailed);
+    const QString refuseToken = engine.saveToFile(123456, m_dir->path() + "/nope.bin");
+    QVERIFY(!refuseToken.isEmpty());
+    QCOMPARE(refuseSpy.count(), 1);
     // 空目标路径：拒绝
     const qint64 fileId = requireUploadedFile();
     const auto rec = m_db->getFileRecord(fileId);
@@ -560,7 +574,10 @@ void TestFileTransfer::saveRefusesWithoutDownloadOrManifest()
     QVERIFY(!json.isEmpty());
     engine.registerIncomingFile(777, json);
     QVERIFY(!engine.isMessageFileAvailable(777));
-    QVERIFY(!engine.saveToFile(777, m_dir->path() + "/nope2.bin"));
+    // 已登记但未下载：同样同步拒绝（复用 refuseSpy，计数累加到 2）
+    const QString refuse2 = engine.saveToFile(777, m_dir->path() + "/nope2.bin");
+    QVERIFY(!refuse2.isEmpty());
+    QCOMPARE(refuseSpy.count(), 2);
 }
 
 void TestFileTransfer::clearCacheRemovesBytesAndFlipsState()
@@ -582,7 +599,11 @@ void TestFileTransfer::clearCacheRemovesBytesAndFlipsState()
     QCOMPARE(engine.cacheBytes(), qint64(0));
     // 清理后状态回到"缺失"，且保存被拒（缓存只是副本，可重新下载）
     QVERIFY(!engine.isMessageFileAvailable(888));
-    QVERIFY(!engine.saveToFile(888, m_dir->path() + "/after-clear.bin"));
+    // P4.3: 校验失败经同步 taskFailed 反馈（先连 spy 再调用）
+    QSignalSpy saveFailSpy(&engine, &FileTransferManager::taskFailed);
+    const QString afterClearToken = engine.saveToFile(888, m_dir->path() + "/after-clear.bin");
+    QVERIFY(!afterClearToken.isEmpty());
+    QCOMPARE(saveFailSpy.count(), 1);
     bool sawMissing = false;
     for (const auto &args : stateSpy) {
         if (args.at(1).toString() == QLatin1String("missing")) {
@@ -633,12 +654,18 @@ void TestFileTransfer::resetClearsRegisteredManifests()
         QVERIFY2(waitForTask(engine, downloadToken), "download did not finish");
     }
     QVERIFY(engine.isMessageFileAvailable(999));
-    QVERIFY(engine.saveToFile(999, m_dir->path() + "/before-reset.bin"));
+    // P4.3: 保存改为异步（事件循环驱动至完成）
+    const QString beforeReset = engine.saveToFile(999, m_dir->path() + "/before-reset.bin");
+    QVERIFY2(waitForTask(engine, beforeReset), "save did not finish");
 
     // 登出/断线：清单含文件密钥，必须清零且不得跨会话驻留
     engine.reset();
     QVERIFY(!engine.isMessageFileAvailable(999));
-    QVERIFY(!engine.saveToFile(999, m_dir->path() + "/after-reset.bin"));
+    // reset 后清单已清：保存同步拒绝（taskFailed），且不留活动任务
+    QSignalSpy afterResetFail(&engine, &FileTransferManager::taskFailed);
+    const QString afterReset = engine.saveToFile(999, m_dir->path() + "/after-reset.bin");
+    QVERIFY(!afterReset.isEmpty());
+    QCOMPARE(afterResetFail.count(), 1);
     QCOMPARE(engine.activeTaskCount(), 0);
 }
 
@@ -881,6 +908,74 @@ void TestFileTransfer::decryptingIODeviceFailsWithoutCache()
     QVERIFY(!engine.isMessageFileAvailable(31338));
     DecryptingIODevice noCache(31338, &engine);
     QVERIFY(!noCache.open(QIODevice::ReadOnly));
+}
+
+// P4.4: 上传 hashing 异步化。uploadAndSend 返回时 hashing 尚未同步跑完（本地泵
+// 靠 QTimer(0)，未回到事件循环就不会推进），证明大文件不会在调用线程冻屏
+void TestFileTransfer::uploadAndSendDefersHashingToEventLoop()
+{
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(engine);
+
+    QSignalSpy doneSpy(&engine, &FileTransferManager::taskFinished);
+    QSignalSpy progressSpy(&engine, &FileTransferManager::taskProgress);
+    const QString token = engine.uploadAndSend(m_sourcePath, 0, 91);
+    QVERIFY(!token.isEmpty());
+    // 返回时任务仍在表里、尚未完成（hashing 未同步跑完）
+    QCOMPARE(doneSpy.count(), 0);
+    QCOMPARE(engine.activeTaskCount(), 1);
+    // 事件循环驱动 hashing → creating → 上传 → 完成
+    QVERIFY2(waitForTask(engine, token), "upload did not finish");
+    QCOMPARE(engine.activeTaskCount(), 0);
+    // 期间确实发过 hashing 相位进度
+    bool sawHashing = false;
+    for (const auto &args : progressSpy) {
+        if (args.at(1).toString() == QLatin1String("hashing")) {
+            sawHashing = true;
+        }
+    }
+    QVERIFY(sawHashing);
+}
+
+// P4.3: saveToFile 异步化。返回 token 时尚未完成，经本地泵在事件循环里
+// 增量解密写盘，发 saving 进度，完成后发 fileSaved 且逐字节还原
+void TestFileTransfer::saveToFileIsAsyncWithProgress()
+{
+    QVERIFY(!m_firstManifestJson.isEmpty());
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(engine);
+    const qint64 messageId = 4243;
+    engine.registerIncomingFile(messageId, m_firstManifestJson);
+    // 缓存是否命中取决于前序用例（clearCache 可能已清空），缺失则先下载一次
+    if (!engine.isMessageFileAvailable(messageId)) {
+        const QString dl = engine.download(messageId);
+        QVERIFY2(waitForTask(engine, dl), "download did not finish");
+    }
+    QVERIFY(engine.isMessageFileAvailable(messageId));
+
+    const QString dest = m_dir->path() + "/async-saved.bin";
+    QSignalSpy savedSpy(&engine, &FileTransferManager::fileSaved);
+    QSignalSpy progressSpy(&engine, &FileTransferManager::taskProgress);
+    const QString token = engine.saveToFile(messageId, dest);
+    QVERIFY(!token.isEmpty());
+    // 异步：返回时尚未保存完成（fileSaved 未发）
+    QCOMPARE(savedSpy.count(), 0);
+    QVERIFY2(waitForTask(engine, token), "save did not finish");
+    QCOMPARE(savedSpy.count(), 1);
+    QCOMPARE(savedSpy.at(0).at(1).toString(), dest);
+    // 保存期间发过 saving 相位进度，且逐字节还原
+    bool sawSaving = false;
+    for (const auto &args : progressSpy) {
+        if (args.at(1).toString() == QLatin1String("saving")) {
+            sawSaving = true;
+        }
+    }
+    QVERIFY(sawSaving);
+    QCOMPARE(readFile(dest), readFile(m_sourcePath));
 }
 
 QTEST_GUILESS_MAIN(TestFileTransfer)

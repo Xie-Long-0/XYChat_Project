@@ -1215,6 +1215,46 @@ qint64 DatabaseManager::getOrCreatePrivateConversation(qint64 userId1, qint64 us
     return convId;
 }
 
+// M10: 会话整表硬删除。显式按 FK 安全顺序清除回执→消息→成员→会话行，
+// 不依赖 PRAGMA foreign_keys（连接级设置，缺失会遗留孤儿行），并用事务保证原子性。
+// 消息引用的文件行不属于会话，由回收任务按“无引用”异步清理，此处不涉足
+bool DatabaseManager::deleteConversation(qint64 conversationId)
+{
+    if (conversationId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    if (!db.transaction()) {
+        qCritical() << "[DB] deleteConversation begin transaction failed:"
+                    << db.lastError().text();
+        return false;
+    }
+
+    QSqlQuery q(db);
+    const QStringList steps = {
+        "DELETE FROM message_receipts WHERE message_id IN "
+        "(SELECT id FROM messages WHERE conversation_id = ?)",
+        "DELETE FROM messages WHERE conversation_id = ?",
+        "DELETE FROM conversation_members WHERE conversation_id = ?",
+        "DELETE FROM conversations WHERE id = ?"
+    };
+    for (const QString &sql : steps) {
+        q.prepare(sql);
+        q.addBindValue(conversationId);
+        if (!q.exec()) {
+            qCritical() << "[DB] deleteConversation failed:" << q.lastError().text();
+            db.rollback();
+            return false;
+        }
+    }
+    if (!db.commit()) {
+        qCritical() << "[DB] deleteConversation commit failed:" << db.lastError().text();
+        db.rollback();
+        return false;
+    }
+    return true;
+}
+
 QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
 {
     QList<ConversationInfo> result;

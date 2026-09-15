@@ -51,6 +51,12 @@ Window {
             title: "XYChat"
         }
 
+        // M10: 网络状态条（断线/重连/离线时可见，Authenticated 时隐藏）
+        NetworkStatusBar {
+            Layout.fillWidth: true
+            networkState: networkManager.state
+        }
+
         // 主页面
         MainPage {
             id: mainPage
@@ -132,10 +138,24 @@ Window {
             onDeleteMessageRequested: function(messageId) {
                 networkManager.deleteMessage(messageId)
             }
+
+            onMarkConversationReadRequested: function(conversationId) {
+                networkManager.getConversations()
+            }
+
+            // P3.2: “正在输入”信号（C++ 侧节流，即发即忘）
+            onTypingRequested: function(conversationId, typing) {
+                networkManager.sendTyping(conversationId, typing)
+            }
+
+            // P3.1: 会话整表删除
+            onDeleteConversationRequested: function(conversationId) {
+                networkManager.deleteConversation(conversationId)
+            }
         }
     }
 
-    // ── NetworkManager 聊天信号连接 ──
+    // NetworkManager 聊天信号连接
     Connections {
         target: networkManager
 
@@ -187,12 +207,21 @@ Window {
         }
 
         function onMessageSendFailed(error) {
-            console.log("Send failed:", error)
+            globalToast.error("发送失败：" + error)
+            // P2.2: 把当前会话中“发送中”的乐观气泡标记为 failed，供点击重发
+            mainPage.handleSendFailed()
         }
 
         // M4.5: 消息状态推送（已送达/已读）实时更新气泡状态
         function onMessageStatusChanged(messageId, status) {
             mainPage.updateMessageStatus(messageId, status)
+        }
+
+        // P3.2: “正在输入”推送——仅当前打开的会话展示（服务端已排除发起者）
+        function onTypingReceived(conversationId, userId, username, typing) {
+            if (conversationId == mainPage.currentConversationId) {
+                mainPage.showPeerTyping(userId, username, typing)
+            }
         }
 
         function onSearchUsersResult(users) {
@@ -215,10 +244,12 @@ Window {
         // M7a: 群组操作结果
         function onGroupCreated(conversationId, name) {
             mainPage.openCreatedGroup(conversationId, name)
+            globalToast.success("群组已创建")
         }
 
         function onGroupLeft(conversationId) {
             mainPage.closeGroupIfCurrent(conversationId)
+            globalToast.info("已退出群聊")
         }
 
         function onGroupInfoResult(info) {
@@ -226,7 +257,7 @@ Window {
         }
 
         function onGroupRequestFailed(error) {
-            console.log("Group operation failed:", error)
+            globalToast.error("群操作失败：" + error)
         }
 
         // M7a: 群变更推送：被移除/目标为自己的变更需关闭当前会话
@@ -255,12 +286,28 @@ Window {
         }
 
         function onMessageEditFailed(error) {
-            console.log("Edit message failed:", error)
+            globalToast.error("编辑失败：" + error)
         }
 
         function onMessageDeleteFailed(error) {
-            console.log("Delete message failed:", error)
+            globalToast.error("删除失败：" + error)
         }
+
+        // P3.1: 会话删除结果（本端响应或其他成员/设备推送）
+        function onConversationDeleted(conversationId) {
+            mainPage.handleConversationDeleted(conversationId)
+            globalToast.info("会话已删除")
+        }
+
+        function onConversationDeleteFailed(error) {
+            globalToast.error("删除会话失败：" + error)
+        }
+    }
+
+    // M10: 全局 Toast 反馈层（覆盖在所有内容之上）
+    Toast {
+        id: globalToast
+        anchors.fill: parent
     }
 
     // M4.5: 对当前会话中最后一条对方消息发送已读回执

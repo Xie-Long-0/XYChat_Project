@@ -11,18 +11,37 @@ Rectangle {
     property string peerUsername: ""
     property string chatTitle: ""
     property bool hasConversation: false
-    // M4.5: 当前登录用户 ID，用于判断消息归属
     property int myUserId: 0
-    // M7a: 群会话状态（E2EE 状态提示、成员数副标题、群信息入口）
+    property int peerUserId: 0
+    property int conversationId: 0
     property bool isGroup: false
     property int groupMemberCount: 0
+
+    // P2.3: 当前会话未读数（MainPage 打开会话时注入，用于放置未读分隔线）
+    property int unreadCount: 0
+    // P2.3: 滚动离开底部期间新到达的对方消息数（“跳到底部”FAB 徽标）
+    property int newMessageCount: 0
+
+    // P3.2: “正在输入”状态。typingUsers 为 userId -> {username, ts}；
+    // typingText 为头部副标题展示文本（空表示无人输入）
+    property var typingUsers: ({})
+    property string typingText: ""
+
+    // P4.2: messageId -> msgModel 行号索引，令 updateFileState/updateFileProgress
+    // 从 O(n) 全表扫描降为 O(1)（大文件多分片进度事件的热点路径）
+    property var msgIndex: ({})
 
     signal sendMessage(string content)
     signal backClicked()
     signal groupInfoRequested()
+    // P3.2: 用户键入（true）或发送/清空（false），转发到 MainPage 发“正在输入”信号
+    signal typingSignal(bool typing)
     // M9 特性栈：消息右键菜单操作（转发到 MainPage）
     signal editRequested(int messageId, string content)
     signal deleteRequested(int messageId)
+    // P2.2: failed 气泡点击重发（带幂等键与正文）与复制正文（均转发到 MainPage）
+    signal resendRequested(string clientMessageId, string content)
+    signal copyRequested(string content)
     // M8.2: 文件消息的下载/另存请求（由 MainPage 接到传输引擎）
     signal fileDownloadRequested(int messageId)
     signal fileSaveRequested(int messageId)
@@ -73,38 +92,20 @@ Rectangle {
                     onClicked: chatView.backClicked()
                 }
 
-                Canvas {
+                Icon {
                     anchors.centerIn: parent
-                    width: 12; height: 12
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-                        ctx.strokeStyle = Theme.textSecondary
-                        ctx.lineWidth = 2
-                        ctx.beginPath()
-                        ctx.moveTo(width, 0)
-                        ctx.lineTo(0, height / 2)
-                        ctx.lineTo(width, height)
-                        ctx.stroke()
-                    }
+                    name: "back"
+                    size: 12
+                    iconColor: Theme.textSecondary
                 }
             }
 
-            // 头像
-            Rectangle {
-                width: Theme.avatarSizeSmall
-                height: Theme.avatarSizeSmall
-                radius: Theme.avatarSizeSmall / 2
-                color: Theme.primaryColor
+            Avatar {
+                userId: isGroup ? conversationId : peerUserId
+                name: peerUsername
+                size: Theme.avatarSizeSmall
+                isGroup: chatView.isGroup
                 visible: hasConversation
-
-                Label {
-                    anchors.centerIn: parent
-                    text: peerUsername.length > 0 ? peerUsername[0].toUpperCase() : "?"
-                    font.pixelSize: Theme.fontSizeMedium
-                    font.weight: Font.Bold
-                    color: Theme.textOnPrimary
-                }
             }
 
             // 标题
@@ -121,12 +122,21 @@ Rectangle {
                     elide: Text.ElideRight
                 }
 
-                // M7a: 群会话副标题（成员数）
+                // M7a: 群会话副标题（成员数）；P3.2: 有人输入时优先显示“正在输入”
                 Label {
-                    visible: isGroup
+                    visible: isGroup && chatView.typingText.length === 0
                     text: groupMemberCount + " 位成员"
                     font.pixelSize: Theme.fontSizeSmall - 1
                     color: Theme.textTertiary
+                }
+
+                // P3.2: “正在输入…”副标题（私聊/群聊通用，主色区分）
+                Label {
+                    visible: chatView.typingText.length > 0
+                    text: chatView.typingText
+                    font.pixelSize: Theme.fontSizeSmall - 1
+                    color: Theme.primaryColor
+                    elide: Text.ElideRight
                 }
             }
 
@@ -146,26 +156,11 @@ Rectangle {
                     onClicked: chatView.groupInfoRequested()
                 }
 
-                // 多人图标（两个圆 + 肩部弧线）
-                Canvas {
+                Icon {
                     anchors.centerIn: parent
-                    width: 16; height: 16
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-                        ctx.strokeStyle = Theme.textSecondary
-                        ctx.lineWidth = 1.4
-                        ctx.beginPath()
-                        ctx.arc(6, 5, 2.6, 0, Math.PI * 2)
-                        ctx.stroke()
-                        ctx.beginPath()
-                        ctx.arc(11, 6, 2.1, 0, Math.PI * 2)
-                        ctx.stroke()
-                        ctx.beginPath()
-                        ctx.moveTo(1.5, 13.5)
-                        ctx.quadraticCurveTo(6, 8.5, 10.5, 13.5)
-                        ctx.stroke()
-                    }
+                    name: "group"
+                    size: 16
+                    iconColor: Theme.textSecondary
                 }
             }
 
@@ -222,7 +217,7 @@ Rectangle {
             Item {
                 width: parent.width
                 height: 32
-                visible: model.isDivider
+                visible: model.isDivider && model.isUnreadDivider !== true
 
                 Rectangle {
                     anchors.centerIn: parent
@@ -238,6 +233,30 @@ Rectangle {
                         font.pixelSize: Theme.fontSizeSmall
                         font.weight: Font.DemiBold
                         color: Theme.dateDividerTextColor
+                    }
+                }
+            }
+
+            // P2.3: 未读消息分隔线（进入会话时标记“从这里开始未读”，主色胶囊区分于日期线）
+            Item {
+                width: parent.width
+                height: 32
+                visible: model.isUnreadDivider === true
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    height: 22
+                    width: unreadDividerLabel.implicitWidth + Theme.spacingLarge * 2
+                    radius: 11
+                    color: Theme.primaryColor
+
+                    Label {
+                        id: unreadDividerLabel
+                        anchors.centerIn: parent
+                        text: "未读消息"
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: Font.DemiBold
+                        color: Theme.textOnPrimary
                     }
                 }
             }
@@ -277,6 +296,7 @@ Rectangle {
                 undecryptable: model.undecryptable === true
                 // M9 特性栈：编辑/删除状态与右键菜单
                 messageId: model.messageId
+                clientMessageId: model.clientMessageId || ""
                 edited: model.edited === true
                 deleted: model.deleted === true
                 // M8.2: 文件消息的脱敏展示与下载/保存交互
@@ -296,6 +316,9 @@ Rectangle {
                 onPlayRequested: chatView.filePlayRequested(model.messageId)
                 onEditRequested: chatView.editRequested(model.messageId, model.content)
                 onDeleteRequested: chatView.deleteRequested(model.messageId)
+                // P2.2: failed 气泡点击重发；复制正文（经 MainPage 剪贴板助手）
+                onResendRequested: chatView.resendRequested(model.clientMessageId || "", model.content || "")
+                onCopyRequested: chatView.copyRequested(model.content || "")
             }
         }
 
@@ -318,12 +341,24 @@ Rectangle {
                 chatView.stayAtBottom = false
             }
         }
+
+        // P2.3: 滚动回底部时清零 FAB 新消息徽标（含用户手动与程序化滚动）
+        onContentYChanged: {
+            if (chatView.atBottom) {
+                chatView.newMessageCount = 0
+            }
+        }
     }
 
     // 是否保持贴底（打开会话/发送或接收消息后置 true）
     property bool stayAtBottom: false
     // 程序化滚动标志（区分用户手动滚动）
     property bool programmaticScroll: false
+
+    // P2.3: 是否贴近底部（留 60px 容差），驱动“跳到底部”FAB 的显隐
+    readonly property bool atBottom: messageListView.contentHeight <= messageListView.height + 1
+                                     || messageListView.contentY >= messageListView.contentHeight - messageListView.height - 60
+    readonly property bool scrolledUp: hasConversation && msgModel.count > 0 && !atBottom
 
     // 滚动到底部定时器：等待新 delegate 完成布局后再滚动
     Timer {
@@ -342,6 +377,15 @@ Rectangle {
         }
     }
 
+    // P3.2: “正在输入”过期清理（每秒剔除 5s 无新信号的成员，空则停表）
+    Timer {
+        id: typingPruneTimer
+        interval: 1000
+        repeat: true
+        running: false
+        onTriggered: chatView.pruneTyping()
+    }
+
     // 消息输入框
     MessageInput {
         id: messageInput
@@ -349,12 +393,78 @@ Rectangle {
         anchors.left: parent.left
         anchors.right: parent.right
         visible: hasConversation
+        maxLength: isGroup ? 16384 : 4096
         onMessageSent: function(text) {
             chatView.sendMessage(text)
+            // P3.2: 发送后停止“正在输入”
+            chatView.typingSignal(false)
         }
-        // M8.2: 选定附件后上转，上传进度横幅由 MainPage 统一展示
         onAttachmentSelected: function(fileUrl) {
             chatView.attachmentSelected(fileUrl)
+        }
+        // P3.2: 键入时上报“正在输入”（C++ 侧节流）
+        onTypingActivity: chatView.typingSignal(true)
+    }
+
+    // P2.3: “跳到底部”悬浮按钮（向上滚动离开底部时出现，右下角，带新消息徽标）
+    Rectangle {
+        id: jumpToBottomFab
+        anchors.right: parent.right
+        anchors.bottom: messageInput.top
+        anchors.rightMargin: Theme.spacingLarge
+        anchors.bottomMargin: Theme.spacingMedium
+        width: 44
+        height: 44
+        radius: 22
+        visible: chatView.scrolledUp
+        color: fabMouse.containsMouse ? Theme.hoverColor : Theme.inputBackground
+        border.width: 1
+        border.color: Theme.separatorColor
+        scale: visible ? 1 : 0.6
+        Behavior on scale {
+            NumberAnimation { duration: Theme.animationFast; easing.type: Theme.easingDecelerate }
+        }
+
+        Icon {
+            anchors.centerIn: parent
+            name: "arrow-down"
+            size: 20
+            iconColor: Theme.textSecondary
+        }
+
+        MouseArea {
+            id: fabMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+                chatView.newMessageCount = 0
+                chatView.scrollToBottom()
+            }
+        }
+
+        // 新消息徽标（滚动离开底部期间到达的对方消息数）
+        Rectangle {
+            visible: chatView.newMessageCount > 0
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.rightMargin: -2
+            anchors.topMargin: -4
+            width: Math.max(18, fabBadgeLabel.implicitWidth + 10)
+            height: 18
+            radius: 9
+            color: Theme.unreadBadgeColor
+            border.width: 2
+            border.color: Theme.chatBackground
+
+            Label {
+                id: fabBadgeLabel
+                anchors.centerIn: parent
+                text: chatView.newMessageCount > 99 ? "99+" : chatView.newMessageCount
+                color: Theme.unreadBadgeTextColor
+                font.pixelSize: Theme.fontSizeSmall - 1
+                font.weight: Font.DemiBold
+            }
         }
     }
 
@@ -370,10 +480,11 @@ Rectangle {
             radius: 40
             color: Theme.primaryLightColor
 
-            Label {
+            Icon {
                 anchors.centerIn: parent
-                text: "💬"
-                font.pixelSize: 32
+                name: "chat-bubble"
+                size: 32
+                iconColor: Theme.primaryColor
             }
         }
 
@@ -392,7 +503,27 @@ Rectangle {
         }
     }
 
-    // ── 时间格式化辅助 ──
+    // 消息加载中状态（已选会话但消息尚未到达）
+    Column {
+        anchors.centerIn: parent
+        spacing: Theme.spacingMedium
+        visible: hasConversation && msgModel.count === 0
+
+        LoadingIndicator {
+            anchors.horizontalCenter: parent.horizontalCenter
+            size: 24
+            running: visible
+        }
+
+        Label {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "加载消息..."
+            font.pixelSize: Theme.fontSizeMedium
+            color: Theme.textTertiary
+        }
+    }
+
+    // 时间格式化辅助
     function parseDate(createdAt) {
         var d = new Date(createdAt)
         if (isNaN(d.getTime())) {
@@ -521,22 +652,51 @@ Rectangle {
         return fileTransfer.isCached(sha256, cipherSize || 0)
     }
 
-    // M8.2: 更新某条消息的附件状态与下载进度
-    function updateFileState(messageId, state) {
+    // P4.2: 重建 messageId -> 行号索引（结构性变更后调用；O(n) 一次性）
+    function rebuildMessageIndex() {
+        var index = {}
         for (var i = 0; i < msgModel.count; i++) {
-            if (msgModel.get(i).messageId === messageId) {
-                msgModel.setProperty(i, "fileState", state)
-                return
+            var item = msgModel.get(i)
+            if (!item.isDivider && item.messageId > 0) {
+                index[item.messageId] = i
             }
+        }
+        msgIndex = index
+    }
+
+    // P4.2: 经索引 O(1) 定位消息行；索引失效（结构变更未同步）时重建兜底，
+    // 命中前用 == 校验行内容，确保绝不会更新到错误的行
+    function rowForMessageId(messageId) {
+        var row = msgIndex[messageId]
+        if (row !== undefined && row >= 0 && row < msgModel.count) {
+            var item = msgModel.get(row)
+            if (item && !item.isDivider && item.messageId == messageId) {
+                return row
+            }
+        }
+        rebuildMessageIndex()
+        row = msgIndex[messageId]
+        if (row !== undefined && row >= 0 && row < msgModel.count) {
+            var retry = msgModel.get(row)
+            if (retry && !retry.isDivider && retry.messageId == messageId) {
+                return row
+            }
+        }
+        return -1
+    }
+
+    // M8.2: 更新某条消息的附件状态与下载进度（P4.2: 经索引 O(1) 定位）
+    function updateFileState(messageId, state) {
+        var row = rowForMessageId(messageId)
+        if (row >= 0) {
+            msgModel.setProperty(row, "fileState", state)
         }
     }
 
     function updateFileProgress(messageId, progress) {
-        for (var i = 0; i < msgModel.count; i++) {
-            if (msgModel.get(i).messageId === messageId) {
-                msgModel.setProperty(i, "fileProgress", progress)
-                return
-            }
+        var row = rowForMessageId(messageId)
+        if (row >= 0) {
+            msgModel.setProperty(row, "fileProgress", progress)
         }
     }
 
@@ -552,21 +712,72 @@ Rectangle {
         return null
     }
 
-    // ── 公共方法 ──
+    // 公共方法
     function setMessages(messages) {
         msgModel.clear()
+        newMessageCount = 0
         for (var i = 0; i < messages.length; i++) {
             var msg = messages[i]
             ensureDivider(msg.createdAt || "")
             msgModel.append(makeMessageEntry(msg))
         }
+        insertUnreadDivider()
+        rebuildMessageIndex()
         scrollToBottom()
     }
 
+    // P2.3: 依据会话未读数，在“第一条未读的对方消息”前插入未读分隔线。
+    // 从末尾回溯统计对方消息（跳过自己的、系统消息与分隔线），数到第
+    // unreadCount 条即为第一条未读消息；不足则置于顶部。用毕清零，仅显示一次
+    function insertUnreadDivider() {
+        if (unreadCount <= 0) {
+            return
+        }
+        var remaining = unreadCount
+        var insertIndex = 0
+        for (var i = msgModel.count - 1; i >= 0; i--) {
+            var item = msgModel.get(i)
+            if (item.isDivider || item.contentType === "system" || item.isMine) {
+                continue
+            }
+            remaining--
+            if (remaining === 0) {
+                insertIndex = i
+                break
+            }
+        }
+        msgModel.insert(insertIndex, {
+            isDivider: true,
+            isUnreadDivider: true,
+            dividerText: "未读消息",
+            dateKeyStr: "",
+            messageId: 0, clientMessageId: "", senderId: 0,
+            senderUsername: "", content: "", contentType: "unread-divider",
+            createdAt: "", displayTime: "", status: "", isMine: false,
+            undecryptable: false,
+            isFileMessage: false, fileName: "", fileSizeBytes: 0,
+            fileSha256: "", fileState: "missing", fileProgress: 0,
+            fileWidth: 0, fileHeight: 0, fileThumb: "", fileMime: "",
+            fileDurationMs: 0
+        })
+        unreadCount = 0
+    }
+
     function appendMessage(msg) {
+        // P2.3: 记录到达前是否贴底。贴底则自动跟随，否则累计 FAB 新消息徽标、保持阅读位置
+        var wasAtBottom = stayAtBottom
         ensureDivider(msg.createdAt || "")
         msgModel.append(makeMessageEntry(msg))
-        scrollToBottom()
+        // P4.2: 新消息行加入索引（追加不移动既有行号）
+        var appended = msgModel.get(msgModel.count - 1)
+        if (appended.messageId > 0) {
+            msgIndex[appended.messageId] = msgModel.count - 1
+        }
+        if (wasAtBottom) {
+            scrollToBottom()
+        } else {
+            newMessageCount++
+        }
     }
 
     // M4.5: 乐观插入“发送中”消息（本地立即展示）
@@ -599,6 +810,10 @@ Rectangle {
             if (!item.isDivider && item.clientMessageId === clientMessageId) {
                 msgModel.setProperty(i, "messageId", messageId)
                 msgModel.setProperty(i, "status", "sent")
+                // P4.2: 乐观消息获得真实 messageId，补入索引
+                if (messageId > 0) {
+                    msgIndex[messageId] = i
+                }
                 return
             }
         }
@@ -641,6 +856,36 @@ Rectangle {
         }
     }
 
+    // P2.2: 发送失败时把最早一条仍在“发送中”的乐观气泡标记为 failed，
+    // 供用户点击重发。若无发送中气泡（如加好友失败复用同一信号）则不动作，
+    // 返回是否命中，便于调用方决定是否需要额外处理
+    function markSendingFailed() {
+        for (var i = 0; i < msgModel.count; i++) {
+            var item = msgModel.get(i)
+            if (!item.isDivider && item.status === "sending") {
+                msgModel.setProperty(i, "status", "failed")
+                return true
+            }
+        }
+        return false
+    }
+
+    // P2.2: 重发前移除指定幂等键的失败乐观气泡，避免与重发新建的气泡重复
+    function removeOptimisticMessage(clientMessageId) {
+        if (!clientMessageId || clientMessageId.length === 0) {
+            return
+        }
+        for (var i = 0; i < msgModel.count; i++) {
+            var item = msgModel.get(i)
+            if (!item.isDivider && item.clientMessageId === clientMessageId) {
+                msgModel.remove(i)
+                // P4.2: 删除使后续行号整体前移，重建索引
+                rebuildMessageIndex()
+                return
+            }
+        }
+    }
+
     // M4.5: 返回当前列表中最后一条对方消息的 ID（用于已读回执）
     function lastIncomingMessageId() {
         for (var i = msgModel.count - 1; i >= 0; i--) {
@@ -652,12 +897,69 @@ Rectangle {
         return 0
     }
 
+    // P3.2: 设置某成员的“正在输入”状态并重算头部副标题文本
+    function setTyping(userId, username, typing) {
+        // 忽略自己的 typing（服务端已排除发起者，此处双保险）
+        if (userId == chatView.myUserId) {
+            return
+        }
+        var map = chatView.typingUsers
+        if (typing) {
+            map[userId] = { username: username, ts: Date.now() }
+        } else {
+            delete map[userId]
+        }
+        chatView.typingUsers = map
+        chatView.recomposeTyping()
+        typingPruneTimer.running = Object.keys(chatView.typingUsers).length > 0
+    }
+
+    // P3.2: 剔除超过 5s 无新信号的成员（接收端超时自动隐藏）
+    function pruneTyping() {
+        var now = Date.now()
+        var map = chatView.typingUsers
+        var changed = false
+        for (var key in map) {
+            if (now - map[key].ts > 5000) {
+                delete map[key]
+                changed = true
+            }
+        }
+        if (changed) {
+            chatView.typingUsers = map
+            chatView.recomposeTyping()
+        }
+        typingPruneTimer.running = Object.keys(chatView.typingUsers).length > 0
+    }
+
+    // P3.2: 组装副标题文本。私聊/单人：“XX 正在输入…”；群聊多人：“XX 等 N 人正在输入…”
+    function recomposeTyping() {
+        var map = chatView.typingUsers
+        var keys = Object.keys(map)
+        if (keys.length === 0) {
+            chatView.typingText = ""
+            return
+        }
+        var first = map[keys[0]].username
+        if (!chatView.isGroup || keys.length === 1) {
+            chatView.typingText = first + " 正在输入…"
+        } else {
+            chatView.typingText = first + " 等 " + keys.length + " 人正在输入…"
+        }
+    }
+
     function scrollToBottom() {
         scrollTimer.restart()
     }
 
     function clearMessages() {
         chatView.stayAtBottom = false
+        chatView.newMessageCount = 0
+        // P3.2: 切换/清空会话时复位“正在输入”状态
+        chatView.typingUsers = ({})
+        chatView.typingText = ""
+        typingPruneTimer.running = false
+        chatView.msgIndex = ({})
         msgModel.clear()
     }
 }

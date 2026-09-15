@@ -38,6 +38,7 @@ RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
     , m_searchWindow(MaxSearchesPerWindow, SearchWindowSeconds)
     , m_editDeleteWindow(MaxEditDeletePerWindow, EditDeleteWindowSeconds)
     , m_prefsWindow(MaxPrefsPerWindow, PrefsWindowSeconds)
+    , m_typingWindow(MaxTypingPerWindow, TypingWindowSeconds)
     , m_fileUploadWindow(MaxFileUploadsPerWindow, FileUploadWindowSeconds)
     , m_fileOpsWindow(MaxFileOpsPerWindow, FileOpsWindowSeconds)
 {
@@ -358,6 +359,17 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     if (packet.messageType == MessageType::DeleteMessageRequest || type == "delete_message") {
         processDeleteMessageRequest(packet, json);
+        return;
+    }
+    // M10: 会话整表删除
+    if (packet.messageType == MessageType::DeleteConversationRequest
+        || type == "delete_conversation") {
+        processDeleteConversationRequest(packet, json);
+        return;
+    }
+    // M10: “正在输入”指示
+    if (packet.messageType == MessageType::TypingRequest || type == "typing") {
+        processTypingRequest(packet, json);
         return;
     }
     // M8: 媒体、文件与对象存储控制面
@@ -2900,6 +2912,128 @@ bool RequestHandler::checkRateLimit(const QString &ipAddress, qint64 userId)
         }
     }
     return false;
+}
+
+// M10: “正在输入”指示。仅会话成员可发；限流通过后 fan-out 到会话其他在线成员。
+// typing 是瞬时状态，不写 sync_events（无需离线补偿），接收端 5s 无新信号自动隐藏
+void RequestHandler::processTypingRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 conversationId = request.value("conversationId").toVariant().toLongLong();
+    const bool typing = request.value("typing").toBool(true);
+
+    // 先校验入参形态，再消费限流配额（与 send/edit/prefs 一致，避免畸形请求白白耗尽窗口）
+    if (conversationId <= 0) {
+        sendResponse(packet.requestId, MessageType::TypingResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+    if (!m_typingWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::TypingResponse,
+                     ErrorCode::RateLimited, "Too many typing signals, please slow down");
+        return;
+    }
+    // 鉴权已过、限流通过后回查 DB：仅会话成员可发
+    if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::TypingResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this conversation");
+        return;
+    }
+
+    QJsonObject payload;
+    payload["conversationId"] = conversationId;
+    payload["userId"] = m_authenticatedUserId;
+    payload["username"] = m_db->usernameById(m_authenticatedUserId);
+    payload["typing"] = typing;
+    Packet notify;
+    notify.messageType = MessageType::TypingNotification;
+    notify.requestId = 0;
+    notify.payload = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const QByteArray encoded = PacketCodec::encode(notify);
+
+    // fan-out 到会话其他成员（私聊/群聊通用）；仅在线直推，不写 sync_events
+    for (qint64 memberId : m_db->getConversationMemberIds(conversationId)) {
+        if (memberId != m_authenticatedUserId) {
+            emit messageForUser(memberId, encoded);
+        }
+    }
+
+    sendResponse(packet.requestId, MessageType::TypingResponse, ErrorCode::Ok, "OK");
+}
+
+// M10: 会话整表删除。仅会话成员可删；群聊仅群主可整表删除（普通成员
+// 请用“退出群聊”，避免单个成员销毁全群数据）。硬删除会话行（成员/消息/
+// 回执经 FK CASCADE 连带清除），随后向全体前成员推送 ConversationDeletedNotification
+// 并写入各自 sync_events（离线补偿）
+void RequestHandler::processDeleteConversationRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 conversationId = request.value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        sendResponse(packet.requestId, MessageType::DeleteConversationResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+    // 破坏性操作，与消息编辑/删除共用限流窗口（先校验形态、后消费配额）
+    if (!m_editDeleteWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::DeleteConversationResponse,
+                     ErrorCode::RateLimited, "Too many delete operations, please slow down");
+        return;
+    }
+    auto convOpt = m_db->getConversation(conversationId);
+    if (!convOpt.has_value()) {
+        sendResponse(packet.requestId, MessageType::DeleteConversationResponse,
+                     ErrorCode::ConversationNotFound, "Conversation not found");
+        return;
+    }
+    if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::DeleteConversationResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this conversation");
+        return;
+    }
+    // 群聊仅群主可整表删除；普通成员应使用“退出群聊”
+    if (convOpt->type == "group"
+        && m_db->groupRole(conversationId, m_authenticatedUserId) != "owner") {
+        sendResponse(packet.requestId, MessageType::DeleteConversationResponse,
+                     ErrorCode::PermissionDenied,
+                     "Only the group owner can delete the conversation; use leave instead");
+        return;
+    }
+
+    // 删除前先取全体成员（CASCADE 后成员行即消失，无法再取）
+    const QList<qint64> members = m_db->getConversationMemberIds(conversationId);
+
+    // fail-closed：库内未真正删除时不得向全员广播删除事件
+    if (!m_db->deleteConversation(conversationId)) {
+        StructuredLogger::event(LogLevel::Warning, "conversation.delete_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("conversationId", conversationId).write();
+        sendResponse(packet.requestId, MessageType::DeleteConversationResponse,
+                     ErrorCode::InternalError, "Failed to delete conversation");
+        return;
+    }
+
+    const QString deletedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    QJsonObject ev;
+    ev["conversationId"] = conversationId;
+    ev["operatorId"] = m_authenticatedUserId;
+    ev["originDeviceId"] = m_currentDeviceId;
+    ev["deletedAt"] = deletedAt;
+    const QByteArray evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
+
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::ConversationDeletedNotification;
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = evJson;
+    const QByteArray encoded = PacketCodec::encode(notifyPacket);
+
+    // 通知全体前成员（各自在线设备实时移除 + sync_events 离线补偿）；
+    // 发起设备由客户端按 originDeviceId 自行忽略（其已凭响应本地清理）
+    for (qint64 memberId : members) {
+        m_db->appendSyncEvent(memberId, "conversation_deleted", QString::fromUtf8(evJson));
+        emit messageForUser(memberId, encoded);
+    }
+
+    sendResponse(packet.requestId, MessageType::DeleteConversationResponse, ErrorCode::Ok,
+                 "OK", ev);
 }
 
 // 响应工具

@@ -85,6 +85,9 @@ public:
                                  bool incrementUnread);
     // M9 特性栈：更新会话偏好（置顶/免打扰），仅更新已存在会话行（服务端权威）
     bool setConversationPrefs(qint64 conversationId, bool pinned, bool muted);
+    // M10: 会话整表删除——清除该会话的全部本地缓存（消息、解密缓存、
+    // 会话行、群 Sender Key/跳过密钥、在途 outbox），与服务端硬删除对齐
+    bool deleteConversation(qint64 conversationId);
 
     // 解密缓存（messageId -> 明文，归口替代 M6 KeyStorage .cache）
     QString loadDecryptedContent(qint64 messageId) const;

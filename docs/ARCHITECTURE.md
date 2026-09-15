@@ -1,8 +1,8 @@
 # XYChat 架构概览
 
-> 本文档描述当前架构实态（截至 2026-09-11，M8.2 数据面与客户端文件传输完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
+> 本文档描述当前架构实态（截至 2026-09-14，M10 UI 重构与体验完善完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
 
-## 当前组件（M8.2 完成后）
+## 当前组件（M10 完成后）
 
 ```text
 Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
@@ -17,7 +17,7 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
-- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
+- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善，M10 建立统一视觉系统 + 基础组件库 + 全局反馈层并将 MainPage 拆分为独立对话框），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路，M10 起接入会话整表删除（`deleteConversation`）与“正在输入”指示（`sendTyping` 每会话 4s 节流 + `typingReceived` 信号））、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`，M10：新增 `deleteConversation` 清理本地会话与消息缓存）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
 - `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包；M9 新增会话偏好/消息编辑/消息删除三个处理器；M11 前置：发消息/搜索连接级限流 RateWindow + 结构化审计日志；**M8.1 新增文件控制面五个处理器**（申请上传/续传查询/宣告完成/取消/下载票据）与 `send_message` 的 `fileId` 校验），管理 session 路由与在线状态，访问 SQLite。**M8.1 新增 `storage/`**：`IObjectStorage` 抽象与 `LocalFileStorage` 实现（由 `Server` 创建并注入各 handler，存储初始化失败则不注入，文件相关接口一律 fail-closed 回 `FileStorageFailed`）；`Server` 维护连接新增 `pruneFileUploads`（与 `pruneSyncEvents` 共用定时器）。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；`FileProtocol`（M8.1：`FileManifest` 编解码、分片数学与体积/分片/票据常量，客户端与服务端共用同一组常量以免校验口径漂移）；
@@ -73,7 +73,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
 - M7a 群聊（明文，服务端与客户端均已落地）：服务端建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。客户端（子任务三）：`NetworkManager` 群组五接口 + 群消息 outbox 分流（明文直发不依赖 E2EE 引导，确定性错误移除待发项避免无限重试）；`LocalStore` 会话缓存群名/成员数（存量库幂等补列）；QML 建群（联系人多选）/群信息（成员列表/层级踢人/退群）/邀请（搜索多选）三个对话框，会话列表群样式与成员数标识，系统消息居中胶囊渲染。M7b 完成后群聊天区顶部“暂未端到端加密”横幅已改为群 E2EE 状态提示。
-- **限制**：本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式）；发消息/搜索限流已于 M11 前置实施（连接级 `RateWindow`：`send_message` 30/10s、`search_users` 20/60s，超限返回 `RateLimited (1003)`，客户端瞬时失败退避重刷不丢消息）；成员加入/退出的 Sender-Key healing 与失权回收已实现（2026-09-02 P1：成员变更触发本端轮换+重分发，离线经 sync_events 补偿），残留大群分发上限与“先落盘后分发”窗口（P2）。会话整表删除仍未实现（消息编辑/删除与置顶/免打扰已于 2026-09-05 实施，见 M9 小节）。
+- **限制**：本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式）；发消息/搜索限流已于 M11 前置实施（连接级 `RateWindow`：`send_message` 30/10s、`search_users` 20/60s，超限返回 `RateLimited (1003)`，客户端瞬时失败退避重刷不丢消息）；成员加入/退出的 Sender-Key healing 与失权回收已实现（2026-09-02 P1：成员变更触发本端轮换+重分发，离线经 sync_events 补偿），残留大群分发上限与“先落盘后分发”窗口（P2）。会话整表删除已于 M10（2026-09-14）实施（消息编辑/删除与置顶/免打扰已于 2026-09-05 实施，见 M9 小节；会话删除与“正在输入”指示见 M10 小节）。
 
 ### 端到端加密（M6）
 
@@ -107,6 +107,17 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - **多端与离线同步**：`conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件 + 实时推送双通道，`ingestSyncEvents` 解密后更新本地缓存并通知 UI（编辑事件同样先失效旧缓存再解密）。
 - **UI**：`ConversationList` 会话右键菜单（置顶/取消置顶、免打扰/取消免打扰）+ 置顶/免打扰角标；`MessageBubble` 消息右键菜单（编辑/删除，仅自己消息）+ “已编辑”标记与“已删除”占位；`MainPage` 编辑对话框与删除确认对话框；`MainWindow` 接线 `setConversationPrefs`/`editMessage`/`deleteMessage` 与五个新信号。
 
+### 会话整表删除、“正在输入”指示与 UI 重构（M10，2026-09-14）
+
+M10 采“保守主体（纯 QML 层重构）+ 精选新能力（两项新协议）”策略，协议号 `100-105`（原规划 `82-87` 已被 M9 占用，见 `docs/PROTOCOL.md`），**两项新能力均无需数据库迁移**（会话删除复用既有 `conversations`/`conversation_members`/`messages`/`message_receipts` 表，typing 为纯瞬时状态不落库）。
+
+- **会话整表删除（类型 100-102）**：仅会话成员可删，**群聊仅群主**可整表删除（普通成员应走“退出群聊”，避免单个成员销毁全群数据）；私聊任一方可删。与消息编辑/删除共用 `m_editDeleteWindow` 限流（破坏性操作，先校验形态后消费配额）。服务端 `DatabaseManager::deleteConversation` 在单事务内**显式按 FK 安全顺序硬删除**回执→消息→成员→会话行（不依赖连接级 `PRAGMA foreign_keys`，避免其缺失时遗留孤儿行）；删除前先取全体成员（成员行删除后即无法再取）。**fail-closed**：库内未真正删除时回 `InternalError`、不广播事件、记 `conversation.delete_failed` 日志。成功后向**全体前成员**推 `ConversationDeletedNotification`（在线直推）+ 各自写 `conversation_deleted` 事件到 `sync_events`（离线补偿），发起设备按 `originDeviceId` 自行忽略（已凭响应本地清理）。客户端 `NetworkManager::deleteConversation` 发请求，成功后 `LocalStore::deleteConversation` 清本地会话/消息缓存并从列表移除；收到推送或 `sync_events` 事件时同样清理。消息引用的**文件行不随会话删除**，由 M8 回收任务按“无引用”异步清理（见“文件与对象存储”节）。
+- **“正在输入”指示（类型 103-105）**：仅会话成员可发（鉴权 + 限流通过后回查 DB）；连接级 `m_typingWindow` 限流 10/10s（typing 高频且按成员数 fan-out，防刷屏放大），先校验入参形态后消费配额。服务端 fan-out 到会话其他成员的**在线设备直推**，**不写 `sync_events`**（typing 是瞬时状态，无需离线补偿），接收端 5s 无新信号自动隐藏。客户端 `NetworkManager::sendTyping` 对 `typing=true` 按会话 4s 节流（`TypingThrottleMs`，`typing=false` 停止信号不节流），即发即忘不跟踪 requestId；`typingReceived(conversationId, userId, username)` 信号驱动 QML 聊天区顶部“XX 正在输入…”。**隐私考量**：推送 payload 携带发起者 `username`（`usernameById`），仅暴露给同会话成员。
+- **统一视觉系统与基础组件库（纯 QML）**：`Theme.qml` 扩展 elevation/阴影、状态色（success/warning/error/info 亮暗双配）、头像确定性配色 `avatarColor(id)`、字号 scale 与动画曲线 token；新增 `icons/`（34 个单色 SVG）+ `Icon.qml`（按 `name` 加载、可 `tint`，主题切换自动重画），替换全部 Canvas 手绘与 emoji 字符图标；新增基础组件库 `AppButton`/`AppTextField`/`AppDialog`/`Avatar`/`Toast`/`EmptyState`/`LoadingIndicator`/`NetworkStatusBar`，所有 Dialog/Button/TextField 统一走组件库（样式改动一处生效全局）。
+- **全局反馈层**：`MainWindow` 顶层挂全局唯一 `Toast` 与 `NetworkStatusBar`（消费既有 `NetworkManager.state`），所有 send/edit/delete/group 失败信号从 `console.log` 改接 Toast，网络断线/重连/离线经状态条可见。
+- **MainPage 拆分与体验完善**：1854 行巨型页面拆出 9 个独立对话框到 `dialogs/`（Search/CreateGroup/GroupInfo/Invite/EditMessage/ConfirmDelete/ImagePreview/MediaPlayback/SaveFile），MainPage 仅保留布局 + 信号接线 + 状态管理（< 500 行）。同步落地：消息气泡重构（SVG 状态勾、failed 点击重发、hover 快捷操作、文本可选中）、未读分隔线 + “跳到底部”FAB、输入区多行 TextArea（Enter 发送/Shift+Enter 换行 + 字符计数器）、会话右键菜单（标记已读 + 删除会话）。QML 侧 `ChatView` 维护 `messageId → row` 的 JS Map，使 `updateFileState`/`updateFileProgress` 从 O(n) 全表扫描降为 O(1) 定位（长会话 × 大文件多分片事件下性能改善）。
+- **异步传输泵（顺带清理历史欠账）**：`FileTransferManager` 的上传 hashing（`uploadAndSend` 第一遍流式加密 + SHA-256）与“另存为”解密（`saveToFile`）此前在 GUI 线程同步执行（2 GiB 文件可冻屏数十秒），M10 改为**单线程时间片增量泵**：`QTimer(0)` 驱动、堆分配 `HashState`/`SaveState`（持不可拷贝的 `QFile`）、每片 8ms 预算，全部在 GUI 线程内交错执行（**刻意不用工作线程**——无锁、无跨线程密钥复制、密文逐字节不变，规避并发损坏风险）。`saveToFile` 返回类型由 `bool` 改为 `QString` token，进度经 `taskProgress`/`taskFinished`/`taskFailed` 信号反馈、可取消；传输横幅改为 `Repeater over fileTransfer.tasks`（多任务并发时全部可见，每个独立进度条 + 取消按钮）。文件句柄在**首个泵切片惰性打开**（`beginHashing` 只建状态存路径），避免同步持有句柄。
+
 ### 客户端本地加密持久化缓存（M6.5）
 
 - `LocalStore`（AppData/localstore，SQLite，按账号+设备隔离）：会话/消息/持久化 outbox/解密缓存/sync_events 游标；消息正文与会话预览以 AES-256-GCM 加密后落库（格式 `enc1:<iv>:<密文+标签>`），磁盘上不存在可读明文；M7a 起会话缓存额外携带群名/成员数，持久化 outbox 支持群消息目标（conversationId）。
@@ -122,7 +133,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 客户端校验服务端证书，证书错误时断开；CA 缺失拒绝连接（`XYCHAT_ALLOW_PLAINTEXT=1` 显式开发开关）。
 - 业务请求强制携带 timestamp/nonce（缺失/格式错误/超时/重复一律拒绝），nonce 由服务端全局 TTL 缓存（`NonceCache`）跨连接去重。
 - 日志脱敏（`LogSanitizer`）；敏感内存清零（`SecureMemory`）；结构化日志（M11 前置 `StructuredLogger`：单行 JSON 统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段，`sendResponse` 中央审计 + 安全事件带 reason，敏感字段脱敏）。
-- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；文件传输的控制面、数据面与客户端引擎均已落地（M8.1/M8.2），但上传 hashing 与保存解密在 GUI 线程同步执行、下载票据 TTL 对大文件不足且无断点续传（见 ROADMAP §3）。
+- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；文件传输的控制面、数据面与客户端引擎均已落地（M8.1/M8.2），上传 hashing 与“另存为”解密已于 M10（2026-09-14）改为单线程时间片增量泵（不再阻塞 GUI 线程、进度可见可取消，见 M10 小节）；残留下载票据 TTL 对大文件不足且中途不续期（见 ROADMAP §3）。
 
 ### 文件与对象存储（M8.1，2026-09-10）
 
@@ -218,8 +229,10 @@ Chat-Client
   ├── QML UI 层（resources/）
   │     ├── main.qml（登录窗口根，objectName=loginRoot）
   │     ├── pages/（LoginPage.qml, MainPage.qml, MainWindow.qml 主窗口根，objectName=mainWindow）
-  │     ├── components/（TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton）
-  │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册）
+  │     ├── components/（既有：TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton；M10 基础组件库：Icon, AppButton, AppTextField, AppDialog, Avatar, Toast, EmptyState, LoadingIndicator, NetworkStatusBar）
+  │     ├── dialogs/（M10：MainPage 拆出的 9 个对话框 Search/CreateGroup/GroupInfo/Invite/EditMessage/ConfirmDelete/ImagePreview/MediaPlayback/SaveFile）
+  │     ├── icons/（M10：34 个单色 SVG，经 Icon.qml 按 name 加载并可 tint）
+  │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册；M10 扩展 elevation/状态色/avatarColor(id)/字号 scale/动画曲线 token）
   ├── C++ 后端层
   │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密；M6.5 起接入 LocalStore 缓存与持久化 outbox；M7a 起提供群组五接口与 sendGroupMessage（outbox 分流，群消息明文直发）；M7b 起实现 ensureGroupSenderKey/buildGroupSenderKeyDistribution/encryptGroupMessage/decryptGroupMessageObject 等群 Sender-Key E2EE 接口与 FetchGroupKeys 协议交互；2026-09-04 起接入会话续期：解析 `expiresAt` 过期前自动 `renewToken`（60 秒看门狗 + 失败退避）、失效发 `sessionExpired` 回登录页；M9 起接入 setConversationPrefs/editMessage/deleteMessage 与 conversationPrefsChanged/messageEdited/messageDeleted 信号）
   │     ├── core/KeyStorage（M6：身份/预密钥私钥持久化，Windows DPAPI 保护；TOFU 指纹存储；M6.5：LocalStore 存储密钥）
@@ -324,9 +337,9 @@ M6 首次实现后经代码审查发现并修复：
 
 ## 下一步演进
 
-M0-M7b、M9 与 M8.1/M8.2（文件与对象存储地基 + 数据面与客户端）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
+M0-M7b、M9、M8.1/M8.2/M8.3（文件与对象存储地基 + 数据面与客户端 + 多媒体元数据与预览）与 M10（UI 重构与体验完善）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
 
-- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M8.3 多媒体元数据与预览、M10 搜索/通知/体验、M11 稳定性与可运维）。
+- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M10 明确排除项如本地消息搜索/系统托盘/桌面通知/草稿/设置页，以及 M11 稳定性与可运维）。
 - 集中登记的欠账与风险见 `docs/ROADMAP.md` §3（P1/P2/P3 分级）。
 
 本文档不再维护逐里程碑的演进流水账，新增架构实态变化时直接更新对应章节。

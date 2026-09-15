@@ -79,6 +79,12 @@ public:
                                  qint64 messageId, const QString &newContent);
     Q_INVOKABLE void deleteMessage(qint64 messageId);
 
+    // M10：“正在输入”指示。客户端节流（typing=true 每会话最快 4s 一次，
+    // 避免每次按键都发包）；typing=false（停止）不节流，立即送达
+    Q_INVOKABLE void sendTyping(qint64 conversationId, bool typing = true);
+    // M10: 会话整表删除（服务端硬删除；成功后清本地缓存并 emit conversationDeleted）
+    Q_INVOKABLE void deleteConversation(qint64 conversationId);
+
     // 状态查询
     ConnectionState state() const { return m_state; }
     QString sessionToken() const { return m_sessionToken; }
@@ -135,6 +141,12 @@ signals:
     void messageDeleted(qint64 conversationId, qint64 messageId);
     void messageEditFailed(const QString &error);
     void messageDeleteFailed(const QString &error);
+    // M10：收到会话成员的“正在输入”信号（服务端 fan-out）
+    void typingReceived(qint64 conversationId, qint64 userId,
+                        const QString &username, bool typing);
+    // M10：会话删除结果（本端响应或其他成员/设备推送）
+    void conversationDeleted(qint64 conversationId);
+    void conversationDeleteFailed(const QString &error);
 
 private slots:
     void onConnected();
@@ -193,6 +205,11 @@ private:
     // M9 欠账修复：编辑/删除事件专用推送（88/89），与响应路径分离，不再靠 requestId==0 区分
     void handleMessageEditedNotification(const XYChat::Protocol::Packet &packet);
     void handleMessageDeletedNotification(const XYChat::Protocol::Packet &packet);
+    // M10：“正在输入”推送
+    void handleTypingNotification(const XYChat::Protocol::Packet &packet);
+    // M10：会话整表删除（响应 + 推送）
+    void handleDeleteConversationResponse(const XYChat::Protocol::Packet &packet);
+    void handleConversationDeletedNotification(const XYChat::Protocol::Packet &packet);
     // M9 特性栈：会话偏好本地应用（响应/推送/事件共用）
     void applyConversationPrefs(qint64 conversationId, bool pinned, bool muted);
     quint64 sendEditMessageRequest(qint64 messageId, qint64 conversationId,
@@ -346,6 +363,14 @@ private:
     QQueue<PrivateEditWait> m_privateEditQueue;    // 等待 fetch_keys 的私聊编辑
     bool m_editFetchInFlight = false;              // 是否为编辑占用了 fetch_keys 传输槽
     QSet<quint64> m_pendingDeleteRequestIds;       // 已发删除请求的 requestId 集合
+
+    // M10：“正在输入”客户端节流（conversationId -> 上次发送 epoch 毫秒）
+    QHash<qint64, qint64> m_lastTypingSentMs;
+    static constexpr qint64 TypingThrottleMs = 4000; // typing=true 每会话最快 4s 一次
+    // M10：会话删除在途请求（requestId → conversationId）。多槽支持并发删除，
+    // 对齐 M9 m_pendingEdits/m_pendingDeleteRequestIds；conversationId 以本地登记为准，
+    // 即使响应 data 缺失也可靠（避免单值被后发请求覆盖导致首个删除静默丢失）
+    QHash<quint64, qint64> m_pendingDeleteConversationRequests;
 
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem

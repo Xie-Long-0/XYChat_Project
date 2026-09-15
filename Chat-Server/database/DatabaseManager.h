@@ -201,6 +201,10 @@ public:
     // M5.5: 授权检查（先授权再查询）
     bool isConversationMember(qint64 conversationId, qint64 userId);
     bool canAccessMessage(qint64 messageId, qint64 userId);
+    // M10: 会话整表硬删除。事务内显式按 FK 安全顺序清除
+    // 回执→消息→成员→会话行（不依赖 PRAGMA foreign_keys 级联）。
+    // conversationId<=0 或 DB 错误返回 false
+    bool deleteConversation(qint64 conversationId);
 
     // 消息管理
     //

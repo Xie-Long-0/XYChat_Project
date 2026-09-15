@@ -9,6 +9,15 @@
         <file>components/ChatView.qml</file>
         <file>components/MessageInput.qml</file>
         <file>components/MessageBubble.qml</file>
+        <file>components/Icon.qml</file>
+        <file>components/AppButton.qml</file>
+        <file>components/AppTextField.qml</file>
+        <file>components/AppDialog.qml</file>
+        <file>components/Avatar.qml</file>
+        <file>components/Toast.qml</file>
+        <file>components/EmptyState.qml</file>
+        <file>components/LoadingIndicator.qml</file>
+        <file>components/NetworkStatusBar.qml</file>
         <file>theme/Theme.qml</file>
         <file>theme/qmldir</file>
         <file>icons/close.svg</file>
@@ -16,6 +25,44 @@
         <file>icons/fullscreen.svg</file>
         <file>icons/maximize.svg</file>
         <file>icons/restore.svg</file>
+        <file>icons/search.svg</file>
+        <file>icons/plus.svg</file>
+        <file>icons/refresh.svg</file>
+        <file>icons/back.svg</file>
+        <file>icons/group.svg</file>
+        <file>icons/pin.svg</file>
+        <file>icons/mute.svg</file>
+        <file>icons/attach.svg</file>
+        <file>icons/send.svg</file>
+        <file>icons/check.svg</file>
+        <file>icons/check-double.svg</file>
+        <file>icons/clock.svg</file>
+        <file>icons/warning.svg</file>
+        <file>icons/edit.svg</file>
+        <file>icons/delete.svg</file>
+        <file>icons/copy.svg</file>
+        <file>icons/sun.svg</file>
+        <file>icons/moon.svg</file>
+        <file>icons/play.svg</file>
+        <file>icons/music.svg</file>
+        <file>icons/download.svg</file>
+        <file>icons/chat-bubble.svg</file>
+        <file>icons/arrow-down.svg</file>
+        <file>icons/logout.svg</file>
+        <file>icons/checkbox-checked.svg</file>
+        <file>icons/checkbox-unchecked.svg</file>
+        <file>icons/bell.svg</file>
+        <file>icons/info.svg</file>
+        <file>icons/x-circle.svg</file>
         <file>components/QWKButton.qml</file>
+        <file>dialogs/SearchDialog.qml</file>
+        <file>dialogs/CreateGroupDialog.qml</file>
+        <file>dialogs/GroupInfoDialog.qml</file>
+        <file>dialogs/InviteDialog.qml</file>
+        <file>dialogs/EditMessageDialog.qml</file>
+        <file>dialogs/ConfirmDeleteDialog.qml</file>
+        <file>dialogs/ImagePreviewDialog.qml</file>
+        <file>dialogs/MediaPlaybackDialog.qml</file>
+        <file>dialogs/SaveFileDialog.qml</file>
     </qresource>
 </RCC>

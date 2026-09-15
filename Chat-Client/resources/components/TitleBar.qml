@@ -48,8 +48,6 @@ Rectangle {
             id: themeToggleBtn
             height: parent.height
             width: height * 1.5
-            text: Theme.darkMode ? "☀️" : "🌑"
-            font.pixelSize: 16
             padding: 0
             background: Rectangle {
                 color: {
@@ -60,10 +58,14 @@ Rectangle {
                     return "transparent"
                 }
             }
+            contentItem: Icon {
+                name: Theme.darkMode ? "sun" : "moon"
+                size: 16
+                iconColor: Theme.textPrimary
+            }
 
             onClicked: themeSettings.darkMode = !themeSettings.darkMode
 
-            // 注册为命中测试可见，避免被 QWindowKit 当作标题栏拖拽区
             Component.onCompleted: windowAgent.setHitTestVisible(themeToggleBtn)
         }
     }

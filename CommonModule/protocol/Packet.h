@@ -98,6 +98,14 @@ enum class MessageType : quint16
     FileUploadCancelResponse = 97,
     FileDownloadTicketRequest = 98,  // 申请下载票据（鉴权与限流通过后才签发）
     FileDownloadTicketResponse = 99,
+    // M10 - 会话整表删除与“正在输入”指示
+    // 注：原规划的 82-87 与 M9（会话偏好/消息编辑删除 82-89）冲突，故顺延至 100+
+    DeleteConversationRequest = 100,
+    DeleteConversationResponse = 101,
+    ConversationDeletedNotification = 102, // 服务端推送：本人其他设备同步删除会话
+    TypingRequest = 103,
+    TypingResponse = 104,
+    TypingNotification = 105,              // 服务端推送：会话成员正在输入（fan-out，不写 sync_events）
 };
 
 enum class ErrorCode : int

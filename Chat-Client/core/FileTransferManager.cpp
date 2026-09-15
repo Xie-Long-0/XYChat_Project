@@ -10,6 +10,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QUuid>
 
 #include "FileCrypto.h"
@@ -37,6 +38,9 @@ constexpr int MaxRecoveryRounds = 5;
 // GCM 标签长度：明文分片为 0 时密文仍有这么长，故"解出空明文"只在
 // 密文分片恰好等于标签长度时才是合法结果
 constexpr qint64 GcmTagSize = 16;
+// P4.4/P4.3: 本地工作单个时间片的耗时预算（毫秒）。每片至少处理一个分片，
+// 随后在预算内继续，超预算即交还事件循环，兼顾进度与界面响应性
+constexpr qint64 LocalSliceBudgetMs = 8;
 
 // 网络类故障（可重试）与协议类故障（重试无益）必须分开：把 4xx 当瞬时错误
 // 重试会白白消耗服务端 per-IP 失败配额，甚至触发限流。
@@ -112,9 +116,55 @@ void FileTransferManager::setSslConfiguration(const QSslConfiguration &config)
     m_sslConfig = config;
 }
 
+// P4.4: hashing 中间态（QFile 不可拷贝，故堆分配、按 token 索引）。
+// 第一遍只算摘要、不落临时文件：加密是确定性的（nonce 由 iv 与序号派生），
+// 第二遍上传时重算得到的密文与这里逐字节相同
+struct FileTransferManager::HashState
+{
+    QFile file;                 // 惰性打开的明文源（不在 beginHashing 同步占用句柄）
+    FileCrypto::Sha256Stream digest;
+    qint64 plainChunk = 0;      // 每片明文字节数（= 密文分片 - GCM 标签）
+    qint64 offset = 0;          // 已处理的明文偏移
+    int chunkCount = 0;         // 已加密的分片数
+    qint64 cipherSize = 0;      // 累计密文字节
+};
+
+// P4.3: 另存为中间态（逐片解密写盘）
+struct FileTransferManager::SaveState
+{
+    QFile src;                  // 密文缓存（惰性打开）
+    QFile dst;                  // 目标临时文件（惰性打开）
+    QString destPath;           // 用户最终目标路径
+    QString tmpPath;            // destPath + ".xysaving"
+    QString cachePath;          // 密文缓存路径
+    qint64 offset = 0;          // 已处理的密文偏移
+    qint64 written = 0;         // 已写出的明文字节
+    int index = 0;              // 分片序号（解密用）
+    FileManifest manifest;      // 含密钥/iv/分片口径
+};
+
 int FileTransferManager::activeTaskCount() const
 {
     return static_cast<int>(m_tasks.size());
+}
+
+// P4.1: 活动任务快照。仅回脱敏展示字段（token/文件名/相位/方向/messageId），
+// 绝不涵盖清单与密钥。进度比值由 QML 侧根据 taskProgress 的 done/total 维护
+QVariantList FileTransferManager::tasks() const
+{
+    QVariantList out;
+    out.reserve(m_tasks.size());
+    for (auto it = m_tasks.constBegin(); it != m_tasks.constEnd(); ++it) {
+        const Task &t = it.value();
+        QVariantMap m;
+        m.insert(QLatin1String("token"), t.token);
+        m.insert(QLatin1String("fileName"), t.fileName);
+        m.insert(QLatin1String("phase"), t.phase);
+        m.insert(QLatin1String("isUpload"), t.isUpload);
+        m.insert(QLatin1String("messageId"), t.messageId);
+        out.append(m);
+    }
+    return out;
 }
 
 qint64 FileTransferManager::nextSeq()
@@ -578,9 +628,11 @@ QString FileTransferManager::uploadAndSend(const QVariant &localPathOrUrl,
     return token;
 }
 
-// M8.3b: hashing → creating 阶段（从 uploadAndSend 抽出，供音视频元数据提取
-// 完成后回调）。computeCipherDigest 在 GUI 线程同步执行（大文件会冻屏，
-// 已登记为 §3 P3 欠账），与重构前行为一致
+// M8.3b/P4.4: hashing → creating 阶段（从 uploadAndSend 抽出，供音视频元数据
+// 提取完成后回调）。P4.4: hashing 不再在此同步跑完（大文件会冻屏），改为
+// 生成密钥、建 HashState 后入本地泵队列，由 QTimer(0) 时间片增量推进；文件
+// 句柄在首个切片惰性打开（避免同步占用句柄，也保证源文件在入队后被删时能
+// 在泵送时明确失败）
 void FileTransferManager::beginHashing(const QString &token)
 {
     auto it = m_tasks.find(token);
@@ -589,18 +641,28 @@ void FileTransferManager::beginHashing(const QString &token)
     }
     Task &t = it.value();
     t.phase = QLatin1String("hashing");
-    // computeCipherDigest 内部会 emit taskProgress（hashing 阶段，offset/plainSize）
 
-    QString error;
-    if (!computeCipherDigest(t, &error)) {
-        failTask(token, error);
+    // 生成文件密钥（廉价，同步做）；每个文件独立密钥，严禁跨文件复用
+    const FileCrypto::FileKey key = FileCrypto::generateFileKey();
+    if (!key.valid) {
+        failTask(token, QLatin1String("Failed to generate a file key"));
+        return;
+    }
+    t.fileKey = key.key;
+    t.iv = key.iv;
+    // 明文分片 = 密文分片 - GCM 标签，使每片密文恰好等于 chunkSize
+    const qint64 plainChunk = Protocol::plainSizeOfChunk(t.chunkSize);
+    if (plainChunk <= 0) {
+        failTask(token, QLatin1String("Invalid chunk size"));
         return;
     }
 
-    t.phase = QLatin1String("creating");
-    emit taskProgress(token, t.phase, 0, t.cipherSize);
-    emit uploadCreateRequested(requestSeq(token), t.cipherSize, t.chunkSize, t.chunkCount,
-                               t.sha256Hex);
+    auto *st = new HashState;
+    st->plainChunk = plainChunk;
+    m_hashStates.insert(token, st);
+    // 首片 taskProgress（hashing 0%）：横幅立即有反馈；后续进度由 runHashSlice 发
+    emit taskProgress(token, t.phase, 0, t.plainSize);
+    enqueueLocalWork(token);
 }
 
 // M8.3b: 开始音视频元数据提取（懒创建 extractor，连接 finished 信号）
@@ -669,74 +731,324 @@ void FileTransferManager::clearExtractionStateForToken(const QString &token)
     }
 }
 
-bool FileTransferManager::computeCipherDigest(Task &task, QString *error)
+// P4.4/P4.3: 惰性创建并启动本地工作泵（QTimer(0)）。每轮事件循环触发一次
+// runLocalSlice，处理一个时间片后交还事件循环，界面因此保持响应
+void FileTransferManager::startLocalPump()
 {
-    QFile file(task.localPath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        *error = QLatin1String("Cannot open file for reading");
-        return false;
+    if (m_resetting) {
+        return;
     }
-
-    const FileCrypto::FileKey key = FileCrypto::generateFileKey();
-    if (!key.valid) {
-        *error = QLatin1String("Failed to generate a file key");
-        return false;
+    if (!m_localPump) {
+        m_localPump = new QTimer(this);
+        m_localPump->setInterval(0);
+        connect(m_localPump, &QTimer::timeout, this, &FileTransferManager::runLocalSlice);
     }
-    task.fileKey = key.key;
-    task.iv = key.iv;
-
-    // 明文分片 = 密文分片 - GCM 标签，使每片密文恰好等于 chunkSize
-    const qint64 plainChunk = Protocol::plainSizeOfChunk(task.chunkSize);
-    if (plainChunk <= 0) {
-        *error = QLatin1String("Invalid chunk size");
-        return false;
+    if (!m_localPump->isActive()) {
+        m_localPump->start();
     }
+}
 
-    // 第一遍只算摘要、不落临时文件：加密是确定性的（nonce 由 iv 与序号派生），
-    // 第二遍上传时重算得到的密文与这里逐字节相同。代价是多一遍 AES 运算，
-    // 换来磁盘占用不翻倍，也没有崩溃残留需要清理
-    FileCrypto::Sha256Stream digest;
-    qint64 cipherSize = 0;
-    int chunkCount = 0;
-    qint64 offset = 0;
-    while (offset < task.plainSize) {
-        const qint64 want = qMin(plainChunk, task.plainSize - offset);
-        const QByteArray plain = file.read(want);
-        if (plain.size() != want) {
-            *error = QLatin1String("Failed to read file");
-            return false;
+// P4.4/P4.3: 把一个待做本地工作的任务入队。串行：若当前无本地任务则
+// 立即取它，否则排队等待；无论如何都确保泵在跑
+void FileTransferManager::enqueueLocalWork(const QString &token)
+{
+    m_pendingLocalTokens.enqueue(token);
+    if (m_localToken.isEmpty()) {
+        advanceLocalWork();
+    }
+    startLocalPump();
+}
+
+// P4.4/P4.3: 从队列取下一个仍需本地工作的任务作为当前任务（跳过已消失/
+// 已取消/无本地态的）。取不到则清空 m_localToken（泵随后自停）
+void FileTransferManager::advanceLocalWork()
+{
+    m_localToken.clear();
+    while (!m_pendingLocalTokens.isEmpty()) {
+        const QString next = m_pendingLocalTokens.dequeue();
+        const auto it = m_tasks.constFind(next);
+        if (it == m_tasks.constEnd() || it->cancelled) {
+            continue;
         }
-        const QByteArray cipher = FileCrypto::encryptChunk(task.fileKey, task.iv, chunkCount, plain);
+        if (!m_hashStates.contains(next) && !m_saveStates.contains(next)) {
+            continue;
+        }
+        m_localToken = next;
+        return;
+    }
+}
+
+// P4.4/P4.3: 泵回调——推进当前本地任务一个时间片。无可推进任务时停泵
+void FileTransferManager::runLocalSlice()
+{
+    if (m_resetting) {
+        return;
+    }
+    if (m_localToken.isEmpty() || !m_tasks.contains(m_localToken)) {
+        advanceLocalWork();
+    }
+    if (m_localToken.isEmpty()) {
+        if (m_localPump) {
+            m_localPump->stop();
+        }
+        return;
+    }
+    const auto it = m_tasks.find(m_localToken);
+    if (it == m_tasks.end()) {
+        advanceLocalWork();
+        return;
+    }
+    Task &task = it.value();
+    if (task.cancelled) {
+        const QString token = m_localToken;
+        clearLocalStateForToken(token);
+        finishTask(token);
+    } else if (m_hashStates.contains(task.token)) {
+        runHashSlice(task);
+    } else if (m_saveStates.contains(task.token)) {
+        runSaveSlice(task);
+    } else {
+        // 本地态已被清理（意外）：放弃并推进队列
+        clearLocalStateForToken(task.token);
+    }
+    // 本片结束：若仍有本地工作，泵会在下一轮事件循环再次触发；否则停泵
+    if (m_localToken.isEmpty() && m_pendingLocalTokens.isEmpty()) {
+        if (m_localPump) {
+            m_localPump->stop();
+        }
+    }
+}
+
+// P4.4: 推进 hashing 一个时间片。完成后校验分片口径并转入 creating（发
+// uploadCreateRequested）；中途出错则清理并失败。文件句柄首片惰性打开
+void FileTransferManager::runHashSlice(Task &task)
+{
+    HashState *st = m_hashStates.value(task.token);
+    if (!st) {
+        failTask(task.token, QLatin1String("Hashing state was lost"));
+        return;
+    }
+    if (!st->file.isOpen()) {
+        st->file.setFileName(task.localPath);
+        if (!st->file.open(QIODevice::ReadOnly)) {
+            const QString token = task.token;
+            clearLocalStateForToken(token);
+            failTask(token, QLatin1String("Cannot open file for reading"));
+            return;
+        }
+    }
+
+    m_sliceTimer.restart();
+    QString error;
+    bool done = false;
+    // 至少处理一片，随后在时间预算内继续（do-while 保证进度，超预算即让出）。
+    // 加密口径与同步版逐字一致：同密钥/iv/分片序号 → 同密文 → 同整体摘要
+    do {
+        const qint64 want = qMin(st->plainChunk, task.plainSize - st->offset);
+        const QByteArray plain = st->file.read(want);
+        if (plain.size() != want) {
+            error = QLatin1String("Failed to read file");
+            break;
+        }
+        const QByteArray cipher = FileCrypto::encryptChunk(task.fileKey, task.iv, st->chunkCount, plain);
         // 空明文分片也会产出标签，故成功时密文必不为空
         if (cipher.isEmpty()) {
-            *error = QLatin1String("Failed to encrypt file");
-            return false;
+            error = QLatin1String("Failed to encrypt file");
+            break;
         }
-        digest.addData(cipher);
-        cipherSize += cipher.size();
-        offset += want;
-        ++chunkCount;
-        emit taskProgress(task.token, QLatin1String("hashing"), offset, task.plainSize);
-    }
-    file.close();
+        st->digest.addData(cipher);
+        st->cipherSize += cipher.size();
+        st->offset += want;
+        ++st->chunkCount;
+        emit taskProgress(task.token, QLatin1String("hashing"), st->offset, task.plainSize);
+        if (st->offset >= task.plainSize) {
+            done = true;
+            break;
+        }
+    } while (m_sliceTimer.elapsed() < LocalSliceBudgetMs);
 
-    if (cipherSize > Protocol::MaxFileSize) {
-        *error = QLatin1String("File exceeds the maximum size");
-        return false;
+    if (!error.isEmpty()) {
+        const QString token = task.token;
+        clearLocalStateForToken(token);
+        failTask(token, error);
+        return;
     }
-    if (chunkCount > Protocol::MaxChunkCount) {
-        *error = QLatin1String("File has too many chunks");
-        return false;
-    }
-    if (!Protocol::isChunkingValid(cipherSize, task.chunkSize, chunkCount)) {
-        *error = QLatin1String("Chunking parameters are inconsistent");
-        return false;
+    if (!done) {
+        return;  // 时间片用尽，泵的下一轮继续
     }
 
-    task.cipherSize = cipherSize;
-    task.chunkCount = chunkCount;
-    task.sha256Hex = digest.hexDigest();
-    return true;
+    // hashing 完成：校验分片口径（与同步版逐条一致）
+    if (st->cipherSize > Protocol::MaxFileSize) {
+        error = QLatin1String("File exceeds the maximum size");
+    } else if (st->chunkCount > Protocol::MaxChunkCount) {
+        error = QLatin1String("File has too many chunks");
+    } else if (!Protocol::isChunkingValid(st->cipherSize, task.chunkSize, st->chunkCount)) {
+        error = QLatin1String("Chunking parameters are inconsistent");
+    }
+
+    const QString token = task.token;
+    const qint64 cipherSize = st->cipherSize;
+    const int chunkCount = st->chunkCount;
+    const QString sha256Hex = error.isEmpty() ? st->digest.hexDigest() : QString();
+    // 先清理本地态（关闭句柄、复位 m_localToken 并推进队列），再转 creating 发信号：
+    // emit 可能被控制面同步回调（onUploadCreated → pumpUpload），届时本任务已
+    // 不再是本地工作，避免 m_localToken 悬空
+    clearLocalStateForToken(token);
+    if (!error.isEmpty()) {
+        failTask(token, error);
+        return;
+    }
+    const auto tit = m_tasks.find(token);
+    if (tit == m_tasks.end() || tit->cancelled) {
+        return;
+    }
+    Task &t = tit.value();
+    t.cipherSize = cipherSize;
+    t.chunkCount = chunkCount;
+    t.sha256Hex = sha256Hex;
+    t.phase = QLatin1String("creating");
+    emit taskProgress(token, t.phase, 0, t.cipherSize);
+    emit uploadCreateRequested(requestSeq(token), t.cipherSize, t.chunkSize, t.chunkCount,
+                               t.sha256Hex);
+}
+
+// P4.3: 推进另存为一个时间片（逐片解密写目标临时文件）。完成后校验长度并
+// 原子改名到目标、发 fileSaved + 结束任务；缓存损坏/写失败分开处理
+void FileTransferManager::runSaveSlice(Task &task)
+{
+    SaveState *st = m_saveStates.value(task.token);
+    if (!st) {
+        failTask(task.token, QLatin1String("Save state was lost"));
+        return;
+    }
+    if (!st->src.isOpen()) {
+        st->src.setFileName(st->cachePath);
+        if (!st->src.open(QIODevice::ReadOnly)) {
+            const QString token = task.token;
+            clearLocalStateForToken(token);
+            failTask(token, QLatin1String("Cannot read the cached file"));
+            return;
+        }
+    }
+    if (!st->dst.isOpen()) {
+        st->dst.setFileName(st->tmpPath);
+        if (!st->dst.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            const QString token = task.token;
+            const QString tmp = st->tmpPath;
+            clearLocalStateForToken(token);
+            QFile::remove(tmp);
+            failTask(token, QLatin1String("Cannot write the destination file"));
+            return;
+        }
+    }
+
+    const FileManifest mf = st->manifest;
+    m_sliceTimer.restart();
+    bool cacheCorrupt = false;
+    bool destFailed = false;
+    bool done = false;
+    do {
+        const qint64 want = qMin(mf.chunkSize, mf.cipherSize - st->offset);
+        const QByteArray cipher = st->src.read(want);
+        if (cipher.size() != want) {
+            cacheCorrupt = true;
+            break;
+        }
+        const QByteArray plain = FileCrypto::decryptChunk(mf.key, mf.iv, st->index, cipher);
+        // 密文分片恰好只有一个标签长时，明文为空是合法结果；其余情况下
+        // 空返回值意味着 GCM 认证失败（缓存损坏或密钥不符）
+        if (plain.isEmpty() && want > GcmTagSize) {
+            cacheCorrupt = true;
+            break;
+        }
+        if (st->dst.write(plain) != plain.size()) {
+            destFailed = true;
+            break;
+        }
+        st->written += plain.size();
+        st->offset += want;
+        ++st->index;
+        emit taskProgress(task.token, QLatin1String("saving"), st->offset, mf.cipherSize);
+        if (st->offset >= mf.cipherSize) {
+            done = true;
+            break;
+        }
+    } while (m_sliceTimer.elapsed() < LocalSliceBudgetMs);
+
+    // 先把后续需要的值拷出局部，再清理本地态（clearLocalStateForToken 会删 SaveState）
+    const QString token = task.token;
+    const QString tmpPath = st->tmpPath;
+    const QString destPath = st->destPath;
+    const QString cachePath = st->cachePath;
+    const qint64 messageId = task.messageId;
+    const qint64 written = st->written;
+    const qint64 plainSize = mf.plainSize;
+
+    if (cacheCorrupt || destFailed) {
+        // 两类失败分开：缓存损坏（读侧/GCM 失败）删缓存让用户重下；目标写
+        // 失败（磁盘满/无权限）时缓存完好，删它只会迫使重下且大概率再次失败
+        clearLocalStateForToken(token);
+        QFile::remove(tmpPath);
+        if (cacheCorrupt) {
+            QFile::remove(cachePath);
+            emit downloadStateChanged(messageId, QLatin1String("missing"));
+        }
+        failTask(token, destFailed ? QLatin1String("Failed to write the destination file")
+                                   : QLatin1String("Cached file failed the integrity check"));
+        return;
+    }
+    if (!done) {
+        return;  // 时间片用尽，下一轮继续
+    }
+
+    // 完成：先关文件（clearLocalStateForToken），再校验长度并原子改名
+    clearLocalStateForToken(token);
+    if (written != plainSize) {
+        QFile::remove(tmpPath);
+        QFile::remove(cachePath);
+        emit downloadStateChanged(messageId, QLatin1String("missing"));
+        failTask(token, QLatin1String("Saved size does not match the manifest"));
+        return;
+    }
+    if (QFileInfo::exists(destPath)) {
+        QFile::remove(destPath);
+    }
+    if (!QFile::rename(tmpPath, destPath)) {
+        QFile::remove(tmpPath);
+        failTask(token, QLatin1String("Cannot move the saved file into place"));
+        return;
+    }
+    emit fileSaved(messageId, destPath);
+    finishTask(token);
+}
+
+// P4.4/P4.3: 释放某任务的本地中间态。关闭并删除 HashState/SaveState、抹零保存
+// 密钥、复位 m_localToken 并推进队列。cancelTask/finishTask/failTask/reset 与
+// 各切片完成/失败路径均调用，确保 QFile 句柄与明文密钥不残留
+void FileTransferManager::clearLocalStateForToken(const QString &token)
+{
+    if (HashState *st = m_hashStates.take(token)) {
+        if (st->file.isOpen()) {
+            st->file.close();
+        }
+        delete st;
+    }
+    if (SaveState *sv = m_saveStates.take(token)) {
+        if (sv->src.isOpen()) {
+            sv->src.close();
+        }
+        if (sv->dst.isOpen()) {
+            sv->dst.close();
+        }
+        // 保存密钥用后清零（manifest.key 是明文密钥的堆副本）
+        SecureMemory::wipe(sv->manifest.key);
+        delete sv;
+    }
+    if (m_localToken == token) {
+        advanceLocalWork();
+    } else {
+        m_pendingLocalTokens.removeAll(token);
+    }
 }
 
 void FileTransferManager::onUploadCreated(qint64 seq, bool ok, qint64 fileId,
@@ -1018,6 +1330,9 @@ void FileTransferManager::cancelTask(const QString &token)
     task.phase = QLatin1String("cancelling");
     // M8.3b: 如果取消的任务正在提取元数据或在队列中，清理提取状态
     clearExtractionStateForToken(token);
+    // P4.4/P4.3: 若正在做本地工作（hashing/saving），关闭句柄并复位泵队列，
+    // 使随后对 tmpPath 的删除不会因句柄未关而失败
+    clearLocalStateForToken(token);
 
     // 立即中止在途请求，不等它自然结束
     if (m_activeReply && m_activeToken == token) {
@@ -1057,6 +1372,7 @@ QString FileTransferManager::download(qint64 messageId)
     }
 
     Task &t = m_tasks[token];
+    t.fileName = manifest.name;   // P4.1: 横幅展示真实文件名（下载任务此前无名）
     t.sha256Hex = manifest.sha256Hex;
     t.cipherSize = manifest.cipherSize;
     t.chunkSize = manifest.chunkSize;
@@ -1287,88 +1603,55 @@ bool FileTransferManager::finalizeDownload(Task &task, QString *error)
     return true;
 }
 
-bool FileTransferManager::saveToFile(qint64 messageId, const QVariant &destPathOrUrl)
+QString FileTransferManager::saveToFile(qint64 messageId, const QVariant &destPathOrUrl)
 {
     // 同 uploadAndSend：保存对话框给的也是 file URL
     const QString destPath = toLocalPath(destPathOrUrl);
+
+    Task task;
+    task.token = makeToken();
+    task.isUpload = false;
+    task.messageId = messageId;
+    const QString token = task.token;
+    m_tasks.insert(token, task);
+    emit tasksChanged();
+
+    // 校验：清单/缓存/目标路径。任一不满足即同步 failTask（与 uploadAndSend 同口径：
+    // 参数非法也返回 token，便于 UI 统一挂进度并收 taskFailed）
     FileManifest manifest;
     if (!manifestFor(messageId, &manifest)) {
-        return false;
+        failTask(token, QLatin1String("File metadata is not available for this message"));
+        return token;
     }
     const QString cachePath = cachePathFor(manifest.sha256Hex);
     if (!isCached(manifest.sha256Hex, manifest.cipherSize)) {
-        return false;  // UI 应先触发 download
+        failTask(token, QLatin1String("File is not downloaded yet"));  // UI 应先触发 download
+        return token;
     }
     if (destPath.isEmpty()) {
-        return false;
+        failTask(token, QLatin1String("Invalid destination path"));
+        return token;
     }
 
-    QFile src(cachePath);
-    if (!src.open(QIODevice::ReadOnly)) {
-        return false;
-    }
-    // 明文只写用户显式选择的目标路径，且经临时文件 + 改名，避免半截明文
-    const QString tmpPath = destPath + QLatin1String(".xysaving");
-    QFile dst(tmpPath);
-    if (!dst.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        src.close();
-        return false;
-    }
+    // P4.3: 建 SaveState（文件句柄在首个切片惰性打开），入本地泵队列由时间片
+    // 增量解密写盘。明文只写目标临时文件，完成后原子改名，避免半截明文
+    auto *st = new SaveState;
+    st->destPath = destPath;
+    st->cachePath = cachePath;
+    st->tmpPath = destPath + QLatin1String(".xysaving");
+    st->manifest = manifest;
+    m_saveStates.insert(token, st);
 
-    qint64 offset = 0;
-    qint64 written = 0;
-    int index = 0;
-    // 两类失败必须分开：缓存损坏（读侧/GCM 认证失败）应当删缓存让用户重下；
-    // 目标写失败（磁盘满/无权限/被杀软锁定）时缓存是完好的，删它只会
-    // 迫使重下整个文件且大概率再次失败
-    bool cacheCorrupt = false;
-    bool destFailed = false;
-    while (offset < manifest.cipherSize) {
-        const qint64 want = qMin(manifest.chunkSize, manifest.cipherSize - offset);
-        const QByteArray cipher = src.read(want);
-        if (cipher.size() != want) {
-            cacheCorrupt = true;
-            break;
-        }
-        const QByteArray plain = FileCrypto::decryptChunk(manifest.key, manifest.iv, index, cipher);
-        // 密文分片恰好只有一个标签长时，明文为空是合法结果；其余情况下
-        // 空返回值意味着 GCM 认证失败（缓存损坏或密钥不符）
-        if (plain.isEmpty() && want > GcmTagSize) {
-            cacheCorrupt = true;
-            break;
-        }
-        if (dst.write(plain) != plain.size()) {
-            destFailed = true;
-            break;
-        }
-        written += plain.size();
-        offset += want;
-        ++index;
-        // 本函数为同步实现（逐片解密直写目标文件），不归属于任何传输任务，
-        // 因此不发 taskProgress。大文件保存会短时阻塞调用线程，已登记为欠账
-    }
-    src.close();
-    dst.close();
-
-    if (cacheCorrupt || destFailed || written != manifest.plainSize) {
-        dst.remove();
-        if (cacheCorrupt || written != manifest.plainSize) {
-            // 缓存已损坏（GCM 认证失败或长度不符）：删掉它并把状态改回缺失，
-            // 让 UI 重新下载，否则用户会反复撞上同一个坏文件
-            QFile::remove(cachePath);
-            emit downloadStateChanged(messageId, QLatin1String("missing"));
-        }
-        return false;
-    }
-    if (QFileInfo::exists(destPath)) {
-        QFile::remove(destPath);
-    }
-    if (!QFile::rename(tmpPath, destPath)) {
-        QFile::remove(tmpPath);
-        return false;
-    }
-    emit fileSaved(messageId, destPath);
-    return true;
+    Task &t = m_tasks[token];
+    t.phase = QLatin1String("saving");
+    t.fileName = manifest.name;   // 横幅展示真实文件名
+    t.cipherSize = manifest.cipherSize;
+    t.chunkSize = manifest.chunkSize;
+    t.plainSize = manifest.plainSize;
+    t.tmpPath = st->tmpPath;      // 便于 cancel/finish/fail 统一清理半截明文
+    emit taskProgress(token, t.phase, 0, manifest.cipherSize);
+    enqueueLocalWork(token);
+    return token;
 }
 
 void FileTransferManager::reset()
@@ -1378,6 +1661,33 @@ void FileTransferManager::reset()
     // m_activeReply 必须在此显式复位（不能只依赖回调）：否则残留非空会
     // 使 pumpNext 永远早退，新会话里所有传输都卡死
     m_resetting = true;
+    // P4.4/P4.3: 先停本地泵并释放 hashing/save 中间态（关闭 QFile 句柄），
+    // 使随后的任务循环能顺利删除保存临时文件（Windows 下打开的文件删不掉）
+    if (m_localPump) {
+        m_localPump->stop();
+    }
+    m_localToken.clear();
+    m_pendingLocalTokens.clear();
+    for (auto hit = m_hashStates.begin(); hit != m_hashStates.end(); ++hit) {
+        HashState *st = hit.value();
+        if (st->file.isOpen()) {
+            st->file.close();
+        }
+        delete st;
+    }
+    m_hashStates.clear();
+    for (auto sit = m_saveStates.begin(); sit != m_saveStates.end(); ++sit) {
+        SaveState *sv = sit.value();
+        if (sv->src.isOpen()) {
+            sv->src.close();
+        }
+        if (sv->dst.isOpen()) {
+            sv->dst.close();
+        }
+        SecureMemory::wipe(sv->manifest.key);
+        delete sv;
+    }
+    m_saveStates.clear();
     for (auto it = m_tasks.begin(); it != m_tasks.end(); ++it) {
         it->cancelled = true;
         if (!it->tmpPath.isEmpty()) {
@@ -1442,6 +1752,9 @@ void FileTransferManager::finishTask(const QString &token)
     // M8.3b: 清理提取状态（防御性：finishTask 通常在任务完成后调用，
     // 此时已过 extracting 阶段，但意外路径下可能仍有悬空 token）
     clearExtractionStateForToken(tokenCopy);
+    // P4.4/P4.3: 关闭并释放本地工作中间态（hashing/save 的 QFile 句柄与密钥）。
+    // 必须在删 tmpPath 之前：Windows 下句柄未关时临时文件删不掉
+    clearLocalStateForToken(tokenCopy);
     SecureMemory::wipe(it->fileKey);
     if (!it->tmpPath.isEmpty()) {
         QFile::remove(it->tmpPath);
@@ -1463,6 +1776,8 @@ void FileTransferManager::failTask(const QString &token, const QString &error)
     const QString tokenCopy = token;
     // M8.3b: 同 finishTask，清理提取状态
     clearExtractionStateForToken(tokenCopy);
+    // P4.4/P4.3: 同 finishTask，关闭并释放本地工作中间态（先于删 tmpPath）
+    clearLocalStateForToken(tokenCopy);
     SecureMemory::wipe(it->fileKey);
     if (!it->tmpPath.isEmpty()) {
         QFile::remove(it->tmpPath);

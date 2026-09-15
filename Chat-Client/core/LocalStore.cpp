@@ -964,6 +964,89 @@ bool LocalStore::clearDecryptedContent(qint64 messageId)
     return query.exec();
 }
 
+// M10: 会话整表删除——清除该会话的全部本地缓存。顺序：先按子查询清解密
+// 缓存（依赖 messages 定位），再清消息、群 Sender Key/跳过密钥、在途 outbox，最后删会话行
+bool LocalStore::deleteConversation(qint64 conversationId)
+{
+    if (!ensureUsableDb() || conversationId <= 0) {
+        return false;
+    }
+    // 全部本地缓存清除尽量在同一事务内完成：不得出现“消息已删而会话行遗留”
+    // 或“会话已删而群密钥材料残留”的半清理状态；事务不可用时仍按非事务
+    // 方式尽力清理（清理可达性优先于原子性，与 removeSenderKeysForGroup 同范式）
+    const bool useTransaction = m_db.transaction();
+    if (!useTransaction) {
+        qWarning() << "[LocalStore] deleteConversation without transaction:"
+                   << m_db.lastError().text();
+    }
+    bool ok = true;
+
+    QSqlQuery dec(m_db);
+    dec.prepare("DELETE FROM decrypt_cache WHERE message_id IN "
+                "(SELECT message_id FROM messages WHERE conversation_id = ?)");
+    dec.addBindValue(conversationId);
+    if (!dec.exec()) {
+        qWarning() << "[LocalStore] deleteConversation decrypt_cache failed:"
+                   << dec.lastError().text();
+        ok = false;
+    }
+
+    QSqlQuery msg(m_db);
+    msg.prepare("DELETE FROM messages WHERE conversation_id = ?");
+    msg.addBindValue(conversationId);
+    if (!msg.exec()) {
+        qWarning() << "[LocalStore] deleteConversation messages failed:"
+                   << msg.lastError().text();
+        ok = false;
+    }
+
+    // 群会话的 Sender Key 与跳过密钥（group_id 即会话 ID；私聊无对应行，exec 0 行）。
+    // 密钥材料删除失败不得静默吞掉（残留本地密钥属泄露面），纳入 ok 判定
+    QSqlQuery keys(m_db);
+    keys.prepare("DELETE FROM sender_keys WHERE group_id = ?");
+    keys.addBindValue(conversationId);
+    if (!keys.exec()) {
+        qWarning() << "[LocalStore] deleteConversation sender_keys failed:"
+                   << keys.lastError().text();
+        ok = false;
+    }
+    QSqlQuery skipped(m_db);
+    skipped.prepare("DELETE FROM sender_key_skipped WHERE group_id = ?");
+    skipped.addBindValue(conversationId);
+    if (!skipped.exec()) {
+        qWarning() << "[LocalStore] deleteConversation sender_key_skipped failed:"
+                   << skipped.lastError().text();
+        ok = false;
+    }
+
+    // 在途 outbox（群消息按 conversation_id 关联；私聊 outbox conversation_id=0，不在此清）
+    QSqlQuery outbox(m_db);
+    outbox.prepare("DELETE FROM outbox WHERE conversation_id = ?");
+    outbox.addBindValue(conversationId);
+    if (!outbox.exec()) {
+        qWarning() << "[LocalStore] deleteConversation outbox failed:"
+                   << outbox.lastError().text();
+        ok = false;
+    }
+
+    QSqlQuery conv(m_db);
+    conv.prepare("DELETE FROM conversations WHERE conversation_id = ?");
+    conv.addBindValue(conversationId);
+    if (!conv.exec()) {
+        qWarning() << "[LocalStore] deleteConversation conversations failed:"
+                   << conv.lastError().text();
+        ok = false;
+    }
+
+    if (!ok) {
+        if (useTransaction) {
+            m_db.rollback();
+        }
+        return false;
+    }
+    return useTransaction ? m_db.commit() : true;
+}
+
 int LocalStore::importLegacyDecryptCache(const QString &username, const QString &deviceId)
 {
     if (!m_open) {

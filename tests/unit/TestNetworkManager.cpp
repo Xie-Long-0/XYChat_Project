@@ -386,6 +386,160 @@ private slots:
         QVERIFY(!undecryptable.value("isFileMessage").toBool());
         QVERIFY(!nm.m_fileTransfer->m_incoming.contains(1006));
     }
+
+    // M10：“正在输入”推送透传——conversationId>0 时发射 typingReceived（携发起者信息），
+    // 畸形推送（conversationId<=0）忽略不发射
+    void typingNotificationEmitsSignal()
+    {
+        NetworkManager nm;
+        QSignalSpy typingSpy(&nm, &NetworkManager::typingReceived);
+
+        Packet ok;
+        ok.messageType = MessageType::TypingNotification;
+        ok.requestId = 0;
+        ok.payload = payloadBytes(QJsonObject{
+            {"conversationId", 5}, {"userId", 9},
+            {"username", "bob"}, {"typing", true}});
+        nm.handleTypingNotification(ok);
+        QCOMPARE(typingSpy.count(), 1);
+        const QList<QVariant> args = typingSpy.takeFirst();
+        QCOMPARE(args.at(0).toLongLong(), qint64(5));   // conversationId
+        QCOMPARE(args.at(1).toLongLong(), qint64(9));   // userId
+        QCOMPARE(args.at(2).toString(), "bob");         // username
+        QCOMPARE(args.at(3).toBool(), true);            // typing
+
+        // 畸形推送：conversationId<=0 忽略
+        Packet bad;
+        bad.messageType = MessageType::TypingNotification;
+        bad.requestId = 0;
+        bad.payload = payloadBytes(QJsonObject{{"conversationId", 0}, {"userId", 9}});
+        nm.handleTypingNotification(bad);
+        QCOMPARE(typingSpy.count(), 0);
+    }
+
+    // M10：sendTyping 客户端节流与前置校验（三条路径均在 sendPacket 前返回，无需 socket）：
+    // ① 未认证：直接返回，不记录节流时间戳
+    // ② conversationId<=0：直接返回
+    // ③ 窗口内（<4s）重复 typing=true：提前返回，时间戳不变（证明未进入发送路径）
+    void sendTypingGuardsAndThrottle()
+    {
+        NetworkManager anon;
+        anon.sendTyping(5, true);
+        QVERIFY(anon.m_lastTypingSentMs.isEmpty());
+
+        NetworkManager nm;
+        nm.m_state = NetworkManager::ConnectionState::Authenticated;
+        nm.sendTyping(0, true);                       // 非法会话 ID
+        QVERIFY(!nm.m_lastTypingSentMs.contains(0));
+
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        nm.m_lastTypingSentMs[5] = nowMs;             // 预置“刚发送过”
+        nm.sendTyping(5, true);                       // 窗口内 → 提前返回
+        QCOMPARE(nm.m_lastTypingSentMs[5], nowMs);    // 时间戳未变
+    }
+
+    // M10：会话删除响应——requestId 命中才处理；Ok 发射 conversationDeleted 并清在途，
+    // 非 Ok 发射 conversationDeleteFailed（LocalStore 未开，缓存清理分支被安全跳过）。
+    // 在途请求为 requestId→conversationId 多槽映射：并发双删除时后发请求不覆盖前一个，
+    // 两个响应乱序到达均能各自命中（P1 回归锁定：单值实现会丢失首个删除且不自愈）
+    void deleteConversationResponseMatchesPending()
+    {
+        NetworkManager nm;
+        // 并发两个在途删除：33→会话5、44→会话6（后发的 44 不得覆盖 33）
+        nm.m_pendingDeleteConversationRequests.insert(33, 5);
+        nm.m_pendingDeleteConversationRequests.insert(44, 6);
+        QSignalSpy deletedSpy(&nm, &NetworkManager::conversationDeleted);
+        QSignalSpy failedSpy(&nm, &NetworkManager::conversationDeleteFailed);
+
+        // 不匹配的 requestId：忽略，两个在途均未消费
+        Packet mismatch;
+        mismatch.messageType = MessageType::DeleteConversationResponse;
+        mismatch.requestId = 99;
+        QJsonObject mj;
+        mj["code"] = static_cast<int>(ErrorCode::Ok);
+        mj["data"] = QJsonObject{{"conversationId", 5}};
+        mismatch.payload = payloadBytes(mj);
+        nm.handleDeleteConversationResponse(mismatch);
+        QCOMPARE(deletedSpy.count(), 0);
+        QCOMPARE(nm.m_pendingDeleteConversationRequests.size(), 2);
+
+        // 先回后发的 44（乱序）：命中并消费 44，33 仍在途（未被覆盖丢失）
+        Packet ok44;
+        ok44.messageType = MessageType::DeleteConversationResponse;
+        ok44.requestId = 44;
+        QJsonObject oj44;
+        oj44["code"] = static_cast<int>(ErrorCode::Ok);
+        oj44["data"] = QJsonObject{{"conversationId", 6}};
+        ok44.payload = payloadBytes(oj44);
+        nm.handleDeleteConversationResponse(ok44);
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(deletedSpy.takeFirst().at(0).toLongLong(), qint64(6));
+        QVERIFY(!nm.m_pendingDeleteConversationRequests.contains(44));
+        QVERIFY(nm.m_pendingDeleteConversationRequests.contains(33));
+
+        // 再回先发的 33：命中并消费；响应 data 故意不带 conversationId，
+        // 验证回退到在途登记值（不依赖服务端回传）
+        Packet ok33;
+        ok33.messageType = MessageType::DeleteConversationResponse;
+        ok33.requestId = 33;
+        QJsonObject oj33;
+        oj33["code"] = static_cast<int>(ErrorCode::Ok);
+        oj33["data"] = QJsonObject{};
+        ok33.payload = payloadBytes(oj33);
+        nm.handleDeleteConversationResponse(ok33);
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(deletedSpy.takeFirst().at(0).toLongLong(), qint64(5));
+        QVERIFY(nm.m_pendingDeleteConversationRequests.isEmpty());
+
+        // 错误码：发射 conversationDeleteFailed 并消费在途
+        nm.m_pendingDeleteConversationRequests.insert(55, 7);
+        Packet err;
+        err.messageType = MessageType::DeleteConversationResponse;
+        err.requestId = 55;
+        QJsonObject ej;
+        ej["code"] = static_cast<int>(ErrorCode::PermissionDenied);
+        ej["message"] = "Only the group owner can delete";
+        err.payload = payloadBytes(ej);
+        nm.handleDeleteConversationResponse(err);
+        QCOMPARE(failedSpy.count(), 1);
+        QVERIFY(!nm.m_pendingDeleteConversationRequests.contains(55));
+    }
+
+    // M10：会话删除推送——发起设备（operatorId+originDeviceId 同时命中）去重，
+    // 他人（不同 operatorId）正常发射 conversationDeleted；畸形推送忽略
+    void conversationDeletedNotificationDedupsOwnOrigin()
+    {
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_localDeviceId = "devA";
+        QSignalSpy deletedSpy(&nm, &NetworkManager::conversationDeleted);
+
+        Packet own;
+        own.messageType = MessageType::ConversationDeletedNotification;
+        own.requestId = 0;
+        own.payload = payloadBytes(QJsonObject{
+            {"conversationId", 5}, {"operatorId", 7}, {"originDeviceId", "devA"}});
+        nm.handleConversationDeletedNotification(own);
+        QCOMPARE(deletedSpy.count(), 0);  // 本端其他设备发起，去重
+
+        // 同机不同账号（deviceId 相同但 operatorId 不同）不得被误去重
+        Packet foreignSameDevice;
+        foreignSameDevice.messageType = MessageType::ConversationDeletedNotification;
+        foreignSameDevice.requestId = 0;
+        foreignSameDevice.payload = payloadBytes(QJsonObject{
+            {"conversationId", 6}, {"operatorId", 8}, {"originDeviceId", "devA"}});
+        nm.handleConversationDeletedNotification(foreignSameDevice);
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(deletedSpy.takeFirst().at(0).toLongLong(), qint64(6));
+
+        // 畸形推送：conversationId<=0 忽略
+        Packet bad;
+        bad.messageType = MessageType::ConversationDeletedNotification;
+        bad.requestId = 0;
+        bad.payload = payloadBytes(QJsonObject{{"conversationId", 0}, {"operatorId", 8}});
+        nm.handleConversationDeletedNotification(bad);
+        QCOMPARE(deletedSpy.count(), 0);
+    }
 };
 
 QTEST_GUILESS_MAIN(TestNetworkManager)

@@ -197,6 +197,7 @@ void NetworkManager::onDisconnected()
     // 回退乐观态（编辑/删除无 outbox 重发兜底）
     const int pendingEditFailures = m_pendingEdits.size() + m_privateEditQueue.size();
     const int pendingDeleteFailures = m_pendingDeleteRequestIds.size();
+    const int pendingConvDeleteFailures = m_pendingDeleteConversationRequests.size();
     m_pendingEdits.clear();
     // M8.2: 中止在途传输并清零已登记的清单密钥（含文件密钥，不得跨会话驻留）。
     // 登出与断线是两条独立路径，两处都必须清（同 M9 编辑泵的教训）
@@ -206,11 +207,17 @@ void NetworkManager::onDisconnected()
     m_privateEditQueue.clear();
     m_editFetchInFlight = false;
     m_pendingDeleteRequestIds.clear();
+    // M10：清空在途会话删除请求与 typing 节流状态（同 M9，两处都必须清）
+    m_pendingDeleteConversationRequests.clear();
+    m_lastTypingSentMs.clear();
     for (int i = 0; i < pendingEditFailures; ++i) {
         emit messageEditFailed("Connection lost");
     }
     for (int i = 0; i < pendingDeleteFailures; ++i) {
         emit messageDeleteFailed("Connection lost");
+    }
+    for (int i = 0; i < pendingConvDeleteFailures; ++i) {
+        emit conversationDeleteFailed("Connection lost");
     }
     setState(ConnectionState::Disconnected);
 
@@ -526,6 +533,20 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::MessageDeletedNotification:
         handleMessageDeletedNotification(packet);
         break;
+    // M10：“正在输入”推送与响应。响应仅用于服务端限流/错误回执，
+    // 客户端即发即忘，无需处理（显式忽略，避免落入 default 造成语义不明）
+    case MessageType::TypingNotification:
+        handleTypingNotification(packet);
+        break;
+    case MessageType::TypingResponse:
+        break;
+    // M10: 会话整表删除（响应 + 推送）
+    case MessageType::DeleteConversationResponse:
+        handleDeleteConversationResponse(packet);
+        break;
+    case MessageType::ConversationDeletedNotification:
+        handleConversationDeletedNotification(packet);
+        break;
     // M8.2: 文件控制面响应（数据面走 HTTP，不经此处）
     case MessageType::FileUploadCreateResponse:
         handleFileUploadCreateResponse(packet);
@@ -738,6 +759,9 @@ void NetworkManager::resetAuthState()
     m_privateEditQueue.clear();
     m_editFetchInFlight = false;
     m_pendingDeleteRequestIds.clear();
+    // M10：清空在途会话删除请求与 typing 节流状态（同 M9 两处都必须清）
+    m_pendingDeleteConversationRequests.clear();
+    m_lastTypingSentMs.clear();
     XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
     m_identityKey = {};
     for (auto &pk : m_localPrekeys) {
@@ -2168,6 +2192,57 @@ void NetworkManager::ackMessage(qint64 messageId, const QString &status)
     sendPacket(packet);
 }
 
+// M10：发送“正在输入”信号。typing=true 每会话节流 4s（避免每次按键发包），
+// typing=false（停止）不节流。即发即忘：不跟踪 pending requestId，
+// 服务端 TypingResponse 仅用于限流/错误回执，客户端不消费
+void NetworkManager::sendTyping(qint64 conversationId, bool typing)
+{
+    if (m_state != ConnectionState::Authenticated || conversationId <= 0) {
+        return;
+    }
+    if (typing) {
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const auto it = m_lastTypingSentMs.constFind(conversationId);
+        if (it != m_lastTypingSentMs.constEnd() && nowMs - it.value() < TypingThrottleMs) {
+            return;
+        }
+        m_lastTypingSentMs[conversationId] = nowMs;
+    }
+
+    QJsonObject json;
+    json["type"] = "typing";
+    json["conversationId"] = conversationId;
+    json["typing"] = typing;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::TypingRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    sendPacket(packet);
+}
+
+// M10: 请求整表删除会话（服务端硬删除）。成功后经响应清本地缓存并 emit
+// conversationDeleted；其他成员/设备的删除经 ConversationDeletedNotification
+void NetworkManager::deleteConversation(qint64 conversationId)
+{
+    if (m_state != ConnectionState::Authenticated || conversationId <= 0) {
+        return;
+    }
+
+    QJsonObject json;
+    json["type"] = "delete_conversation";
+    json["conversationId"] = conversationId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::DeleteConversationRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingDeleteConversationRequests.insert(packet.requestId, conversationId);
+    sendPacket(packet);
+}
+
 // M3: 同步消息
 void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int limit)
 {
@@ -3403,6 +3478,76 @@ void NetworkManager::applyConversationPrefs(qint64 conversationId, bool pinned, 
         emit conversationsResult(m_localStore.loadConversations());
     }
     emit conversationPrefsChanged(conversationId, pinned, muted);
+}
+
+// M10: “正在输入”推送。服务端已按会话 fan-out 并排除发起者，此处直接透传给 UI；
+// 瞬时状态不落本地缓存、不写事件流。conversationId<=0 的畸形推送忽略
+void NetworkManager::handleTypingNotification(const Packet &packet)
+{
+    const QJsonObject payload = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 conversationId = payload.value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        return;
+    }
+    const qint64 userId = payload.value("userId").toVariant().toLongLong();
+    const QString username = payload.value("username").toString();
+    const bool typing = payload.value("typing").toBool(true);
+    emit typingReceived(conversationId, userId, username, typing);
+}
+
+// M10: 会话删除响应。按 requestId 命中在途请求即处理（多槽支持并发删除）；
+// conversationId 以在途登记的本地值为准，响应 data 缺失也可靠
+void NetworkManager::handleDeleteConversationResponse(const Packet &packet)
+{
+    const quint64 rid = packet.requestId;
+    if (rid == 0 || !m_pendingDeleteConversationRequests.contains(rid)) {
+        return;
+    }
+    const qint64 pendingConvId = m_pendingDeleteConversationRequests.take(rid);
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
+    if (code != static_cast<int>(ErrorCode::Ok)) {
+        emit conversationDeleteFailed(
+            response.value("message").toString("Failed to delete conversation"));
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        conversationId = pendingConvId;
+    }
+    if (conversationId <= 0) {
+        return;
+    }
+    if (m_localStore.isOpen()) {
+        m_localStore.deleteConversation(conversationId);
+    }
+    emit conversationDeleted(conversationId);
+}
+
+// M10: 会话删除推送（其他成员删除，或本人其他设备删除）。发起设备去重后
+// 清本地缓存并通知 UI 移除会话
+void NetworkManager::handleConversationDeletedNotification(const Packet &packet)
+{
+    const QJsonObject data = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        return;
+    }
+    // 发起设备不回显自身操作（本端已在响应路径处理）。deviceId 是机器级，
+    // 须连同 operatorId 一并比对，避免同机多账号误跳过
+    const qint64 operatorId = data.value("operatorId").toVariant().toLongLong();
+    const QString originDeviceId = data.value("originDeviceId").toString();
+    if (operatorId == m_userId && !originDeviceId.isEmpty()
+        && originDeviceId == m_localDeviceId) {
+        return;
+    }
+    if (m_localStore.isOpen()) {
+        m_localStore.deleteConversation(conversationId);
+    }
+    emit conversationDeleted(conversationId);
 }
 
 // ── M9 特性栈：消息编辑/删除 ──
