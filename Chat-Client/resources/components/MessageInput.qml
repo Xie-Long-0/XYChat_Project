@@ -105,7 +105,8 @@ Rectangle {
                     Behavior on border.color { ColorAnimation { duration: Theme.animationFast } }
                 }
 
-                Keys.onReturnPressed: {
+                // Qt 6.8+：信号处理器的隐式参数注入已废弃，必须用带形参的箭头函数显式接收 event
+                Keys.onReturnPressed: (event) => {
                     if (event.modifiers & Qt.ShiftModifier) {
                         inputField.insert(inputField.cursorPosition, "\n")
                     } else {
@@ -114,7 +115,7 @@ Rectangle {
                     event.accepted = true
                 }
 
-                Keys.onEnterPressed: {
+                Keys.onEnterPressed: (event) => {
                     if (event.modifiers & Qt.ShiftModifier) {
                         inputField.insert(inputField.cursorPosition, "\n")
                     } else {
