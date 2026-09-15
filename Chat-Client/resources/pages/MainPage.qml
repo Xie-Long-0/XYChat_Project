@@ -674,6 +674,7 @@ Rectangle {
     }
 
     function openCreatedGroup(conversationId, name) {
+        convList.beginLoading()
         loadConversationsRequested()
         currentConversationId = conversationId
         currentConversationType = "group"
@@ -698,6 +699,7 @@ Rectangle {
             chatView.clearMessages()
             convList.selectedIndex = -1
         }
+        convList.beginLoading()
         loadConversationsRequested()
     }
 

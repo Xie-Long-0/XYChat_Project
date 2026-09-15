@@ -107,6 +107,17 @@ FileManifest decodeFileManifest(const QString &json, bool *ok = nullptr);
 // 快速判断一段已解密正文是否为文件清单（只看标记字段，不校验完整性）
 bool looksLikeFileManifest(const QString &content);
 
+// 文件清单转可展示的预览摘要："[File] 文件名"，解析失败退化为 "[File]"。
+//
+// 存在的意义是**消灭重复的真相源**：客户端有两处需要把"最后一条消息的正文"
+// 变成会话列表预览——NetworkManager::conversationPreviewFor（服务端下发与
+// 实时推送两条路径）与 LocalStore::loadConversations（本地缓存回填）。清单里含
+// 32 字节文件密钥，映射一旦在某处漏做，含密钥的 JSON 就会直接显示在会话列表上
+// （这是实际发生过的 bug）。故实现只保留这一处，两处调用点都改为调用它。
+// 调用前应自行确认 content 确实是清单（looksLikeFileManifest）；本函数对
+// 非清单输入不负责判别，只会因解析失败返回 "[File]"
+QString filePreviewText(const QString &content);
+
 // 分片数学：客户端加密/续传与服务端校验共用，确保两侧算出的分片数一致
 
 // 密文分片数 = ceil(cipherSize / chunkSize)；参数非法时返回 0

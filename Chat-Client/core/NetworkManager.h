@@ -117,6 +117,10 @@ signals:
     void messageSent(qint64 messageId, qint64 conversationId, const QString &clientMessageId);
     void messageSendFailed(const QString &error);
     void newMessageReceived(const QJsonObject &message);
+    // M8.2: 本人发出的文件消息在服务端确认后的本地回显（脱敏后的 UI 对象）。
+    // 与 newMessageReceived 分开：那是"服务端推送给我的他人消息"，
+    // 拿到后要回已读回执；本条是自己发的，不需要也不该给自己发回执
+    void fileMessageSent(const QJsonObject &message);
     void messagesSynced(qint64 conversationId, const QJsonArray &messages, bool hasMore);
     void messageAcked(qint64 messageId);
     // M5.5
@@ -283,6 +287,16 @@ private:
     // 兼作兜底防线：即使 fileId 缺失或清单解析失败，只要正文形态像清单就置空
     void sanitizeForUi(QJsonObject &message);
     QJsonArray sanitizeArrayForUi(const QJsonArray &messages);
+    // M8.2: 文件消息（正文是清单）发送确认后的本地回显：通过 attachFileInfo
+    // 补登记清单到传输引擎，并把脱敏后的消息对象 emit fileMessageSent 给 QML
+    // 立即插入气泡。clientMessageId 未命中在途登记（普通文本消息）时不做任何事
+    void echoSentFileMessage(const QString &clientMessageId, qint64 messageId,
+                             qint64 conversationId);
+    // M8.2: 会话预览文本的统一出口。密文（私聊 envelope / 群 envelope /
+    // sender_key_distribution）转占位、群系统消息的结构化 JSON 转摘要、
+    // 文件清单转 "[File] 文件名"。清单里有 32 字节文件密钥，绝不能作为预览
+    // 文本落到 UI 或本地库（会话列表会直接显示 lastMessage）
+    static QString conversationPreviewFor(const QString &content);
     void emitCachedConversations();
     // 将 sync_events 事件写入本地缓存并推进游标（hasMore 时自动续拉）
     void ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, bool hasMore);
@@ -409,4 +423,8 @@ private:
     XYChat::Client::FileTransferManager *m_fileTransfer = nullptr;
     // TCP requestId -> 传输引擎的 seq（响应到达时反查，用后即删）
     QHash<qint64, qint64> m_fileSeqByRequestId;
+    // M8.2: 在途的文件消息发送：clientMessageId -> 清单 JSON（含文件密钥）。
+    // 清单要留到发送确认到达才能补登记到传输引擎（登记键是 messageId），
+    // 同时用于给 QML 回显文件气泡。登出/断线随 resetAuthState 清空
+    QHash<QString, QString> m_pendingFileSends;
 };

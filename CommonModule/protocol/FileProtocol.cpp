@@ -186,6 +186,18 @@ bool looksLikeFileManifest(const QString &content)
     return content.contains("\"kind\":\"file\"") && content.contains("\"cipherSize\":");
 }
 
+QString filePreviewText(const QString &content)
+{
+    // 只取文件名，绝不回落成清单原文：清单含 32 字节文件密钥，字符串一旦进入
+    // JS 堆或本地库就无法可靠清零（见 FileProtocol.h 里本函数的说明）
+    bool ok = false;
+    const FileManifest manifest = decodeFileManifest(content, &ok);
+    if (!ok || manifest.name.isEmpty()) {
+        return QStringLiteral("[File]");
+    }
+    return QStringLiteral("[File] ") + manifest.name;
+}
+
 int chunkCountFor(qint64 cipherSize, qint64 chunkSize)
 {
     // 先夹住取值区间再运算：MaxFileSize + MaxChunkSize 远小于 qint64 上界，

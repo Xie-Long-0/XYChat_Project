@@ -14,10 +14,13 @@
 #include "KeyStorage.h"
 #include "encryption/E2eeCrypto.h"
 #include "encryption/GroupE2eeCrypto.h"
+#include "protocol/FileProtocol.h"
 #include "security/SecureMemory.h"
 
 using XYChat::Security::E2eeCrypto;
 using XYChat::Security::GroupE2eeCrypto;
+using XYChat::Protocol::filePreviewText;
+using XYChat::Protocol::looksLikeFileManifest;
 using XYChat::Security::SecureMemory;
 
 namespace
@@ -866,6 +869,13 @@ QJsonArray LocalStore::loadConversations() const
             || GroupE2eeCrypto::looksLikeDistribution(lastMsg)) {
             const QString cached = loadDecryptedContent(lastMsgId);
             lastMsg = cached.isEmpty() ? QLatin1String("[Encrypted message]") : cached;
+        }
+        // M8.2 同类拦截：文件消息的"明文"就是清单本身（含 32 字节文件密钥），
+        // 若被当作预览写进本地库，会话列表会直接显示一串含密钥的 JSON。
+        // 映射实现只在 Protocol::filePreviewText 一处（与 NetworkManager 的
+        // conversationPreviewFor 共用），避免两侧各写一份而漂移
+        if (looksLikeFileManifest(lastMsg)) {
+            lastMsg = filePreviewText(lastMsg);
         }
         conv["lastMessage"] = lastMsg;
         conv["lastMessageId"] = lastMsgId;

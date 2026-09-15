@@ -188,6 +188,9 @@ void NetworkManager::onDisconnected()
     m_pendingFetchGroupKeysRequestId = 0;
     m_fetchGroupKeysTargetConvId = 0;
     m_pendingGroupDistributions.clear();
+    // M8.2: 在途文件消息携带清单（含 32 字节文件密钥），不得跨会话驻留
+    //（登出与断线两条路径都必须清，同 M9 编辑泵的教训）
+    m_pendingFileSends.clear();
     m_groupSenderKeys.clear();
     m_healQueue.clear();
     // M9 欠账修复：在途编辑/删除随连接失效。必须复位 m_editFetchInFlight
@@ -747,6 +750,9 @@ void NetworkManager::resetAuthState()
     m_pendingFetchGroupKeysRequestId = 0;
     m_fetchGroupKeysTargetConvId = 0;
     m_pendingGroupDistributions.clear();
+    // M8.2: 在途文件消息携带清单（含 32 字节文件密钥），不得跨会话驻留
+    //（登出与断线两条路径都必须清，同 M9 编辑泵的教训）
+    m_pendingFileSends.clear();
     m_groupSenderKeys.clear();
     m_healQueue.clear();
     // M9 欠账修复：清空在途编辑/删除状态与等待密钥的私聊编辑队列
@@ -2315,31 +2321,23 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
-        // M6: 会话预览中的 envelope 密文替换为占位文本
+        // M6/M8.2: 会话预览经统一出口脱敏（密文转占位、系统消息转摘要、
+        // 文件清单转 "[File] 文件名"）
         QJsonArray conversations =
             response.value("data").toObject().value("conversations").toArray();
         for (QJsonValueRef value : conversations) {
             QJsonObject conv = value.toObject();
             const QString lastMessage = conv.value("lastMessage").toString();
-            // 密文预览一律替换为占位：私聊 pairwise envelope + 群 e2ee_group +
-            // sender_key_distribution。群 envelope 是 JSON（type=group_e2ee），
-            // 此前只识别 pairwise envelope，导致群密文 JSON 被当作正文直接展示
-            if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(lastMessage)
-                || GroupE2eeCrypto::looksLikeGroupMessage(lastMessage)
-                || GroupE2eeCrypto::looksLikeDistribution(lastMessage)) {
-                conv["lastMessage"] = "[Encrypted message]";
-                value = conv;
-                continue;
-            }
-            // M7a: 群系统消息预览（结构化 JSON）转为可读摘要
-            const QJsonObject sysObj = QJsonDocument::fromJson(lastMessage.toUtf8()).object();
-            if (!sysObj.isEmpty() && sysObj.contains("event")) {
-                conv["lastMessage"] = systemMessageSummary(lastMessage);
+            const QString preview = conversationPreviewFor(lastMessage);
+            if (preview != lastMessage) {
+                conv["lastMessage"] = preview;
                 value = conv;
             }
         }
         // M6.5: 服务端权威会话数据写入本地缓存；预览为占位符时先用本地
-        // 解密缓存回填真实明文，避免持久化预览退化为 "[Encrypted message]"
+        // 解密缓存回填真实明文，避免持久化预览退化为 "[Encrypted message]"。
+        // 回填同样必须过脱敏出口：文件消息的解密缓存里存的就是清单原文
+        //（含 32 字节文件密钥），直接回填会让会话列表显示一串清单 JSON
         for (QJsonValueRef value : conversations) {
             QJsonObject conv = value.toObject();
             if (conv.value("lastMessage").toString() == "[Encrypted message]") {
@@ -2347,7 +2345,7 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
                     conv.value("lastMessageId").toVariant().toLongLong();
                 const QString cached = m_localStore.loadDecryptedContent(lastMessageId);
                 if (!cached.isEmpty()) {
-                    conv["lastMessage"] = cached;
+                    conv["lastMessage"] = conversationPreviewFor(cached);
                     value = conv;
                 }
             }
@@ -2413,10 +2411,19 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
             m_localStore.upsertMessage(cached);
         }
         emit messageSent(messageId, conversationId, ackedId);
+        // M8.2: 文件消息（正文是清单）确认后本地回显 + 补登记清单。
+        // 必须在 emit messageSent 之后：文本消息靠 QML 侧的乐观气泡确认，
+        // 而文件消息的乐观气泡要等这里回显（清单在 hashing 完成前不存在，
+        // QML 无从提前插入）
+        echoSentFileMessage(ackedId, messageId, conversationId);
     } else {
         // M7a: 群消息的确定性失败（已不在群/会话不存在/请求非法）移除
         // outbox 项避免无限重试；瞬时错误保留重试
         const int code2 = response.value("code").toInt();
+        // M8.2: 文件消息发送失败：撤销在途登记。否则同一个 clientMessageId
+        // 的清单会一直留在内存里（含 32 字节文件密钥），且重发成功时可能
+        // 命中过期的旧清单
+        m_pendingFileSends.remove(clientMessageId);
         const bool deterministic = code2 == static_cast<int>(ErrorCode::PermissionDenied)
             || code2 == static_cast<int>(ErrorCode::ConversationNotFound)
             || code2 == static_cast<int>(ErrorCode::InvalidRequest);
@@ -2442,6 +2449,55 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
         }
         emit messageSendFailed(response.value("message").toString("Send failed"));
     }
+}
+
+// M8.2: 文件消息发送确认后的收尾。要解决的是"服务端不会把这条消息推回给
+// 发送者"这一事实带来的两个后果：
+//   1. 清单没有登记到传输引擎。登记键是 messageId，而它到发送成功后才存在，
+//      因此 FileTransferManager::onUploadCompleted 明确把这一步留给本类
+//      （见该处注释）。不补登记的话，发送方对自己刚发出的文件无法
+//      "下载/另存为/预览/播放"，必须手动刷新一次历史同步才能用。
+//   2. UI 里没有气泡。文本消息靠 QML 侧的 appendOptimisticMessage 乐观插入，
+//      文件消息做不到——清单要等 hashing 与元数据提取完成才存在，QML 事先
+//      拿不到 sha256/尺寸/缩略图；而服务端的实时 fan-out 明确排除发送者
+//      （RequestHandler 里 `if (memberId != operatorId)`），于是不在此回显
+//      就只能等下一次历史同步（手动刷新/重进会话）才看得到自己的文件气泡。
+//
+// 登记经 sanitizeForUi → attachFileInfo 完成：NetworkManager.cpp 中那句
+// registerIncomingFile 是"离线补收、历史翻页、本地缓存回填与本人发送"四条
+// 路径唯一的登记入口，本函数正是其中的"本人发送"路径。
+void NetworkManager::echoSentFileMessage(const QString &clientMessageId, qint64 messageId,
+                                         qint64 conversationId)
+{
+    const QString manifestJson = m_pendingFileSends.take(clientMessageId);
+    if (manifestJson.isEmpty()) {
+        // 非文件消息（文本消息不带在途清单登记）
+        return;
+    }
+    if (messageId <= 0 || conversationId <= 0) {
+        // 缺 messageId 既无法登记也无法回显，历史同步会补上
+        return;
+    }
+
+    QJsonObject msg;
+    msg["messageId"] = messageId;
+    msg["conversationId"] = conversationId;
+    msg["senderId"] = m_userId;
+    msg["senderUsername"] = m_username;
+    // 正文先放清单：sanitizeForUi → attachFileInfo 靠它登记清单、解析 fileId
+    // 并补齐脱敏展示字段，随后把正文置空，故含密钥的清单不会进 QML
+    msg["content"] = manifestJson;
+    msg["contentType"] = "text";
+    msg["status"] = "sent";
+    msg["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    sanitizeForUi(msg);
+
+    if (!msg.value("isFileMessage").toBool() || msg.value("fileName").toString().isEmpty()) {
+        // 清单形态/自洽性自检未通过（attachFileInfo 提前返回）：宁可不回显，
+        // 也不要在气泡里放一个点不开的空附件；历史同步到达时会再解析一次
+        return;
+    }
+    emit fileMessageSent(msg);
 }
 
 void NetworkManager::handleAckMessageResponse(const Packet &packet)
@@ -2553,12 +2609,17 @@ void NetworkManager::wireFileTransfer()
     connect(m_fileTransfer, &FT::sendMessageRequested, this,
             [this](qint64 conversationId, qint64 peerUserId, const QString &manifestJson,
                    qint64 fileId) {
-                if (conversationId > 0) {
-                    sendGroupMessage(conversationId, manifestJson, fileId);
-                } else if (peerUserId > 0) {
-                    sendMessage(peerUserId, manifestJson, fileId);
-                } else {
+                if (conversationId <= 0 && peerUserId <= 0) {
                     emit messageSendFailed("Invalid file message target");
+                    return;
+                }
+                const QString clientMessageId = conversationId > 0
+                    ? sendGroupMessage(conversationId, manifestJson, fileId)
+                    : sendMessage(peerUserId, manifestJson, fileId);
+                // 记下在途文件消息：确认到达后凭它把清单补登记到传输引擎，
+                // 并给 QML 回显气泡（见 echoSentFileMessage）
+                if (!clientMessageId.isEmpty()) {
+                    m_pendingFileSends.insert(clientMessageId, manifestJson);
                 }
             });
 }
@@ -2832,16 +2893,12 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     m_localStore.upsertMessage(msg);
     {
         const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
-        // M7a: 群系统消息预览用可读摘要，避免结构化 JSON 直接展示
-        const bool isSystem = msg.value("contentType").toString() == "system";
-        // M8.2: 文件消息的正文是清单 JSON，预览必须用文件名摘要，
-        // 否则会话列表会展示一大段含密钥的 JSON
+        // M8.2: 预览一律经统一出口生成（密文占位、文件清单转 "[File] 文件名"、
+        // 群系统消息转摘要）。此处正文尚未被 sanitizeForUi 清空，文件消息
+        // 拿到的仍是清单，正好由出口归一
         const QString preview = msg.value("undecryptable").toBool()
-            ? "[Encrypted message]"
-            : (msg.value("isFileMessage").toBool()
-                   ? "[File] " + msg.value("fileName").toString()
-                   : (isSystem ? systemMessageSummary(msg.value("content").toString())
-                               : msg.value("content").toString()));
+            ? QStringLiteral("[Encrypted message]")
+            : conversationPreviewFor(msg.value("content").toString());
         m_localStore.bumpConversationPreview(convId, preview, true);
     }
     // M8.2: 文件消息的正文（清单）含 32 字节文件密钥，绝不得进 QML/JS 引擎。
@@ -3764,6 +3821,36 @@ void NetworkManager::handleMessageDeletedNotification(const Packet &packet)
 }
 
 // M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）
+// M8.2: 会话预览文本的统一出口。
+// 会话列表会把 lastMessage 直接显示给用户，因此这里是唯一允许生成预览文本
+// 的地方。三类正文必须在这里被替换掉，否则会原样出现在会话列表上：
+//   1. 密文（私聊 pairwise envelope / 群 e2ee_group / sender_key_distribution）
+//      —— 之前只识别 pairwise envelope，群密文 JSON 被当正文展示；
+//   2. 文件清单 —— 含 32 字节文件密钥，绝不能当预览文本（历史 bug：
+//      "解密缓存回填"路径把清单原文写进预览，会话列表上就是一串含密钥的 JSON）；
+//   3. 群系统消息的结构化 JSON —— 转可读摘要。
+QString NetworkManager::conversationPreviewFor(const QString &content)
+{
+    if (content.isEmpty()) {
+        return content;
+    }
+    if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(content)
+        || GroupE2eeCrypto::looksLikeGroupMessage(content)
+        || GroupE2eeCrypto::looksLikeDistribution(content)) {
+        return QStringLiteral("[Encrypted message]");
+    }
+    if (XYChat::Protocol::looksLikeFileManifest(content)) {
+        // 解析与降级口径只在 Protocol::filePreviewText 一处实现，
+        // 与 LocalStore::loadConversations 共用（见该函数说明）
+        return XYChat::Protocol::filePreviewText(content);
+    }
+    const QJsonObject sysObj = QJsonDocument::fromJson(content.toUtf8()).object();
+    if (!sysObj.isEmpty() && sysObj.contains("event")) {
+        return systemMessageSummary(content);
+    }
+    return content;
+}
+
 QString NetworkManager::systemMessageSummary(const QString &content)
 {
     const QJsonObject obj = QJsonDocument::fromJson(content.toUtf8()).object();

@@ -19,6 +19,13 @@ Rectangle {
     // M4.5: 当前选中会话索引（修复原先错误的判断条件）
     property int selectedIndex: -1
 
+    // 会话列表是否处于「已发起拉取、尚未收到结果」状态。
+    // 初值为 true：登录后 MainPage/MainWindow 会立刻拉取会话，收到结果时由
+    // updateConversations() 置为 false。
+    // 借此把「加载中」与「加载完成但确实没有任何会话」区分开——此前空列表
+    // 只按 convModel.count === 0 判断，导致没有会话时永远显示"加载中..."。
+    property bool loading: true
+
     // 顶部工具栏
     Rectangle {
         id: toolbar
@@ -110,7 +117,11 @@ Rectangle {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: conversationList.refreshClicked()
+                    onClicked: {
+                        // 列表为空时点刷新，先回到加载态显示 spinner
+                        conversationList.beginLoading()
+                        conversationList.refreshClicked()
+                    }
                 }
 
                 Icon {
@@ -160,37 +171,40 @@ Rectangle {
                 }
             }
 
-            Menu {
+            // 会话右键菜单。用 AppMenu/AppMenuItem 而非裸 Menu/MenuItem
+            //（Basic 样式在暗色主题下是浅色面板 + 不可见的白图标，见两个组件的说明）
+            AppMenu {
                 id: convContextMenu
-                MenuItem {
+                AppMenuItem {
                     text: model.pinned === true ? "取消置顶" : "置顶会话"
-                    icon.source: "qrc:/icons/pin.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.textPrimary
+                    iconName: "pin"
                     onTriggered: conversationList.conversationPrefsRequested(
                         model.conversationId, model.pinned !== true, model.muted === true)
                 }
-                MenuItem {
+                AppMenuItem {
                     text: model.muted === true ? "取消免打扰" : "开启免打扰"
-                    icon.source: model.muted === true ? "qrc:/icons/bell.svg" : "qrc:/icons/mute.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.textPrimary
+                    iconName: model.muted === true ? "bell" : "mute"
                     onTriggered: conversationList.conversationPrefsRequested(
                         model.conversationId, model.pinned === true, model.muted !== true)
                 }
-                MenuItem {
+                AppMenuItem {
                     text: "标记为已读"
-                    icon.source: "qrc:/icons/check.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.textPrimary
+                    iconName: "check"
                     onTriggered: conversationList.markReadRequested(model.conversationId)
                 }
-                MenuSeparator {}
-                MenuItem {
+                // 分隔线同样要主题化：Basic 的 MenuSeparator 取 palette.mid（系统浅色），
+                // 暗色主题下是一条亮线
+                MenuSeparator {
+                    contentItem: Rectangle {
+                        implicitWidth: 160
+                        implicitHeight: 1
+                        color: Theme.separatorColor
+                    }
+                }
+                AppMenuItem {
                     text: "删除会话"
-                    icon.source: "qrc:/icons/delete.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.errorColor
+                    iconName: "delete"
+                    danger: true
                     onTriggered: conversationList.deleteConversationRequested(model.conversationId)
                 }
             }
@@ -315,7 +329,8 @@ Rectangle {
             }
         }
 
-        // 空状态提示（加载中显示 spinner）
+        // 空状态提示：loading 为 true 时显示 spinner（"加载中..."），
+        // 拉取完成但一条会话都没有时显示空态图标 +"暂无会话"
         Column {
             anchors.centerIn: parent
             spacing: Theme.spacingMedium
@@ -324,12 +339,22 @@ Rectangle {
             LoadingIndicator {
                 anchors.horizontalCenter: parent.horizontalCenter
                 size: 24
+                visible: conversationList.loading
                 running: visible
+            }
+
+            // 空态图标。Column 会跳过不可见子项，故两个图标不会同时占位
+            Icon {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: !conversationList.loading
+                name: "chat-bubble"
+                size: 32
+                iconColor: Theme.textTertiary
             }
 
             Label {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "加载中..."
+                text: conversationList.loading ? "加载中..." : "暂无会话"
                 horizontalAlignment: Text.AlignHCenter
                 font.pixelSize: Theme.fontSizeMedium
                 color: Theme.textTertiary
@@ -372,6 +397,9 @@ Rectangle {
         if (!conversations || conversations.length === undefined) {
             return
         }
+        // 收到任一有效会话结果即视为本次拉取结束（空数组同样算结束，
+        // 此时由下方空状态显示"暂无会话"而不是一直转圈）
+        loading = false
         var seen = {}
         for (var i = 0; i < conversations.length; i++) {
             var conv = conversations[i]
@@ -471,10 +499,17 @@ Rectangle {
         }
     }
 
-    // M4.5: 清空选中与列表（登出时）
+    // 清空选中与列表（登出时）。loading 复位为 true：下一个会话登录后会重新拉取
     function reset() {
         convModel.clear()
         selectedIndex = -1
+        loading = true
+    }
+
+    // 重新发起拉取时调用，回到加载态（刷新按钮、建群/退群后重载等）。
+    // 列表非空时不会看到 spinner——空状态整块仅在 convModel.count === 0 时可见
+    function beginLoading() {
+        loading = true
     }
 
     // P3.1: 会话整表删除后从列表移除该项（并修正选中索引）

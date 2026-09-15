@@ -69,6 +69,7 @@ private slots:
     void decodeRejectsBadChunkSize();
     void decodeRejectsBadNameAndOversizeThumbnail();
     void looksLikeFileManifestDiscriminates();
+    void filePreviewTextHidesKeyMaterial();
 
     // 分片数学
     void chunkCountIsCeilingDivision();
@@ -383,6 +384,52 @@ void TestFileProtocol::looksLikeFileManifestDiscriminates()
     QVERIFY(!looksLikeFileManifest(QString()));
     QVERIFY(!looksLikeFileManifest("{\"v\":1,\"devices\":[]}"));
     QVERIFY(!looksLikeFileManifest("plain text that mentions \"kind\":\"file\" only"));
+}
+
+// 会话预览文本的单一映射（NetworkManager::conversationPreviewFor 与
+// LocalStore::loadConversations 共用）。本用例锁住的核心不变量是：
+// **任何情况下预览文本都不得包含清单原文**——清单里有 32 字节文件密钥，
+// 一旦作为预览落到 UI（会话列表直接显示 lastMessage）或本地库，
+// 密钥就随滚动条一起暴露了。历史上这条路径真的漏过（本地缓存回填把清单
+// 原文写进了预览），所以这里对"降级路径"也逐条断言，而不只测正常路径
+void TestFileProtocol::filePreviewTextHidesKeyMaterial()
+{
+    const FileManifest manifest = makeValidManifest();
+    const QString encoded = encodeFileManifest(manifest);
+    const QString keyBase64 = QString::fromLatin1(manifest.key.toBase64());
+    QVERIFY(!encoded.isEmpty());
+
+    // 正常路径：出 "[File] 文件名"
+    const QString preview = filePreviewText(encoded);
+    QCOMPARE(preview, QStringLiteral("[File] ") + manifest.name);
+    // 不得夹带任何密钥材料或清单结构
+    QVERIFY(!preview.contains(keyBase64));
+    QVERIFY(!preview.contains(QString::fromLatin1(manifest.iv.toBase64())));
+    QVERIFY(!preview.contains("kind"));
+    QVERIFY(!preview.contains('{'));
+
+    // 非 ASCII 文件名原样保留（预览要给人看，不做转义/截断）
+    FileManifest cjk = makeValidManifest();
+    cjk.name = QString::fromUtf8("季度报告.pdf");
+    QCOMPARE(filePreviewText(encodeFileManifest(cjk)),
+             QStringLiteral("[File] ") + cjk.name);
+
+    // 降级路径：形态像清单但内容不自洽（此处密钥长度非法）→ 只出 "[File]"，
+    // 绝不回退成清单原文
+    QJsonObject obj = manifestObject(manifest);
+    obj["key"] = QString::fromLatin1(QByteArray(24, 'k').toBase64());
+    const QString broken = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    QVERIFY(looksLikeFileManifest(broken)); // 启发式判别仍然认为是清单
+    QCOMPARE(filePreviewText(broken), QStringLiteral("[File]"));
+    QVERIFY(!filePreviewText(broken).contains('{'));
+
+    // 空文件名同样降级；空/垃圾输入返回占位而非空串，避免会话列表出现空行
+    QJsonObject noName = manifestObject(manifest);
+    noName["name"] = "";
+    QCOMPARE(filePreviewText(QString::fromUtf8(QJsonDocument(noName).toJson(QJsonDocument::Compact))),
+             QStringLiteral("[File]"));
+    QCOMPARE(filePreviewText(QString()), QStringLiteral("[File]"));
+    QCOMPARE(filePreviewText("not a manifest"), QStringLiteral("[File]"));
 }
 
 void TestFileProtocol::chunkCountIsCeilingDivision()

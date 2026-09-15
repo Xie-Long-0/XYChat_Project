@@ -13,6 +13,8 @@
         <file>components/AppButton.qml</file>
         <file>components/AppTextField.qml</file>
         <file>components/AppDialog.qml</file>
+        <file>components/AppMenu.qml</file>
+        <file>components/AppMenuItem.qml</file>
         <file>components/Avatar.qml</file>
         <file>components/Toast.qml</file>
         <file>components/EmptyState.qml</file>

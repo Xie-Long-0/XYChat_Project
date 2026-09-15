@@ -199,6 +199,23 @@ Window {
             networkManager.getConversations()
         }
 
+        // M8.2: 本人发出的文件消息在服务端确认后的本地回显。
+        // 两条前提决定了必须由 C++ 回显：服务端的实时 fan-out 明确排除发送者
+        //（RequestHandler 里 `if (memberId != operatorId)`），而文件消息又不像
+        // 文本消息那样能提前乐观插入——清单要等 hashing 与元数据提取完成才
+        // 存在，QML 事先拿不到 sha256/尺寸/缩略图。缺了这条回显，发送方要等
+        // 下一次历史同步（手动刷新/重进会话）才看得到自己的文件气泡。
+        // 与 onNewMessageReceived 的区别：这是自己发的消息，不回已读回执
+        function onFileMessageSent(message) {
+            if (message.conversationId == mainPage.currentConversationId) {
+                mainPage.appendMessage(message)
+            }
+            // 会话列表不本地拼预览：文件消息的正文已被脱敏出口置空，本地拼出来
+            // 是空串；而且自己的消息不该计未读。预览文本与未读数一律以服务端
+            // 为准（服务端 lastMessage 经脱敏出口转成 "[File] 文件名"）
+            networkManager.getConversations()
+        }
+
         function onMessageSent(messageId, conversationId, clientMessageId) {
             // M4.5: 首条消息成功后绑定服务端会话 ID，并确认乐观消息
             mainPage.bindNewConversation(conversationId)

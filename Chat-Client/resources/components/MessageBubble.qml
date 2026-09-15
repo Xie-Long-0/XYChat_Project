@@ -60,6 +60,51 @@ Item {
     // 气泡内容区可用宽度上限
     readonly property int maxContentWidth: Theme.messageMaxWidth - Theme.spacingMedium * 2
 
+    // 文件面板目标宽度（缩略图、进度条、文件名省略宽度均以此为准）
+    readonly property int filePanelWidth: Math.min(260, maxContentWidth)
+
+    // 缩略图最大高度：仅作上限约束，显示尺寸按原始宽高比换算
+    readonly property int thumbMaxHeight: 260
+    readonly property real thumbScale: (fileWidth > 0 && fileHeight > 0)
+        ? Math.min(filePanelWidth / fileWidth, thumbMaxHeight / fileHeight) : 0
+    readonly property int thumbWidth: thumbScale > 0 ? Math.round(fileWidth * thumbScale) : filePanelWidth
+    readonly property int thumbHeight: thumbScale > 0 ? Math.round(fileHeight * thumbScale) : 180
+
+    // 气泡内部内容所需宽度：文本自然宽度（超上限则折行到上限）、文件面板宽度、
+    // 时间/状态行宽度、最小宽度四者取最大。
+    // 修复：此前漏算文件面板宽度——文件消息正文被置空、元信息行只有时间+状态，
+    // 气泡被压到最小宽度（约 60px），而 filePanel 固定 260px，
+    // 于是文件名、"另存为"按钮等整体溢出气泡并被窗口裁切。
+    readonly property real contentWidth: {
+        var w = 60 - Theme.spacingMedium * 2
+        if (contentLabel.visible) {
+            w = Math.max(w, Math.min(contentLabel.implicitWidth, maxContentWidth))
+        }
+        if (filePanel.visible) {
+            w = Math.max(w, filePanel.width)
+        }
+        return Math.max(w, metaRow.width)
+    }
+
+    // 悬浮操作按钮是否放在气泡外侧。外侧（自己的消息在左、对方消息在右）不会
+    // 遮挡正文；窄窗口下长消息会占满整行、外侧放不下，此时 actionsOutside 为
+    // false，退回气泡内部右上角——宁可轻微遮挡，也不能把按钮推到可视区之外
+    //（那样等于点不到）。两侧对称：气泡靠窗口边只留 spacingMedium，故外侧
+    // 剩余宽度相同，判断只需一条公式。
+    // 依赖 actionButtons.width（Positioner 的内容宽度）而非另算一份按钮数量，
+    // 避免"编辑按钮仅自己的文本消息可见"这类条件在两处各写一遍而漂移
+    readonly property bool actionsOutside:
+        (width - Theme.spacingMedium - bubbleColumn.width)
+            >= actionButtons.width + Theme.spacingXSmall
+
+    // 悬浮操作按钮的显隐判定区：覆盖整行（气泡 + 外侧按钮 + 两者之间的间隙）。
+    // Qt 的 hover 只沿父子链向上传播、不会传给被遮挡的兄弟节点（见
+    // qquickdeliveryagent.cpp 的 deliverHoverEventRecursive 注释），因此若
+    // 分别监听气泡与各按钮，光标穿过间隙的那一帧两边都不 hover，按钮会闪一下。
+    // root 是气泡与按钮的共同祖先，必然收到 hover，用它统一判定最稳。
+    // 用 HoverHandler 而非 MouseArea：它不消费鼠标事件，不会抢走气泡的右键菜单
+    HoverHandler { id: rowHover }
+
     Column {
         id: bubbleColumn
         // 自己的消息靠右，对方的消息靠左
@@ -81,10 +126,7 @@ Item {
         // 气泡主体：宽度随内容自适应，超过上限自动换行
         Rectangle {
             id: bubbleRect
-            width: Math.max(
-                       Math.min(contentLabel.implicitWidth, messageBubble.maxContentWidth),
-                       metaRow.width,
-                       60 - Theme.spacingMedium * 2) + Theme.spacingMedium * 2
+            width: messageBubble.contentWidth + Theme.spacingMedium * 2
             height: contentColumn.implicitHeight + Theme.spacingMedium * 2
             radius: Theme.radiusBubble
             color: isMine ? Theme.bubbleOutColor : Theme.bubbleInColor
@@ -125,7 +167,7 @@ Item {
                 Column {
                     id: filePanel
                     visible: isFileMessage && !deleted
-                    width: Math.min(260, messageBubble.maxContentWidth)
+                    width: messageBubble.filePanelWidth
                     spacing: Theme.spacingSmall
 
                     // M8.3: 内联缩略图。仅在解码成功后显示（status === Ready），
@@ -138,8 +180,10 @@ Item {
                                 : ""
                         visible: fileThumb.length > 0 && status === Image.Ready
                         fillMode: Image.PreserveAspectFit
-                        width: filePanel.width
-                        height: 180
+                        // 按清单里的原始宽高比换算显示尺寸，避免竖图被塞进
+                        // 定宽 × 180 高后上下留出大片空白（"气泡大小异常"的一部分）
+                        width: messageBubble.thumbWidth
+                        height: messageBubble.thumbHeight
                         asynchronous: true
                         smooth: true
                         cache: true
@@ -258,14 +302,20 @@ Item {
 
                     Row {
                         spacing: Theme.spacingSmall
-                        Button {
+                        // 统一用 AppButton：裸 Button 会落到 Controls 默认（浅色）样式，
+                        // 在暗色主题气泡里是一块刺眼的白底，且宽度不受控
+                        AppButton {
                             visible: fileState === "missing"
                             text: "下载"
+                            height: 28
+                            font.pixelSize: Theme.fontSizeSmall
                             onClicked: downloadRequested()
                         }
-                        Button {
+                        AppButton {
                             visible: fileState === "available"
                             text: "另存为"
+                            height: 28
+                            font.pixelSize: Theme.fontSizeSmall
                             onClicked: saveRequested()
                         }
                         Label {
@@ -339,19 +389,29 @@ Item {
                 }
             }
 
+            // 悬浮操作按钮。原先锚在气泡内部右上角，会直接盖住正文（短消息
+            // 如 "Hello" 几乎被三个按钮压掉大半），故改为气泡外侧；
+            // 窄窗口下退回内部（见 actionsOutside）
             Row {
                 id: actionButtons
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.margins: Theme.spacingXSmall
                 spacing: 2
-                // P2.2: 悬浮显示。同时监听气泡与各操作按钮的 hover，避免光标
-                // 从气泡移到按钮时因兄弟节点 hover 不传递而闪烁消失
-                visible: !deleted && (bubbleMouse.containsMouse
-                                      || copyMouseArea.containsMouse
-                                      || editMouseArea.containsMouse
-                                      || deleteMouseArea.containsMouse)
-                opacity: visible ? 1 : 0
+                // 三种落位用显式 x/y 表达，避免 anchors 在条件切换时互相冲突：
+                //   外侧且自己的消息 → 气泡左侧；外侧且对方消息 → 气泡右侧；
+                //   放不下 → 气泡内部右上角
+                x: messageBubble.actionsOutside
+                   ? (isMine ? -Theme.spacingXSmall - width
+                             : bubbleRect.width + Theme.spacingXSmall)
+                   : bubbleRect.width - Theme.spacingXSmall - width
+                y: messageBubble.actionsOutside
+                   ? Math.round((bubbleRect.height - height) / 2)
+                   : Theme.spacingXSmall
+
+                // 显隐由整行 hover 统一驱动（见根节点的 HoverHandler）。
+                // 只改 opacity，让淡出动画真正可见；enabled 保证不可见时不吞点击
+                //（disabled 会向下传递给按钮上的 MouseArea）
+                opacity: (!deleted && rowHover.hovered) ? 1 : 0
+                visible: opacity > 0
+                enabled: opacity > 0
                 Behavior on opacity { NumberAnimation { duration: Theme.animationFast } }
 
                 Rectangle {
@@ -411,30 +471,27 @@ Item {
                 }
             }
 
-            Menu {
+            // M9 特性栈：右键菜单。用 AppMenu/AppMenuItem 而非裸 Menu/MenuItem
+            //（Basic 样式在暗色主题下是浅色面板 + 不可见的白图标，见两个组件的说明）
+            AppMenu {
                 id: contextMenu
-                MenuItem {
+                AppMenuItem {
                     text: "复制"
-                    icon.source: "qrc:/icons/copy.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.textPrimary
+                    iconName: "copy"
                     onTriggered: messageBubble.copyRequested()
                 }
-                MenuItem {
+                AppMenuItem {
                     text: "编辑"
-                    icon.source: "qrc:/icons/edit.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.textPrimary
+                    iconName: "edit"
                     enabled: !isFileMessage
                     onTriggered: messageBubble.editRequested()
                     ToolTip.visible: hovered && !enabled
                     ToolTip.text: "文件消息不可编辑，请删除后重发"
                 }
-                MenuItem {
+                AppMenuItem {
                     text: "删除"
-                    icon.source: "qrc:/icons/delete.svg"
-                    icon.width: 14; icon.height: 14
-                    icon.color: Theme.errorColor
+                    iconName: "delete"
+                    danger: true
                     onTriggered: messageBubble.deleteRequested()
                 }
             }
