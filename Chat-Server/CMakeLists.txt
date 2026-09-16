@@ -79,7 +79,8 @@ target_include_directories(Chat-Server SYSTEM PUBLIC
 # Debug 取 3rdparty/debug/bin，其余配置取 3rdparty/bin
 xychat_copy_runtime_dlls(Chat-Server)
 
-# M5: 构建后拷贝证书生成脚本到输出目录
+# M5: 构建后确保 certs 目录存在 —— 服务端首次启动时会在该目录自动生成开发证书
+# （TlsHelper::generateDevCertificates），客户端也优先从 exe 同级的 certs/ 读取 CA
 add_custom_command(TARGET Chat-Server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         $<TARGET_FILE_DIR:Chat-Server>/certs

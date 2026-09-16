@@ -18,7 +18,7 @@
 
 | 里程碑 | 名称 | 状态 | 完成日期 | 交付摘要 |
 | --- | --- | --- | --- | --- |
-| M0 | 工程基线与可维护性 | 已完成 | 2026-07-01 | README、`.gitignore`、`docs/` 四文档、GitHub Actions CI、Qt Test、顶层 CMake 统一（C++20、`XYCHAT_BUILD_TESTS`）。**注**：CI 工作流曾于 2026-08-03 随 `31622df` 被删、连续 5 周无机器门禁，2026-09-09 已重建（首次运行待验证，见 §3） |
+| M0 | 工程基线与可维护性 | 已完成 | 2026-07-01 | README、`.gitignore`、`docs/` 四文档、GitHub Actions CI、Qt Test、顶层 CMake 统一（C++20、`XYCHAT_BUILD_TESTS`）。**注**：CI 工作流曾于 2026-08-03 随 `31622df` 被删、连续 5 周无机器门禁，2026-09-09 已重建（首次运行先后暴露两处配置缺陷，均已于 2026-09-16 修复，待绿色运行确认） |
 | M1 | 网络协议层重构 | 已完成 | 2026-07-01 | 长度前缀帧协议（magic `XYCP`）、requestId 匹配、统一错误码、ping/pong 心跳与空闲超时 |
 | M2 | 账户体系与认证安全 | 已完成 | 2026-07-29 | 注册、PBKDF2-HMAC-SHA256 密码存储、session token（只存摘要）、多设备管理、登录限流、版本化迁移 |
 | M3 | 一对一文本聊天 MVP | 已完成 | 2026-07-29 | 用户搜索/联系人、会话与消息模型、收发/状态/离线同步接口、客户端聊天界面 |
@@ -55,7 +55,7 @@
 ### M0：工程基线（2026-07-01）
 
 - 交付：README、`.gitignore`、`docs/` 四文档、GitHub Actions CI（configure/build/test）、Qt Test 框架与 `TestEncryptionManager`、顶层 CMake 统一（C++20、警告选项、`XYCHAT_BUILD_TESTS`）。
-- **更正（2026-09-09 周度审查）**：上述"CI 全流程通过"自 2026-08-03 起已不成立——`.github/workflows/cmake.yml` 随 `31622df` 被删，连续 5 周无任何机器门禁，期间各里程碑的 "`ctest` 6/6" 仅靠本地手工运行得出（并因此遗漏一项约 50% 概率失败的单测，见 M9）。工作流已于 2026-09-09 重建（windows-latest + Qt 6.8.3，三步 + 失败上传 `LastTest.log`）；**重建后的首次运行即暴露配置缺陷**——安装器默认只装 Qt base，而项目依赖的 Multimedia/HttpServer 属独立 add-on 模块，configure 阶段报 `Failed to find required Qt component "Multimedia"`。已于 2026-09-16 补 `modules` 修复（见 §10），**待一次绿色运行确认**。
+- **更正（2026-09-09 周度审查）**：上述"CI 全流程通过"自 2026-08-03 起已不成立——`.github/workflows/cmake.yml` 随 `31622df` 被删，连续 5 周无任何机器门禁，期间各里程碑的 "`ctest` 6/6" 仅靠本地手工运行得出（并因此遗漏一项约 50% 概率失败的单测，见 M9）。工作流已于 2026-09-09 重建（windows-latest + Qt 6.8.3，三步 + 失败上传 `LastTest.log`）；**重建后的首次运行即暴露配置缺陷**——安装器默认只装 Qt base，而项目依赖的 Multimedia/HttpServer 属独立 add-on 模块，configure 阶段报 `Failed to find required Qt component "Multimedia"`。2026-09-16 连修两处：① 补 `modules` 声明，解决 configure 阶段的 add-on 模块缺失；② 修 build 阶段 `TestGroupRepro` 的 `certs` 目录自我拷贝竞态（详见 §10）。**仍待一次绿色运行确认**。
 
 ### M1：网络协议层（2026-07-01）
 
@@ -343,3 +343,4 @@
 | 2026-09-15 | M11A 完成：基础体验与系统集成 | 设置页（`AppSettings` 替代 `ThemeSettings`，统一管理 darkMode/通知/预览/托盘偏好 + `SettingsDialog` 外观/通知/存储/关于四节）；系统托盘（`TrayManager` + `QSystemTrayIcon`，`QApplication` + `setQuitOnLastWindowClosed(false)`，关闭最小化到托盘、双击恢复、右键菜单退出）；桌面通知（`NetworkManager.handleNewMessageNotification` 中按设置/免打扰/非本人过滤后 emit → `TrayManager.showMessage`，点击跳转会话，当前活动会话抑制）；草稿（`MainPage.drafts` JS 对象，会话切换保存/恢复输入框文本，发送后清除）；本地消息搜索（`LocalStore.searchMessages` 解密后内存 LIKE 匹配 + `conversationName` 附带，`LocalSearchDialog` 搜索/结果列表/跳转，`ChatView.scrollToMessage` 定位滚动，`pendingScrollMessageId` 机制解决异步加载时序）。`ctest` 12/12（`TestLocalStore` +2 用例）、`qmllint` 零错误。CodeReview 3 项 P1（私聊通知冗余前缀、托盘不可用窗口永久隐藏、搜索跳转时序失败）+ 1 项 P2（QMenu 泄漏）均已修 |
 | 2026-09-16 | M11A 复审修复 + 规划补全 | 复审发现 1 项 P1 功能回退——消息搜索顶替了侧边栏搜索按钮，致"用户搜索→发起一对一会话"（M4.5 能力）失去 UI 入口：已修为会话列表工具栏独立"消息搜索"按钮（新增 `search-messages` 图标），原搜索按钮恢复打开 `SearchDialog`；并补"目标会话已不在列表"的提示。ROADMAP 补全 M11B/M11C 规划章节（§4.4/§4.5，原 M11 稳定性任务顺延为 §4.6）与 §5 片内执行顺序 |
 | 2026-09-16 | 修复 CI 配置缺陷：Qt add-on 模块缺失 | 重建后的 CI 首次运行在 configure 阶段失败：`jurplel/install-qt-action` 默认只装 Qt base（qtbase + qtdeclarative/qtquickcontrols2），而项目依赖的 `Qt6Multimedia`（客户端元数据提取与播放器、测试）与 `Qt6HttpServer`（服务端数据面、测试）属独立 add-on 模块；且 `Qt6HttpServer` 的 CMake 包 `find_dependency` 了 `Qt6WebSockets`。修为在安装步骤显式声明 `modules: qtmultimedia qthttpserver qtwebsockets` 并固定 `arch: win64_msvc2022_64`，不再依赖安装器的模块依赖自动解析。OpenSSL/QWindowKit/zlib 仍由已提交的 `3rdparty/` 提供，CI 无需另行安装 |
+| 2026-09-16 | 修复 CI 构建缺陷：`certs` 目录自我拷贝竞态 | 上一修复后 CI 推进至 build 阶段，`TestGroupRepro` 的 POST_BUILD 失败于 `cmake -E copy_directory`：其源与目标同为 `build/Release/certs`——`qt_standard_project_setup()` 在 Windows 上把 `CMAKE_RUNTIME_OUTPUT_DIRECTORY` 统一指向构建根目录（理由：Windows 无 RPATH，DLL 须与 exe 同目录，见 `Qt6CoreMacros.cmake`），故本目标与 `Chat-Server` 输出到同一目录。自我拷贝本身可通过，但它要求源已存在，而 `Chat-Server` 的 `make_directory` POST_BUILD 与之并发（MSBuild `--parallel`），全新构建目录下必然抢跑失败。修为改用幂等的 `make_directory`，不再依赖目标构建顺序（本地已复刻全新构建目录场景：移走 `certs` + 强制重链，ninja 退出码 0）；顺带更正 `Chat-Server/CMakeLists.txt` 中"拷贝证书生成脚本"的失实注释。另为 Install Qt 步骤加 `cache: true` 缩短后续 CI。`ctest` 12/12 |

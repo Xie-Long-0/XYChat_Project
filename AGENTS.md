@@ -27,6 +27,8 @@ ctest --test-dir out/build/debug --output-on-failure
 
 工具链事实来源：Qt `6.8.3 msvc2022_64`（`D:\Qt\6.8.3\msvc2022_64`），MSVC `14.51.36231`，Visual Studio 18 Enterprise。运行时需 Qt 与 QWindowKit/OpenSSL/zlib DLL 在 PATH 或可执行文件同级（CMake 已配置拷贝）。
 
+输出目录约定：`qt_standard_project_setup()` 在 Windows 上会把 `CMAKE_RUNTIME_OUTPUT_DIRECTORY` 统一设为**构建根目录**（见 `Qt6CoreMacros.cmake`，理由是 Windows 无 RPATH、DLL 必须与 exe 同目录），因此所有目标的可执行文件一律平铺在 `out/build/debug/`（多配置生成器再加 `<Config>/` 一层），而非各子目录下。推论：**`$<TARGET_FILE_DIR:A>` 与 `$<TARGET_FILE_DIR:B>` 恒等**，所以任何"从 A 的输出目录拷到 B 的输出目录"的 `copy_directory` 都是自我拷贝——它只是路径相同时的巧合，且 `cmake -E copy_directory` **要求源已存在**；若源目录由另一目标的 POST_BUILD 创建，并行构建（MSBuild `--parallel`）下必然抢跑失败（CI 曾在 `TestGroupRepro` 上栽此坑）。需要"确保某目录存在"时用幂等的 `cmake -E make_directory`，它与目标构建顺序无关。
+
 ## 测试诊断技巧（重要）
 
 - Windows 下 Qt Test 的 stdout **全缓冲**：测试失败/崩溃时 `ctest --output-on-failure` 与 `LastTest.log` 常显示空输出，易把断言失败误判为崩溃或"沙箱偶发"。必须用以下任一方式取真实断言：

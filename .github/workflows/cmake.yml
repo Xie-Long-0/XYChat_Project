@@ -39,6 +39,10 @@ jobs:
           # 显式固定 ABI，避免 runner 镜像默认值变化导致装到不匹配的 Qt 构建
           arch: win64_msvc2022_64
           modules: 'qtmultimedia qthttpserver qtwebsockets'
+          # 缓存 Qt 安装：命中时跳过下载解压（环境变量与构建工具仍会每次设置）
+          # key 由 host/target/arch/version/dir/modules 等输入拼接，故日后增删
+          # modules 会自动失效重下，不会复用缺模块的旧缓存
+          cache: true
 
       - name: Configure
         run: cmake -S . -B build -DXYCHAT_BUILD_TESTS=ON

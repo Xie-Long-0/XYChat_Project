@@ -331,8 +331,18 @@ endif()
 
 xychat_copy_runtime_dlls(TestGroupRepro)
 
+# 确保 certs 目录存在（服务端首次运行会在该目录自动生成开发证书）。
+#
+# 注意：不能用 copy_directory 从 Chat-Server 的输出目录拷过来 ——
+# qt_standard_project_setup() 在 Windows 上会把 CMAKE_RUNTIME_OUTPUT_DIRECTORY
+# 统一设为构建根目录（见 Qt6CoreMacros.cmake，理由是 Windows 无 RPATH、DLL 必须
+# 与 exe 同目录），因此本目标与 Chat-Server 输出到同一目录，那条命令的源与目标
+# 是同一路径。自我拷贝本身虽可通过，但它要求源已存在，而 Chat-Server 的
+# make_directory POST_BUILD 与之并发执行（MSBuild --parallel），全新构建目录下
+# 必然抢跑失败：Error copying directory from ".../certs" to ".../certs"。
+# make_directory 幂等且不依赖任何目标先完成，与构建顺序无关。
 add_custom_command(TARGET TestGroupRepro POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        $<TARGET_FILE_DIR:Chat-Server>/certs
+    COMMAND ${CMAKE_COMMAND} -E make_directory
         $<TARGET_FILE_DIR:TestGroupRepro>/certs
+    COMMENT "Ensuring certs directory for TestGroupRepro"
 )
