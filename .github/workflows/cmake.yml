@@ -19,12 +19,26 @@ jobs:
       - uses: actions/checkout@v4
 
       # 依赖说明：OpenSSL / QWindowKit / zlib 均已随仓库提交在 3rdparty/
-      # （顶层 CMakeLists 已把 3rdparty 加入 CMAKE_PREFIX_PATH），
-      # 因此 CI 只需额外准备 Qt 6.8.3（与本地开发环境一致）
+      # （顶层 CMakeLists 已把 3rdparty 加入 CMAKE_PREFIX_PATH，
+      #  xychat_copy_runtime_dlls 只拷贝这批 DLL，故 CI 不需要额外装它们），
+      # 因此 CI 只需额外准备 Qt 6.8.3（与本地开发环境一致）。
+      #
+      # modules 必须显式列出 add-on 模块：安装器的默认包只含 qtbase 与
+      # qtdeclarative/qtquickcontrols2（故 Core/Network/Sql/Test/Gui/Quick/
+      # QuickControls2/Widgets 无需声明），而 Multimedia、HttpServer、WebSockets
+      # 属于独立 add-on 模块，不在默认包内——漏配即报
+      # "Failed to find required Qt component Multimedia"（Qt6_FOUND=FALSE）。
+      # 依赖关系：项目用到 Multimedia（客户端元数据提取/播放器 + 测试）与
+      # HttpServer（服务端数据面 + 测试），而 Qt6HttpServer 的 CMake 包又
+      # find_dependency 了 Qt6WebSockets，故三者一并显式列出，不依赖安装器的
+      # 模块依赖自动解析（缺任一都会在 configure 阶段 FATAL_ERROR）。
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.3'
+          # 显式固定 ABI，避免 runner 镜像默认值变化导致装到不匹配的 Qt 构建
+          arch: win64_msvc2022_64
+          modules: 'qtmultimedia qthttpserver qtwebsockets'
 
       - name: Configure
         run: cmake -S . -B build -DXYCHAT_BUILD_TESTS=ON

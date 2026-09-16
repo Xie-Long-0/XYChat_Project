@@ -55,7 +55,7 @@
 ### M0：工程基线（2026-07-01）
 
 - 交付：README、`.gitignore`、`docs/` 四文档、GitHub Actions CI（configure/build/test）、Qt Test 框架与 `TestEncryptionManager`、顶层 CMake 统一（C++20、警告选项、`XYCHAT_BUILD_TESTS`）。
-- **更正（2026-09-09 周度审查）**：上述"CI 全流程通过"自 2026-08-03 起已不成立——`.github/workflows/cmake.yml` 随 `31622df` 被删，连续 5 周无任何机器门禁，期间各里程碑的 "`ctest` 6/6" 仅靠本地手工运行得出（并因此遗漏一项约 50% 概率失败的单测，见 M9）。工作流已于 2026-09-09 重建（windows-latest + Qt 6.8.3，三步 + 失败上传 `LastTest.log`）；**首次运行结果待验证**，已登记为 §3 P2。
+- **更正（2026-09-09 周度审查）**：上述"CI 全流程通过"自 2026-08-03 起已不成立——`.github/workflows/cmake.yml` 随 `31622df` 被删，连续 5 周无任何机器门禁，期间各里程碑的 "`ctest` 6/6" 仅靠本地手工运行得出（并因此遗漏一项约 50% 概率失败的单测，见 M9）。工作流已于 2026-09-09 重建（windows-latest + Qt 6.8.3，三步 + 失败上传 `LastTest.log`）；**重建后的首次运行即暴露配置缺陷**——安装器默认只装 Qt base，而项目依赖的 Multimedia/HttpServer 属独立 add-on 模块，configure 阶段报 `Failed to find required Qt component "Multimedia"`。已于 2026-09-16 补 `modules` 修复（见 §10），**待一次绿色运行确认**。
 
 ### M1：网络协议层（2026-07-01）
 
@@ -342,3 +342,4 @@
 | 2026-09-15 | UI 缺陷修复（两轮） | ① 暗色主题下图标全黑（`MultiEffect` 缺 `brightness: 1.0`，乘法着色使黑色源恒为黑）、文件气泡尺寸异常（漏算文件面板宽度）、空会话列表永久"加载中"；② 发送文件后气泡需手动刷新（服务端 fan-out 排除发送者且文件消息无法乐观插入 → 改发送确认后回显）、消息气泡悬停控件遮挡正文（改气泡外侧，窄窗口退回内部）、弹出菜单未与主题统一（Basic 样式取系统调色板 → 新增 `AppMenu`/`AppMenuItem`）。另收口"正文→会话预览文本"为唯一实现 `Protocol::filePreviewText()` 并补回归单测。`ctest` 12/12、`qmllint` 零错误 |
 | 2026-09-15 | M11A 完成：基础体验与系统集成 | 设置页（`AppSettings` 替代 `ThemeSettings`，统一管理 darkMode/通知/预览/托盘偏好 + `SettingsDialog` 外观/通知/存储/关于四节）；系统托盘（`TrayManager` + `QSystemTrayIcon`，`QApplication` + `setQuitOnLastWindowClosed(false)`，关闭最小化到托盘、双击恢复、右键菜单退出）；桌面通知（`NetworkManager.handleNewMessageNotification` 中按设置/免打扰/非本人过滤后 emit → `TrayManager.showMessage`，点击跳转会话，当前活动会话抑制）；草稿（`MainPage.drafts` JS 对象，会话切换保存/恢复输入框文本，发送后清除）；本地消息搜索（`LocalStore.searchMessages` 解密后内存 LIKE 匹配 + `conversationName` 附带，`LocalSearchDialog` 搜索/结果列表/跳转，`ChatView.scrollToMessage` 定位滚动，`pendingScrollMessageId` 机制解决异步加载时序）。`ctest` 12/12（`TestLocalStore` +2 用例）、`qmllint` 零错误。CodeReview 3 项 P1（私聊通知冗余前缀、托盘不可用窗口永久隐藏、搜索跳转时序失败）+ 1 项 P2（QMenu 泄漏）均已修 |
 | 2026-09-16 | M11A 复审修复 + 规划补全 | 复审发现 1 项 P1 功能回退——消息搜索顶替了侧边栏搜索按钮，致"用户搜索→发起一对一会话"（M4.5 能力）失去 UI 入口：已修为会话列表工具栏独立"消息搜索"按钮（新增 `search-messages` 图标），原搜索按钮恢复打开 `SearchDialog`；并补"目标会话已不在列表"的提示。ROADMAP 补全 M11B/M11C 规划章节（§4.4/§4.5，原 M11 稳定性任务顺延为 §4.6）与 §5 片内执行顺序 |
+| 2026-09-16 | 修复 CI 配置缺陷：Qt add-on 模块缺失 | 重建后的 CI 首次运行在 configure 阶段失败：`jurplel/install-qt-action` 默认只装 Qt base（qtbase + qtdeclarative/qtquickcontrols2），而项目依赖的 `Qt6Multimedia`（客户端元数据提取与播放器、测试）与 `Qt6HttpServer`（服务端数据面、测试）属独立 add-on 模块；且 `Qt6HttpServer` 的 CMake 包 `find_dependency` 了 `Qt6WebSockets`。修为在安装步骤显式声明 `modules: qtmultimedia qthttpserver qtwebsockets` 并固定 `arch: win64_msvc2022_64`，不再依赖安装器的模块依赖自动解析。OpenSSL/QWindowKit/zlib 仍由已提交的 `3rdparty/` 提供，CI 无需另行安装 |
