@@ -1057,6 +1057,129 @@ bool LocalStore::deleteConversation(qint64 conversationId)
     return useTransaction ? m_db.commit() : true;
 }
 
+// M11A A3: 检查会话是否被设为免打扰
+bool LocalStore::isConversationMuted(qint64 conversationId) const
+{
+    if (!m_open || conversationId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT muted FROM conversations WHERE conversation_id = ?");
+    query.addBindValue(conversationId);
+    if (!query.exec() || !query.next()) {
+        return false;
+    }
+    return query.value(0).toInt() != 0;
+}
+
+// M11A A3: 获取会话显示名称（私聊返回 peerUsername，群聊返回 name）
+QString LocalStore::conversationDisplayName(qint64 conversationId) const
+{
+    if (!m_open || conversationId <= 0) {
+        return {};
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT type, peer_username, name FROM conversations WHERE conversation_id = ?");
+    query.addBindValue(conversationId);
+    if (!query.exec() || !query.next()) {
+        return {};
+    }
+    const QString type = query.value(0).toString();
+    if (type == QLatin1String("group")) {
+        return query.value(2).toString();
+    }
+    return query.value(1).toString();
+}
+
+// M11A A3: 获取会话类型
+QString LocalStore::conversationType(qint64 conversationId) const
+{
+    if (!m_open || conversationId <= 0) {
+        return {};
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT type FROM conversations WHERE conversation_id = ?");
+    query.addBindValue(conversationId);
+    if (!query.exec() || !query.next()) {
+        return {};
+    }
+    return query.value(0).toString();
+}
+
+// M11A A5: 本地消息搜索（解密后 LIKE 匹配）
+QJsonArray LocalStore::searchMessages(const QString &query, int limit,
+                                      qint64 conversationId) const
+{
+    QJsonArray result;
+    if (!m_open || query.isEmpty() || limit <= 0) {
+        return result;
+    }
+
+    QSqlQuery sql(m_db);
+    // 按 messageId 降序搜索（最近的消息优先），限制扫描行数以避免全表解密
+    // 实际匹配在内存中进行（正文加密存储，无法用 SQL LIKE）
+    if (conversationId > 0) {
+        sql.prepare(
+            "SELECT message_id, conversation_id, sender_id, sender_username,"
+            " content_enc, content_type, created_at, deleted"
+            " FROM messages WHERE conversation_id = ? AND deleted = 0"
+            " ORDER BY message_id DESC LIMIT ?");
+        sql.addBindValue(conversationId);
+        sql.addBindValue(limit * 10); // 多取一些，因为不是所有行都会匹配
+    } else {
+        sql.prepare(
+            "SELECT message_id, conversation_id, sender_id, sender_username,"
+            " content_enc, content_type, created_at, deleted"
+            " FROM messages WHERE deleted = 0"
+            " ORDER BY message_id DESC LIMIT ?");
+        sql.addBindValue(limit * 10);
+    }
+
+    if (!sql.exec()) {
+        qWarning() << "[LocalStore] searchMessages query failed:" << sql.lastError().text();
+        return result;
+    }
+
+    const QString lowerQuery = query.toLower();
+    // 缓存会话名称查询结果（避免每条消息都查一次）
+    QHash<qint64, QString> convNameCache;
+    while (sql.next() && result.size() < limit) {
+        const bool deleted = sql.value(7).toInt() != 0;
+        if (deleted) {
+            continue;
+        }
+        // 解密正文（失败返回空，跳过）
+        const QString content = decryptText(sql.value(4).toString());
+        if (content.isEmpty()) {
+            continue;
+        }
+        // 大小写不敏感匹配
+        if (!content.toLower().contains(lowerQuery)) {
+            continue;
+        }
+
+        const qint64 convId = sql.value(1).toLongLong();
+        // 查缓存或查询会话名称
+        auto it = convNameCache.find(convId);
+        if (it == convNameCache.end()) {
+            it = convNameCache.insert(convId, conversationDisplayName(convId));
+        }
+
+        QJsonObject msg;
+        msg["messageId"] = sql.value(0).toLongLong();
+        msg["conversationId"] = convId;
+        msg["conversationName"] = it.value();
+        msg["senderId"] = sql.value(2).toLongLong();
+        msg["senderUsername"] = sql.value(3).toString();
+        msg["content"] = content;
+        msg["contentType"] = sql.value(5).toString();
+        msg["createdAt"] = sql.value(6).toString();
+        result.append(msg);
+    }
+
+    return result;
+}
+
 int LocalStore::importLegacyDecryptCache(const QString &username, const QString &deviceId)
 {
     if (!m_open) {

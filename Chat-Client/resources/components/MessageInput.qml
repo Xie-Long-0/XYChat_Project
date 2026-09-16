@@ -16,6 +16,8 @@ Rectangle {
     signal typingActivity()
 
     property int maxLength: 4096
+    // M11A A4: 暴露输入框文本供外部读写（草稿保存/恢复）
+    property alias text: inputField.text
 
     FileDialog {
         id: attachmentDialog

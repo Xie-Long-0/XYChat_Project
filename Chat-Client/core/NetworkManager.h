@@ -18,6 +18,8 @@
 #include "LocalStore.h"
 #include "FileTransferManager.h"
 
+class AppSettings;
+
 class NetworkManager : public QObject
 {
     Q_OBJECT
@@ -100,6 +102,14 @@ public:
     QObject *fileTransfer() const;
     Q_INVOKABLE QVariantList toVariantList(const QJsonArray &array) const;
 
+    // M11A A3: 注入应用设置（用于检查通知开关）
+    void setAppSettings(AppSettings *settings) { m_appSettings = settings; }
+
+    // M11A A5: 本地消息搜索（经 LocalStore 解密后 LIKE 匹配）
+    // 返回 QJsonArray，每条含 messageId/conversationId/senderUsername/content/createdAt
+    Q_INVOKABLE QJsonArray searchMessages(const QString &query, int limit = 50,
+                                          qint64 conversationId = 0) const;
+
 signals:
     void loginSuccessful();
     void loginFailed(const QString &errorMessage);
@@ -151,6 +161,11 @@ signals:
     // M10：会话删除结果（本端响应或其他成员/设备推送）
     void conversationDeleted(qint64 conversationId);
     void conversationDeleteFailed(const QString &error);
+    // M11A A3: 桌面通知请求（经 main.cpp 接线到 TrayManager::showNotification）
+    // conversationId: 关联会话 ID（点击通知时回传以跳转）
+    // title: 通知标题（私聊=发送者，群聊=群名）
+    // body: 通知正文（消息预览，已经 sanitizeForUi 脱敏）
+    void desktopNotificationRequested(qint64 conversationId, const QString &title, const QString &body);
 
 private slots:
     void onConnected();
@@ -427,4 +442,7 @@ private:
     // 清单要留到发送确认到达才能补登记到传输引擎（登记键是 messageId），
     // 同时用于给 QML 回显文件气泡。登出/断线随 resetAuthState 清空
     QHash<QString, QString> m_pendingFileSends;
+
+    // M11A A3: 应用设置指针（由 main.cpp 注入，用于检查通知开关）
+    AppSettings *m_appSettings = nullptr;
 };

@@ -17,7 +17,7 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
-- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善，M10 建立统一视觉系统 + 基础组件库 + 全局反馈层并将 MainPage 拆分为独立对话框），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路，M10 起接入会话整表删除（`deleteConversation`）与“正在输入”指示（`sendTyping` 每会话 4s 节流 + `typingReceived` 信号））、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`，M10：新增 `deleteConversation` 清理本地会话与消息缓存）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
+- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善，M10 建立统一视觉系统 + 基础组件库 + 全局反馈层并将 MainPage 拆分为独立对话框），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路，M10 起接入会话整表删除（`deleteConversation`）与“正在输入”指示（`sendTyping` 每会话 4s 节流 + `typingReceived` 信号），M11A 起接入桌面通知（`desktopNotificationRequested` 信号）与本地消息搜索（`searchMessages`））、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`，M10：新增 `deleteConversation` 清理本地会话与消息缓存，M11A：新增 `isConversationMuted`/`conversationDisplayName`/`conversationType`/`searchMessages` 辅助查询）、`core/AppSettings`（M11A：统一设置管理，替代原 `ThemeSettings`，QSettings 持久化 darkMode/通知/预览/托盘偏好）、`core/TrayManager`（M11A：系统托盘 `QSystemTrayIcon` 管理，最小化/恢复/退出菜单/桌面通知/点击跳转）与 `models/User`。
 - `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包；M9 新增会话偏好/消息编辑/消息删除三个处理器；M11 前置：发消息/搜索连接级限流 RateWindow + 结构化审计日志；**M8.1 新增文件控制面五个处理器**（申请上传/续传查询/宣告完成/取消/下载票据）与 `send_message` 的 `fileId` 校验），管理 session 路由与在线状态，访问 SQLite。**M8.1 新增 `storage/`**：`IObjectStorage` 抽象与 `LocalFileStorage` 实现（由 `Server` 创建并注入各 handler，存储初始化失败则不注入，文件相关接口一律 fail-closed 回 `FileStorageFailed`）；`Server` 维护连接新增 `pruneFileUploads`（与 `pruneSyncEvents` 共用定时器）。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；`FileProtocol`（M8.1：`FileManifest` 编解码、分片数学与体积/分片/票据常量，客户端与服务端共用同一组常量以免校验口径漂移）；
@@ -69,7 +69,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 客户端实现会话列表、聊天窗口、消息气泡、持久化 outbox（M6.5：加密落库，未确认消息重启后登录成功自动重发，幂等键保证不重复）。
 - M6.5 本地缓存接入：登录后立即展示上一周期的缓存会话列表，打开会话先展示本地缓存再由服务端数据覆盖；登录后基于 `sync_events` 游标自动增量同步（hasMore 自动续拉），事件写入本地缓存并推进游标。
 - M9 多端同步与离线一致性：`ack_message(read)` 触发已读者自身 `read_cursor` 事件 + `ReadCursorNotification` 推送，同账号其他设备经 `markConversationRead` 重算未读角标、推进消息已读态（状态只前进）；`sync_events` 按 30 天保留期每小时清理（`sync_meta` 水位线），落后于水位的设备由 `needsFullSync` 触发全量回退（重置游标 + `get_conversations`，历史消息经 `sync_messages` 从 messages 表补齐）。
-- M4.5 客户端体验完善：搜索用户直接发起对话（虚拟会话 + 首条消息 ACK 后绑定 conversationId）、发送乐观显示（发送中→已发送→已送达→已读实时流转）、显式已读回执、日期分隔线、会话选中高亮与未读角标本地实时更新、侧边栏用户信息栏与登出入口、亮/暗主题切换（`Theme.qml` darkMode 驱动 + `ThemeSettings` QSettings 持久化）。
+- M4.5 客户端体验完善：搜索用户直接发起对话（虚拟会话 + 首条消息 ACK 后绑定 conversationId）、发送乐观显示（发送中→已发送→已送达→已读实时流转）、显式已读回执、日期分隔线、会话选中高亮与未读角标本地实时更新、侧边栏用户信息栏与登出入口、亮/暗主题切换（`Theme.qml` darkMode 驱动 + `AppSettings` QSettings 持久化，M11A 起由 `AppSettings` 统一管理）。
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
 - M7a 群聊（明文，服务端与客户端均已落地）：服务端建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。客户端（子任务三）：`NetworkManager` 群组五接口 + 群消息 outbox 分流（明文直发不依赖 E2EE 引导，确定性错误移除待发项避免无限重试）；`LocalStore` 会话缓存群名/成员数（存量库幂等补列）；QML 建群（联系人多选）/群信息（成员列表/层级踢人/退群）/邀请（搜索多选）三个对话框，会话列表群样式与成员数标识，系统消息居中胶囊渲染。M7b 完成后群聊天区顶部“暂未端到端加密”横幅已改为群 E2EE 状态提示。
@@ -237,7 +237,8 @@ Chat-Client
   │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密；M6.5 起接入 LocalStore 缓存与持久化 outbox；M7a 起提供群组五接口与 sendGroupMessage（outbox 分流，群消息明文直发）；M7b 起实现 ensureGroupSenderKey/buildGroupSenderKeyDistribution/encryptGroupMessage/decryptGroupMessageObject 等群 Sender-Key E2EE 接口与 FetchGroupKeys 协议交互；2026-09-04 起接入会话续期：解析 `expiresAt` 过期前自动 `renewToken`（60 秒看门狗 + 失败退避）、失效发 `sessionExpired` 回登录页；M9 起接入 setConversationPrefs/editMessage/deleteMessage 与 conversationPrefsChanged/messageEdited/messageDeleted 信号）
   │     ├── core/KeyStorage（M6：身份/预密钥私钥持久化，Windows DPAPI 保护；TOFU 指纹存储；M6.5：LocalStore 存储密钥）
   │     ├── core/LocalStore（M6.5：按账号+设备隔离的 SQLite 加密本地缓存，M7a 含群会话字段，M7b 新增 sender_keys 表保存 chain key 与 Ed25519 签名密钥对，M9 新增会话 pinned/muted 与消息 edited_at/deleted 及 updateMessageContent/markMessageDeleted/clearDecryptedContent，见上文）
-  │     ├── core/ThemeSettings（QSettings 主题持久化，注册为 QML 上下文对象）
+  │     ├── core/AppSettings（M11A：QSettings 统一设置持久化，注册为 QML 上下文对象）
+  │     ├── core/TrayManager（M11A：系统托盘管理，QSystemTrayIcon + 桌面通知）
   │     └── models/User
   └── QWindowKit（QWK::Quick WindowAgent：无边框、拖拽、Snap Layout；标题栏自定义按钮需 setHitTestVisible 注册）
 ```
@@ -246,7 +247,7 @@ Chat-Client
 
 - `main.cpp` 依次 `engine.load()` 加载 `main.qml`（登录窗口）与 `pages/MainWindow.qml`（主窗口），两者均为独立根窗口；主窗口按 `objectName` 查找后注入登录窗口的 `mainWindow` 属性。**不能把主窗口声明在登录窗口 QML 内部**，否则会成为 transient 子窗口而不在 Windows 任务栏显示。
 - 窗口流转：启动→登录窗口→（登录成功）隐藏登录窗口并显示主窗口；登出→隐藏主窗口并重新显示登录窗口；关闭主窗口退出应用，主窗口打开时关闭登录窗口仅隐藏。
-- 主题：`Theme.qml` 全部颜色属性为 `darkMode ? 暗色 : 亮色` 绑定表达式，`main.qml` 用 `Binding` 将 `Theme.darkMode` 绑定到 `themeSettings.darkMode`，标题栏切换按钮写入 `themeSettings` 即全局生效并持久化。
+- 主题：`Theme.qml` 全部颜色属性为 `darkMode ? 暗色 : 亮色` 绑定表达式，`main.qml` 用 `Binding` 将 `Theme.darkMode` 绑定到 `appSettings.darkMode`，标题栏切换按钮写入 `appSettings` 即全局生效并持久化。
 - 聊天区：`ChatView` 消息列表直接用 `ListView`（不用外层 ScrollView 包 `height: contentHeight` 的 ListView，否则不可滚动）；自动贴底由 50ms Timer + `stayAtBottom`/`programmaticScroll` 标志实现（用户手动上滚时暂停贴底）。
 
 M7a 群聊 UI（子任务三新增）：
@@ -257,7 +258,7 @@ M7a 群聊 UI（子任务三新增）：
 
 与旧文档的差异说明：
 
-- 亮/暗主题切换已于 M4.5 实现（单一 `Theme.qml` 双配色 + `ThemeSettings` 持久化），不再需要独立的 `DarkTheme.qml`/`LightTheme.qml`。
+- 亮/暗主题切换已于 M4.5 实现（单一 `Theme.qml` 双配色 + `AppSettings` 持久化，M11A 起由 `AppSettings` 统一管理替代原 `ThemeSettings`），不再需要独立的 `DarkTheme.qml`/`LightTheme.qml`。
 
 - 客户端自 M6.5 起具备本地数据库（`LocalStore`，仅作加密展示缓存）；`models/User` 仍是登录态数据对象，未引入独立模型层。
 

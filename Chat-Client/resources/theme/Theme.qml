@@ -3,7 +3,7 @@ import QtQuick
 
 QtObject {
     // 主题模式（M4.5：亮/暗切换）
-    // 由 ThemeSettings 持久化驱动；所有颜色属性均为绑定表达式，
+    // 由 AppSettings 持久化驱动；所有颜色属性均为绑定表达式，
     // 切换 darkMode 后全界面自动刷新。
     property bool darkMode: false
 

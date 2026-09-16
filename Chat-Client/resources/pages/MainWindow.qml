@@ -34,8 +34,16 @@ Window {
         windowAgent.setup(mainWindow)
     }
 
-    // 关闭主窗口即退出应用
-    onClosing: Qt.quit()
+    // M11A: 关闭主窗口——若设置启用“最小化到托盘”且托盘可用则隐藏窗口而非退出应用
+    onClosing: function(close) {
+        if (typeof appSettings !== "undefined" && appSettings.minimizeToTray
+            && typeof trayManager !== "undefined" && trayManager.available) {
+            trayManager.minimizeToTray()
+            close.accepted = false
+        } else {
+            Qt.quit()
+        }
+    }
 
     // 主布局
     ColumnLayout {

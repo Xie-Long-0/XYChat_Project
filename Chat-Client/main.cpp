@@ -1,7 +1,8 @@
-#include <QGuiApplication>
+#include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QQuickWindow>
 
 #include <QWKQuick/qwkquickglobal.h>
 
@@ -9,16 +10,21 @@
 #include "core/FileImageProvider.h"
 #include "core/FileTransferManager.h"
 #include "core/MediaPlaybackManager.h"
-#include "core/ThemeSettings.h"
+#include "core/AppSettings.h"
+#include "core/TrayManager.h"
 
 int main(int argc, char *argv[])
 {
-    QGuiApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
+    QApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
     //QQuickWindow::setDefaultAlphaBuffer(true);
 
-    QGuiApplication app(argc, argv);
+    // M11A: 改用 QApplication（QSystemTrayIcon 的 QMenu 需要 Widgets 模块）
+    QApplication app(argc, argv);
     app.setOrganizationName("XYChat");
     app.setApplicationName("XYChat");
+    app.setApplicationVersion("1.0.1");
+    // M11A: 关闭最后一个窗口不退出应用（最小化到托盘后窗口隐藏，应用继续运行）
+    app.setQuitOnLastWindowClosed(false);
 
     // 设置默认样式
     QQuickStyle::setStyle("Basic");
@@ -26,8 +32,17 @@ int main(int argc, char *argv[])
     // 创建 NetworkManager
     NetworkManager networkManager;
 
-    // M4.5: 主题偏好持久化
-    ThemeSettings themeSettings;
+    // M11A: 应用设置统一管理（合并原 ThemeSettings）
+    AppSettings appSettings;
+    // M11A A3: 注入设置到 NetworkManager（用于检查通知开关）
+    networkManager.setAppSettings(&appSettings);
+
+    // M11A: 系统托盘管理器
+    TrayManager trayManager;
+
+    // M11A A3: 接线桌面通知（NetworkManager 发出请求 → TrayManager 弹出通知）
+    QObject::connect(&networkManager, &NetworkManager::desktopNotificationRequested,
+                     &trayManager, &TrayManager::showNotification);
 
     // M8.3b: 音视频播放器（C++ QMediaPlayer + DecryptingIODevice，从密文缓存
     // 流式解密播放，明文不落盘）。声明在 engine 之前，保证 engine 销毁时
@@ -40,7 +55,8 @@ int main(int argc, char *argv[])
 
     // 暴露 C++ 对象到 QML
     engine.rootContext()->setContextProperty("networkManager", &networkManager);
-    engine.rootContext()->setContextProperty("themeSettings", &themeSettings);
+    engine.rootContext()->setContextProperty("appSettings", &appSettings);
+    engine.rootContext()->setContextProperty("trayManager", &trayManager);
     // M8.2: 文件传输引擎（数据面 HTTP + 分片加解密 + 密文缓存）单独暴露，
     // QML 直接连其进度/状态信号并调用上传/下载/保存；文件密钥与清单不经 QML
     engine.rootContext()->setContextProperty("fileTransfer", networkManager.fileTransfer());
@@ -80,6 +96,11 @@ int main(int argc, char *argv[])
     }
     if (mainWindow != nullptr && loginRoot != nullptr) {
         loginRoot->setProperty("mainWindow", QVariant::fromValue(mainWindow));
+        // M11A: 将主窗口指针交给托盘管理器（用于最小化/恢复）
+        if (QQuickWindow *quickWindow = qobject_cast<QQuickWindow *>(mainWindow)) {
+            trayManager.setMainWindow(quickWindow);
+            trayManager.initialize();
+        }
     } else {
         qCritical() << "[Main] Failed to locate login/main root windows"
                     << "loginRoot:" << loginRoot << "mainWindow:" << mainWindow;

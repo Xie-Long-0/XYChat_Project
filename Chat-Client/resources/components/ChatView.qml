@@ -31,6 +31,9 @@ Rectangle {
     // 从 O(n) 全表扫描降为 O(1)（大文件多分片进度事件的热点路径）
     property var msgIndex: ({})
 
+    // M11A A4: 暴露输入框文本供 MainPage 草稿保存/恢复
+    property alias inputText: messageInput.text
+
     signal sendMessage(string content)
     signal backClicked()
     signal groupInfoRequested()
@@ -950,6 +953,21 @@ Rectangle {
 
     function scrollToBottom() {
         scrollTimer.restart()
+    }
+
+    // M11A A5: 滚动到指定消息（本地搜索结果跳转）
+    // 返回是否成功定位（消息不在当前列表中时返回 false）
+    function scrollToMessage(messageId) {
+        var row = rowForMessageId(messageId)
+        if (row < 0) {
+            return false
+        }
+        // 取消贴底模式，允许用户查看历史消息
+        chatView.stayAtBottom = false
+        chatView.programmaticScroll = true
+        messageListView.positionViewAtIndex(row, ListView.Center)
+        Qt.callLater(function() { chatView.programmaticScroll = false })
+        return true
     }
 
     function clearMessages() {

@@ -52,6 +52,11 @@ Rectangle {
     property int playMessageId: 0
     property int currentGroupMemberCount: 0
     property string searchMode: "chat"
+    // M11A A4: 草稿缓存（conversationId -> text），切换会话时保存/恢复输入框文本
+    // 内存级：退出应用后不保留（与规划一致）
+    property var drafts: ({})
+    // M11A A5: 待滚动到的消息 ID（搜索跳转时设置，消息加载完成后执行滚动）
+    property int pendingScrollMessageId: 0
 
     // P4.1: 传输横幅改为 Repeater over fileTransfer.tasks，多任务并发时每个任务
     // 独立显示“文件名 · 相位 进度% + 进度条 + 取消”。横幅置于内容区上方全宽
@@ -177,6 +182,7 @@ Rectangle {
                     searchMode = "chat"
                     searchDialog.open()
                 }
+                onMessageSearchClicked: localSearchDialog.open()
                 onRefreshClicked: loadConversationsRequested()
                 onCreateGroupClicked: createGroupDialog.open()
                 onConversationPrefsRequested: function(conversationId, pinned, muted) {
@@ -230,6 +236,29 @@ Rectangle {
                         font.weight: Font.DemiBold
                         color: Theme.textPrimary
                         elide: Text.ElideRight
+                    }
+
+                    // M11A: 设置按钮（齿轮图标）
+                    Rectangle {
+                        id: settingsBtn
+                        width: 36; height: 36
+                        radius: 18
+                        color: settingsMouse.containsMouse ? Theme.hoverColor : "transparent"
+
+                        MouseArea {
+                            id: settingsMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: settingsDialog.open()
+                        }
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "settings"
+                            size: 16
+                            iconColor: Theme.textSecondary
+                        }
                     }
 
                     Rectangle {
@@ -454,6 +483,35 @@ Rectangle {
         }
     }
 
+    // M11A: 设置对话框
+    SettingsDialog {
+        id: settingsDialog
+        onClearCacheRequested: {
+            if (typeof fileTransfer !== "undefined") {
+                var removed = fileTransfer.clearCache()
+                mainPage.fileNotice = "已清理 " + removed + " 个缓存文件"
+            }
+        }
+    }
+
+    // M11A A5: 本地消息搜索对话框
+    LocalSearchDialog {
+        id: localSearchDialog
+        onJumpToMessageRequested: function(conversationId, messageId) {
+            // 先切换到目标会话，设置待滚动消息 ID（消息加载完成后执行滚动）
+            var idx = convList.findIndexByConversationId(conversationId)
+            if (idx < 0) {
+                mainPage.fileNotice = "该消息所在会话已不在列表中"
+                return
+            }
+            var conv = convList.getConversation(idx)
+            if (conv) {
+                mainPage.pendingScrollMessageId = messageId
+                mainPage.openConversation(conv)
+            }
+        }
+    }
+
     Connections {
         target: typeof fileTransfer !== "undefined" ? fileTransfer : null
 
@@ -526,6 +584,27 @@ Rectangle {
         }
     }
 
+    // M11A A3: 绑定当前活动会话到托盘管理器（抑制该会话的桌面通知）
+    Binding {
+        target: typeof trayManager !== "undefined" ? trayManager : null
+        property: "activeConversation"
+        value: mainPage.currentConversationId
+        when: target !== null
+    }
+
+    // M11A A3: 点击桌面通知时跳转到对应会话
+    Connections {
+        target: typeof trayManager !== "undefined" ? trayManager : null
+
+        function onNotificationClicked(conversationId) {
+            var idx = convList.findIndexByConversationId(conversationId)
+            if (idx >= 0) {
+                var conv = convList.getConversation(idx)
+                if (conv) mainPage.openConversation(conv)
+            }
+        }
+    }
+
     // P2.2: 剪贴板助手。QML 无直接剪贴板 API，借只读 TextEdit 的
     // selectAll + copy 实现“复制消息正文”（隐藏、零尺寸，不参与布局与交互）
     TextEdit {
@@ -537,6 +616,13 @@ Rectangle {
     }
 
     function openConversation(conv) {
+        // M11A A4: 保存当前会话的草稿（切换前）
+        if (currentConversationId > 0) {
+            var d = drafts
+            d[currentConversationId] = chatView.inputText
+            drafts = d
+        }
+
         currentConversationId = conv.conversationId
         currentConversationType = conv.type || "private"
         if (currentConversationType === "group") {
@@ -558,9 +644,19 @@ Rectangle {
         chatView.unreadCount = conv.unreadCount || 0
         convList.setSelectedByConversationId(conv.conversationId)
         loadMessagesRequested(conv.conversationId, 0)
+
+        // M11A A4: 恢复新会话的草稿（切换后）
+        chatView.inputText = drafts[conv.conversationId] || ""
     }
 
     function openChatWithUser(userId, username) {
+        // M11A A4: 保存当前会话的草稿（切换前）
+        if (currentConversationId > 0) {
+            var d = drafts
+            d[currentConversationId] = chatView.inputText
+            drafts = d
+        }
+
         var existing = convList.findConversationByPeerId(userId)
         if (existing) {
             openConversation(existing)
@@ -577,6 +673,8 @@ Rectangle {
         chatView.clearMessages()
         chatView.unreadCount = 0
         convList.selectedIndex = -1
+        // M11A A4: 新会话无草稿，清空输入框
+        chatView.inputText = ""
     }
 
     function bindNewConversation(conversationId) {
@@ -594,6 +692,10 @@ Rectangle {
             var mm = now.getMinutes()
             var timeStr = (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm
             convList.updateForNewMessage(currentConversationId, content, timeStr, false)
+            // M11A A4: 发送成功后清除该会话的草稿
+            var d = drafts
+            delete d[currentConversationId]
+            drafts = d
         }
     }
 
@@ -614,7 +716,15 @@ Rectangle {
         }
     }
 
-    function updateMessages(messages) { chatView.setMessages(messages) }
+    function updateMessages(messages) {
+        chatView.setMessages(messages)
+        // M11A A5: 消息加载完成后执行待定的滚动（搜索结果跳转）
+        if (pendingScrollMessageId > 0) {
+            chatView.scrollToMessage(pendingScrollMessageId)
+            pendingScrollMessageId = 0
+        }
+    }
+
     function appendMessage(msg) { chatView.appendMessage(msg) }
     function confirmMessage(clientMessageId, messageId) { chatView.confirmOptimisticMessage(clientMessageId, messageId) }
     function updateMessageStatus(messageId, status) { chatView.updateMessageStatus(messageId, status) }

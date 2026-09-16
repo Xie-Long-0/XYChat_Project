@@ -27,11 +27,11 @@ ApplicationWindow {
         id: windowAgent
     }
 
-    // M4.5: 主题模式绑定（Theme 为全局单例，绑定一次即可作用于所有窗口）
+    // M11A: 主题模式绑定（Theme 为全局单例，绑定一次即可作用于所有窗口）
     Binding {
         target: Theme
         property: "darkMode"
-        value: themeSettings.darkMode
+        value: typeof appSettings !== "undefined" ? appSettings.darkMode : false
     }
 
     Component.onCompleted: {

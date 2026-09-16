@@ -10,6 +10,7 @@ Rectangle {
 
     signal conversationClicked(int index)
     signal searchClicked()
+    signal messageSearchClicked()
     signal refreshClicked()
     signal createGroupClicked()
     signal conversationPrefsRequested(int conversationId, bool pinned, bool muted)
@@ -71,6 +72,37 @@ Rectangle {
                     size: 16
                     iconColor: Theme.textSecondary
                 }
+
+                ToolTip.visible: searchMouse.containsMouse
+                ToolTip.delay: 600
+                ToolTip.text: "搜索用户"
+            }
+
+            // M11A A5: 消息搜索按钮（在当前账号本地缓存的消息正文中检索）
+            Rectangle {
+                id: messageSearchBtn
+                width: 36; height: 36
+                radius: 18
+                color: messageSearchMouse.containsMouse ? Theme.hoverColor : "transparent"
+
+                MouseArea {
+                    id: messageSearchMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: conversationList.messageSearchClicked()
+                }
+
+                Icon {
+                    anchors.centerIn: parent
+                    name: "search-messages"
+                    size: 16
+                    iconColor: Theme.textSecondary
+                }
+
+                ToolTip.visible: messageSearchMouse.containsMouse
+                ToolTip.delay: 600
+                ToolTip.text: "搜索消息"
             }
 
             // 标题

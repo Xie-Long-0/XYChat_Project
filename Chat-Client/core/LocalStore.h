@@ -89,6 +89,22 @@ public:
     // 会话行、群 Sender Key/跳过密钥、在途 outbox），与服务端硬删除对齐
     bool deleteConversation(qint64 conversationId);
 
+    // M11A A3: 桌面通知辅助查询
+    // 检查会话是否被设为免打扰（muted）
+    bool isConversationMuted(qint64 conversationId) const;
+    // 获取会话显示名称（私聊返回 peerUsername，群聊返回 name）
+    QString conversationDisplayName(qint64 conversationId) const;
+    // 获取会话类型（"private" 或 "group"），不存在返回空
+    QString conversationType(qint64 conversationId) const;
+
+    // M11A A5: 本地消息搜索
+    // 在本地缓存中搜索消息正文（解密后 LIKE 匹配），返回匹配的消息数组。
+    // 每条结果含 messageId/conversationId/senderUsername/content/createdAt。
+    // 搜索范围：全部会话（conversationId <= 0）或指定会话。
+    // 性能：千级消息量下可接受（< 1s），万级需考虑 FTS5 或异步搜索。
+    QJsonArray searchMessages(const QString &query, int limit = 50,
+                              qint64 conversationId = 0) const;
+
     // 解密缓存（messageId -> 明文，归口替代 M6 KeyStorage .cache）
     QString loadDecryptedContent(qint64 messageId) const;
     bool saveDecryptedContent(qint64 messageId, const QString &plaintext);

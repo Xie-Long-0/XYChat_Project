@@ -64,7 +64,11 @@ Rectangle {
                 iconColor: Theme.textPrimary
             }
 
-            onClicked: themeSettings.darkMode = !themeSettings.darkMode
+            onClicked: {
+                if (typeof appSettings !== "undefined") {
+                    appSettings.darkMode = !appSettings.darkMode
+                }
+            }
 
             Component.onCompleted: windowAgent.setHitTestVisible(themeToggleBtn)
         }

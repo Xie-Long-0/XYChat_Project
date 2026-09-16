@@ -16,6 +16,7 @@
 #include "TlsHelper.h"
 #include "SecureMemory.h"
 #include "GroupE2eeCrypto.h"
+#include "AppSettings.h"
 
 using namespace XYChat::Protocol;
 using namespace XYChat::Security;
@@ -2907,6 +2908,47 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     sanitizeForUi(uiMsg);
     emit newMessageReceived(uiMsg);
 
+    // M11A A3: 桌面通知（经 main.cpp 接线到 TrayManager）
+    // 条件：通知开关启用 + 会话未免打扰 + 消息非本人发出
+    if (m_appSettings && m_appSettings->notificationsEnabled()) {
+        const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
+        const qint64 senderId = msg.value("senderId").toVariant().toLongLong();
+        // 跳过本人发出的消息（多端同步场景）与免打扰会话
+        if (m_userId > 0 && senderId != m_userId && !m_localStore.isConversationMuted(convId)) {
+            const QString senderName = msg.value("senderUsername").toString();
+            // 通知正文：经 sanitizeForUi 脱敏后的内容（文件消息为 "[File] xxx"）
+            QString body = uiMsg.value("content").toString();
+            if (body.isEmpty() && uiMsg.value("isFileMessage").toBool()) {
+                body = uiMsg.value("fileName").toString();
+                if (!body.isEmpty()) {
+                    body = "[File] " + body;
+                }
+            }
+            if (body.isEmpty()) {
+                body = "[消息]";
+            }
+            // 消息预览开关：关闭时只显示 "[新消息]" 不显示正文
+            if (!m_appSettings->messagePreviewEnabled()) {
+                body = "[新消息]";
+            }
+            // 标题：群聊显示群名，私聊显示发送者
+            const QString convName = m_localStore.conversationDisplayName(convId);
+            const QString convType = m_localStore.conversationType(convId);
+            QString title;
+            if (convType == QLatin1String("group")) {
+                // 群聊：群名（发送者放在正文前缀）
+                title = convName.isEmpty() ? senderName : convName;
+                if (!senderName.isEmpty()) {
+                    body = senderName + ": " + body;
+                }
+            } else {
+                // 私聊：发送者名
+                title = senderName;
+            }
+            emit desktopNotificationRequested(convId, title, body);
+        }
+    }
+
     // 自动发送已送达确认
     const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
     if (msgId > 0) {
@@ -3237,6 +3279,13 @@ QVariantList NetworkManager::toVariantList(const QJsonArray &array) const
         result.append(val.toVariant());
     }
     return result;
+}
+
+// M11A A5: 本地消息搜索（经 LocalStore 解密后 LIKE 匹配）
+QJsonArray NetworkManager::searchMessages(const QString &query, int limit,
+                                          qint64 conversationId) const
+{
+    return m_localStore.searchMessages(query, limit, conversationId);
 }
 
 // M7a: 群组操作

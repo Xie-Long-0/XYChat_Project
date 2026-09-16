@@ -740,6 +740,83 @@ private slots:
         QCOMPARE(store.loadOutbox().size(), 0);
         store.closeAndDestroy();
     }
+
+    // M11A A5: 本地消息搜索
+    void searchMessagesFindsMatchingContent()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        // 写入测试消息
+        QVERIFY(store.upsertMessage(makeMessage(1, 10, "Hello world")));
+        QVERIFY(store.upsertMessage(makeMessage(2, 10, "Goodbye world")));
+        QVERIFY(store.upsertMessage(makeMessage(3, 11, "Hello there")));
+        QVERIFY(store.upsertMessage(makeMessage(4, 11, "Nothing special")));
+
+        // 搜索 "hello"（大小写不敏感）
+        QJsonArray results = store.searchMessages("hello", 50, 0);
+        QCOMPARE(results.size(), 2);
+        // 结果按 messageId 降序（最近优先）
+        QCOMPARE(results.at(0).toObject().value("messageId").toVariant().toLongLong(), 3LL);
+        QCOMPARE(results.at(1).toObject().value("messageId").toVariant().toLongLong(), 1LL);
+
+        // 搜索 "world"
+        results = store.searchMessages("world", 50, 0);
+        QCOMPARE(results.size(), 2);
+
+        // 搜索不存在的关键词
+        results = store.searchMessages("nonexistent", 50, 0);
+        QCOMPARE(results.size(), 0);
+
+        // 限制搜索范围到特定会话
+        results = store.searchMessages("hello", 50, 10);
+        QCOMPARE(results.size(), 1);
+        QCOMPARE(results.at(0).toObject().value("messageId").toVariant().toLongLong(), 1LL);
+
+        // 限制结果数量
+        results = store.searchMessages("o", 1, 0); // "o" 匹配所有含 o 的消息
+        QCOMPARE(results.size(), 1);
+
+        store.closeAndDestroy();
+    }
+
+    // M11A A3: 会话免打扰与显示名称查询
+    void conversationMutedAndDisplayName()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        // 私聊会话
+        QJsonObject privateConv;
+        privateConv["conversationId"] = 10;
+        privateConv["type"] = "private";
+        privateConv["peerUserId"] = 7;
+        privateConv["peerUsername"] = "alice";
+        privateConv["muted"] = false;
+        QVERIFY(store.upsertConversation(privateConv));
+
+        // 群聊会话（免打扰）
+        QJsonObject groupConv;
+        groupConv["conversationId"] = 20;
+        groupConv["type"] = "group";
+        groupConv["name"] = "项目群";
+        groupConv["muted"] = true;
+        QVERIFY(store.upsertConversation(groupConv));
+
+        // 检查免打扰状态
+        QVERIFY(!store.isConversationMuted(10));
+        QVERIFY(store.isConversationMuted(20));
+        QVERIFY(!store.isConversationMuted(999)); // 不存在的会话
+
+        // 检查显示名称
+        QCOMPARE(store.conversationDisplayName(10), QString("alice"));
+        QCOMPARE(store.conversationDisplayName(20), QString("项目群"));
+        QVERIFY(store.conversationDisplayName(999).isEmpty());
+
+        store.closeAndDestroy();
+    }
 };
 
 QTEST_GUILESS_MAIN(TestLocalStore)

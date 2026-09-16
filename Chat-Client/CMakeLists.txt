@@ -21,7 +21,8 @@ endif()
 
 # QML 模块：Qml + Quick；M6.5 本地持久化缓存需要 Sql（QSQLITE）
 # M8.3b: Multimedia 用于音视频元数据提取（QMediaPlayer/QVideoSink）与播放器
-find_package(Qt6 COMPONENTS Quick QuickControls2 Network Sql Multimedia REQUIRED)
+# M11A: Widgets 用于 QSystemTrayIcon 的 QMenu（托盘右键菜单）
+find_package(Qt6 COMPONENTS Quick QuickControls2 Network Sql Multimedia Widgets REQUIRED)
 # OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
 include(XYChatOpenSSL)
 xychat_find_openssl()
@@ -48,12 +49,13 @@ set(SOURCES
     core/MediaMetadataExtractor.cpp
     core/DecryptingIODevice.cpp
     core/MediaPlaybackManager.cpp
+    core/TrayManager.cpp
 )
 
 # C++ 头文件
 set(HEADERS
     core/NetworkManager.h
-    core/ThemeSettings.h
+    core/AppSettings.h
     core/KeyStorage.h
     core/LocalStore.h
     core/FileTransferManager.h
@@ -62,6 +64,7 @@ set(HEADERS
     core/MediaMetadataExtractor.h
     core/DecryptingIODevice.h
     core/MediaPlaybackManager.h
+    core/TrayManager.h
 )
 
 # 生成可执行文件
@@ -79,6 +82,7 @@ target_link_libraries(Chat-Client PUBLIC
     Qt6::Network
     Qt6::Sql
     Qt6::Multimedia
+    Qt6::Widgets
     OpenSSL::SSL
     QWindowKit::Core
     QWindowKit::Quick
