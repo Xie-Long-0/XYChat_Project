@@ -73,6 +73,14 @@ private slots:
     // P4.3: saveToFile 异步化——返回 token，解密写盘经本地泵增量推进，
     // 期间发 saving 相位进度，完成后发 fileSaved，逐字节还原
     void saveToFileIsAsyncWithProgress();
+    // M8 欠账修复：下载票据寿命短于大文件下载耗时（单次 GET 有字节上限，
+    // 2 GiB 需 2048 次串行 Range GET），旧实现把 401 当确定性故障直接失败并
+    // 丢弃全部已下载分片。必须验：401 后重新申请票据并从断点续传，且
+    // 续写偏移正确（最终字节级一致是唯一判据）
+    void downloadRenewsTicketAndResumesFromBreakpoint();
+    // 续期次数必须封顶：每次签发的票据都失效时，任务应明确失败而不是
+    // "申请-再 401"无限循环（与恢复轮次必须单独封顶同一教训）
+    void downloadTicketRenewalIsBounded();
 
 private:
     // 迷你控制面：与 RequestHandler 的口径一致（创建即签上传票据、完成即
@@ -84,6 +92,10 @@ private:
     // 取一个已上传完成的 fileId（前置断言非空）：用例可被单独运行，
     // 不得假定前一个用例已填充过映射
     qint64 requireUploadedFile();
+    // 上传一份全新的文件并返回其清单 JSON（失败返回空串）。每次上传都用新的
+    // 文件密钥，故密文 SHA-256（= 缓存键）唯一，不会命中此前用例留下的缓存，
+    // 从而保证调用方走的是真实下载而非缓存命中
+    QString uploadFreshManifest(qint64 *fileIdOut);
 
     QTemporaryDir *m_dir = nullptr;
     QString m_sourcePath;      // 上传源文件（明文）
@@ -198,6 +210,24 @@ qint64 TestFileTransfer::requireUploadedFile()
         return -1;
     }
     return m_blobKeys.begin().key();
+}
+
+QString TestFileTransfer::uploadFreshManifest(qint64 *fileIdOut)
+{
+    FileTransferManager uploader;
+    uploader.setCacheRoot(m_cacheRoot);
+    uploader.setBaseUrl(m_http->baseUrl());
+    wireControlPlane(uploader);
+
+    QSignalSpy sendSpy(&uploader, &FileTransferManager::sendMessageRequested);
+    const QString token = uploader.uploadAndSend(m_sourcePath, 0, 7);
+    if (token.isEmpty() || !waitForTask(uploader, token) || sendSpy.count() != 1) {
+        return QString();
+    }
+    if (fileIdOut) {
+        *fileIdOut = sendSpy.at(0).at(3).toLongLong();
+    }
+    return sendSpy.at(0).at(2).toString();
 }
 
 void TestFileTransfer::wireControlPlane(FileTransferManager &engine)
@@ -976,6 +1006,120 @@ void TestFileTransfer::saveToFileIsAsyncWithProgress()
     }
     QVERIFY(sawSaving);
     QCOMPARE(readFile(dest), readFile(m_sourcePath));
+}
+
+void TestFileTransfer::downloadRenewsTicketAndResumesFromBreakpoint()
+{
+    qint64 fileId = 0;
+    const QString manifestJson = uploadFreshManifest(&fileId);
+    QVERIFY(!manifestJson.isEmpty());
+    QVERIFY(fileId > 0);
+
+    const auto rec = m_db->getFileRecord(fileId);
+    QVERIFY(rec.has_value());
+    // 多片才谈得上"断点"：单片文件一次 GET 就结束，续传路径不会被走到
+    QVERIFY(rec->chunkCount >= 3);
+
+    // 捕获变量声明在 engine 之前：局部对象按声明逆序析构，这样 engine
+    // （及挂在它上面的 lambda 连接）会先销毁，不会在析构尾声中引用已亡变量
+    int ticketRequests = 0;
+    bool revoked = false;
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+
+    // 迷你控制面：每次申请都签发一张新票据（等价于 RequestHandler 的
+    // file_download_ticket），并统计申请次数
+    connect(&engine, &FileTransferManager::downloadTicketRequested, this,
+            [this, &engine, &ticketRequests](qint64 seq, qint64 id) {
+                const auto record = m_db->getFileRecord(id);
+                QVERIFY(record.has_value());
+                const QString ticket = FileCrypto::generateTicket();
+                m_db->issueFileTicket(id, m_userId, Protocol::FileTicketKind::Download,
+                                      FileCrypto::ticketHash(ticket), 300);
+                ++ticketRequests;
+                engine.onDownloadTicket(seq, true, ticket, record->sizeBytes, record->chunkSize,
+                                        record->chunkCount, record->sha256Hex, QString());
+            });
+
+    // 第一片落盘后立刻吊销全部下载票据：等价于下载进行到一半时票据失效
+    //（空闲超过 DownloadTicketTtlSeconds，或触及 DownloadTicketMaxLifetimeSeconds）。
+    // 服务端 blob 本身完好，因此唯有"重新申请票据 + 从断点续传"能救回这次下载；
+    // 旧实现把 401 当确定性故障，会直接失败并丢弃已下载的全部分片
+    connect(&engine, &FileTransferManager::taskProgress, this,
+            [this, fileId, &revoked](const QString &, const QString &, qint64 done, qint64) {
+                if (!revoked && done > 0) {
+                    revoked = true;
+                    m_db->revokeFileTickets(fileId, Protocol::FileTicketKind::Download);
+                }
+            });
+
+    const qint64 messageId = 6100;
+    engine.registerIncomingFile(messageId, manifestJson);
+    QVERIFY(!engine.isMessageFileAvailable(messageId));
+
+    QSignalSpy failSpy(&engine, &FileTransferManager::taskFailed);
+    const QString token = engine.download(messageId);
+    QVERIFY2(waitForTask(engine, token), "download did not finish after the ticket lapsed");
+    QCOMPARE(failSpy.count(), 0);
+    // 吊销过一张 -> 客户端必须重新申请过（首次申请 + 续期申请 = 2 次）
+    QCOMPARE(ticketRequests, 2);
+    QVERIFY(engine.isMessageFileAvailable(messageId));
+
+    // 唯一判据：逐字节一致。续写偏移一旦算错（从头覆盖、或多写/少写分片），
+    // 整体 SHA-256 与逐片 GCM 都必然对不上，这里也就不会相等
+    const QString dest = m_dir->path() + "/resumed.bin";
+    const QString saveToken = engine.saveToFile(messageId, dest);
+    QVERIFY(!saveToken.isEmpty());
+    QVERIFY2(waitForTask(engine, saveToken), "save did not finish");
+    QCOMPARE(readFile(dest), readFile(m_sourcePath));
+}
+
+void TestFileTransfer::downloadTicketRenewalIsBounded()
+{
+    qint64 fileId = 0;
+    const QString manifestJson = uploadFreshManifest(&fileId);
+    QVERIFY(!manifestJson.isEmpty());
+
+    const auto rec = m_db->getFileRecord(fileId);
+    QVERIFY(rec.has_value());
+
+    int ticketRequests = 0;
+    FileTransferManager engine;
+    engine.setCacheRoot(m_cacheRoot);
+    engine.setBaseUrl(m_http->baseUrl());
+
+    // 每次签发的票据都立即吊销：客户端每次 GET 都拿 401。续期必须封顶，
+    // 否则"申请票据 -> 401 -> 再申请"就是活锁（与"重试预算不得被恢复动作的
+    // 成功清零"同一教训：恢复轮次必须单独封顶）
+    connect(&engine, &FileTransferManager::downloadTicketRequested, this,
+            [this, &engine, &ticketRequests](qint64 seq, qint64 id) {
+                const auto record = m_db->getFileRecord(id);
+                QVERIFY(record.has_value());
+                const QString ticket = FileCrypto::generateTicket();
+                m_db->issueFileTicket(id, m_userId, Protocol::FileTicketKind::Download,
+                                      FileCrypto::ticketHash(ticket), 300);
+                m_db->revokeFileTickets(id, Protocol::FileTicketKind::Download);
+                ++ticketRequests;
+                engine.onDownloadTicket(seq, true, ticket, record->sizeBytes, record->chunkSize,
+                                        record->chunkCount, record->sha256Hex, QString());
+            });
+
+    const qint64 messageId = 6200;
+    engine.registerIncomingFile(messageId, manifestJson);
+
+    QSignalSpy failSpy(&engine, &FileTransferManager::taskFailed);
+    QSignalSpy doneSpy(&engine, &FileTransferManager::taskFinished);
+    const QString token = engine.download(messageId);
+    QVERIFY(!waitForTask(engine, token));
+    QCOMPARE(doneSpy.count(), 0);
+    QCOMPARE(failSpy.count(), 1);
+    QVERIFY(failSpy.at(0).at(1).toString().contains("HTTP 401"));
+    // 首次申请 1 次 + 续期上限 3 次（FileTransferManager::MaxTicketRenewals）。
+    // 该数值随上限变化——这正是本断言的目的：改动上限必须同步复核此处的期望
+    QCOMPARE(ticketRequests, 4);
+    // 失败不得留下半截缓存（否则下次会当作已就绪）
+    QVERIFY(!engine.isMessageFileAvailable(messageId));
 }
 
 QTEST_GUILESS_MAIN(TestFileTransfer)

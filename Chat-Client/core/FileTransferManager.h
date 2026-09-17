@@ -177,6 +177,14 @@ private:
     //（与 NetworkManager 的 friend 注入同一范式）
     friend class ::TestNetworkManager;
 
+    // 下载票据**连续**重新申请的次数上限。服务端下载票据按"最后一次使用"滑动续期，
+    // 但存在绝对寿命上限（DownloadTicketMaxLifetimeSeconds），且空闲超窗口即失效；
+    // 客户端收到 401 时凭此重新申请票据并从断点续传。必须封顶：否则"申请票据-再收到
+    // 401"会变成活锁，与重试预算被打回同一类缺陷。
+    // 注意是"连续"而非"累计"——任一分片成功落盘即清零（见 onGetFinished 成功分支），
+    // 否则一台休眠过几次的机器下载大文件时会因累计满 3 次而永久失败并丢掉全部进度
+    static constexpr int MaxTicketRenewals = 3;
+
     struct Task
     {
         QString token;
@@ -212,6 +220,8 @@ private:
         QString downloadTicket;
         int downloadIndex = 0;
         QString tmpPath;  // 下载中的临时密文文件
+        // 已重新申请票据的次数（401 -> 重申请 -> 断点续传），受 MaxTicketRenewals 封顶
+        int ticketRenewals = 0;
 
         // 当前正在传输的分片（上传/下载共用）与本分片已重试次数。
         // 串行传输下只有一个在途分片，故无需 per-chunk 计数

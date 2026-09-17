@@ -898,7 +898,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 - **取消顺序**：先落状态再删磁盘。反序会与并发的完成请求交错出“DB=ready 而 blob 已删”的不可自愈状态（下载票据能正常签发、数据面必然读失败）；本序最坏只留下“DB=cancelled 而分片仍在盘上”的隐形孤儿，由维护任务的终态回收兜底。`markFileCancelled` 带 `WHERE status='uploading'`，因此并发的取消/完成只有一方能赢得状态。
 - **已完成的文件不走取消接口**：它可能已被消息引用，撤回会让接收方的下载票据指向已消失的对象；未被引用的 `ready` 文件由回收任务处理。
 - **票据签发失败回滚**：申请上传时若 `issueFileTicket` 失败，立即把刚建的记录标 `cancelled`，避免留下一条无凭据可用、又白占并发配额的 `uploading` 行。
-- **票据生命周期**：上传票据 `UploadTicketTtlSeconds=86400`（覆盖大文件慢速上传），**上传完成/取消/标失败后立即由服务端吊销**（`revokeFileTickets`：分片已组装回收，持票也无处可用，留着只白白延长泄露窗口）；下载票据 `DownloadTicketTtlSeconds=300`（短时效，TTL 内可重复使用以支持 Range 分段与断点续下，因此**不**调 `markFileTicketUsed` 消费）；过期票据由维护任务 `pruneExpiredFileTickets` 清理。
+- **票据生命周期**：上传票据 `UploadTicketTtlSeconds=86400`（覆盖大文件慢速上传），**上传完成/取消/标失败后立即由服务端吊销**（`revokeFileTickets`：分片已组装回收，持票也无处可用，留着只白白延长泄露窗口）；下载票据 `DownloadTicketTtlSeconds=300` 是**空闲容忍窗口**而非总寿命——TTL 内可重复使用以支持 `Range` 分段与断点续下，因此**不**调 `markFileTicketUsed` 消费，且每次授权通过时按“最后一次使用”把寿命推回完整窗口（`renewFileTicket`）。之所以必须滑动：单次 GET 上限 4 MiB，2 GiB 文件要 2048 次串行 Range GET，固定 TTL 会让慢链路下载必然中途失效。续期同时以 `DownloadTicketMaxLifetimeSeconds=86400`（自签发起算）为**绝对上限**封顶，否则泄露票据只要被持续使用就能无限续命；且**只对仍然有效且未消费的票据生效**（不复活已失效票据）。续期失败不改变本次授权结论，故授权路径不因它 fail-closed。客户端侧对应：收到 401 且已有已下载分片时重新申请票据并从断点续传（次数由 `FileTransferManager::MaxTicketRenewals=3` 封顶，防止“申请－再 401”活锁）。过期票据由维护任务 `pruneExpiredFileTickets` 清理。
 
 ### 数据面（HTTP(S)，M8.2）
 

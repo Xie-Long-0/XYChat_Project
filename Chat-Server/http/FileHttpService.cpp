@@ -255,6 +255,14 @@ std::optional<FileTicketInfo> FileHttpService::authorizeTicket(const QHttpServer
         respondError(responder, Status::Unauthorized, "Invalid file ticket");
         return std::nullopt;
     }
+    // 授权即续期（仅下载票据）：单次 GET 有字节上限，2 GiB 文件要 2048 次 Range GET，
+    // 固定 TTL 会让慢链路下载中途失效。续期失败不改变本次授权结论（票据此刻已验证
+    // 有效），只意味着"若客户端长时间空闲，下次可能需要重新申请票据"——而客户端
+    // 收到 401 会重新申请并从断点续传，因此这里绝不能 fail-closed 拒绝本次请求
+    if (kind == QLatin1String(Protocol::FileTicketKind::Download)) {
+        m_db.renewFileTicket(info->id, Protocol::DownloadTicketTtlSeconds,
+                             Protocol::DownloadTicketMaxLifetimeSeconds);
+    }
     return info;
 }
 

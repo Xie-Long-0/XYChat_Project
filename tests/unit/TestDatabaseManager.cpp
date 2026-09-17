@@ -98,6 +98,9 @@ private slots:
     void terminalFilesAreSelectableForReaping();
     void fileTicketIssueValidateConsume();
     void fileTicketRejectsExpiryAndPrunes();
+    // M8 欠账修复：下载票据滑动续期的两条边界——寿命被推后，但绝不越过
+    // created_at + maxLifetime；且续期不能复活已失效/已消费的票据
+    void fileTicketRenewalSlidesButIsCapped();
     void fileAccessRequiresMessageReference();
     void messageCarriesFileIdAcrossReadPaths();
     void deleteFileRecordRefusesReferencedFile();
@@ -1769,6 +1772,82 @@ void TestDatabaseManager::fileTicketRejectsExpiryAndPrunes()
     QVERIFY(m_db->pruneExpiredFileTickets() >= 1);
     // 清理后再扫一次应无过期票据（其余票据 TTL 均在未来）
     QCOMPARE(m_db->pruneExpiredFileTickets(), 0);
+}
+
+void TestDatabaseManager::fileTicketRenewalSlidesButIsCapped()
+{
+    auto user = m_db->getUserByUsername("testuser");
+    QVERIFY(user.has_value());
+    const qint64 fileId = makeUpload(*m_db, user->id, "tk03");
+    QVERIFY(m_db->markFileReady(fileId));
+
+    // 票据剩余寿命（秒）：直接问 SQLite，避免把日期串比较写进断言
+    const auto remainingSeconds = [this](const QString &ticketHash) {
+        QSqlQuery q(QSqlDatabase::database(m_connectionName));
+        q.prepare("SELECT CAST(strftime('%s', expires_at) AS INTEGER) "
+                  "- CAST(strftime('%s', 'now') AS INTEGER) FROM file_tickets "
+                  "WHERE ticket_hash = ?");
+        q.addBindValue(ticketHash);
+        if (!q.exec() || !q.next()) {
+            return -1000000;
+        }
+        return q.value(0).toInt();
+    };
+
+    const QString hash = QString(64, 'g');
+    QVERIFY(m_db->issueFileTicket(fileId, user->id, "download", hash, 300));
+    const auto ticket = m_db->validateFileTicket(hash, "download");
+    QVERIFY(ticket.has_value());
+
+    // 把寿命拨到只剩 10 秒，模拟"大文件下载途中票据即将到期"。
+    // 留 10 秒而非 1 秒是抗调度停顿：本条与下面的续期调用之间若被抢占超过窗口，
+    // 票据会真的过期而续期被拒（续期只对仍有效的票据生效），属用例自身的假失败
+    QSqlQuery shrink(QSqlDatabase::database(m_connectionName));
+    shrink.prepare("UPDATE file_tickets SET expires_at = datetime('now', '+10 seconds') "
+                   "WHERE ticket_hash = ?");
+    shrink.addBindValue(hash);
+    QVERIFY(shrink.exec());
+    QVERIFY(remainingSeconds(hash) <= 11);
+
+    // 滑动续期：寿命被推后到完整的 ttlSeconds（而非维持拨小后的 10 秒）
+    QVERIFY(m_db->renewFileTicket(ticket->id, 300, 24 * 3600));
+    const int ttlAfterRenew = remainingSeconds(hash);
+    QVERIFY(ttlAfterRenew >= 290);
+    QVERIFY(ttlAfterRenew <= 300);
+    QVERIFY(m_db->validateFileTicket(hash, "download").has_value());
+
+    // 绝对上限：即使传入 30 天的滑动窗口，也不得越过 created_at + 24h
+    QVERIFY(m_db->renewFileTicket(ticket->id, 30 * 24 * 3600, 24 * 3600));
+    const int ttlCapped = remainingSeconds(hash);
+    QVERIFY(ttlCapped <= 24 * 3600);
+    // created_at 就在刚刚，故续到上限后应接近 24 小时
+    QVERIFY(ttlCapped >= 24 * 3600 - 60);
+    // 封顶后仍可校验通过（上限不等于失效）
+    QVERIFY(m_db->validateFileTicket(hash, "download").has_value());
+
+    // 已消费的票据不可续期：续期不得把用过的票据救回来
+    QVERIFY(m_db->markFileTicketUsed(ticket->id));
+    QVERIFY(!m_db->renewFileTicket(ticket->id, 300, 24 * 3600));
+
+    // 已过期的票据同样不可续期（否则泄露的旧票据被拾起就又能用）
+    const QString staleHash = QString(64, 'h');
+    QVERIFY(m_db->issueFileTicket(fileId, user->id, "download", staleHash, 300));
+    const auto stale = m_db->validateFileTicket(staleHash, "download");
+    QVERIFY(stale.has_value());
+    QSqlQuery expire(QSqlDatabase::database(m_connectionName));
+    expire.prepare("UPDATE file_tickets SET expires_at = datetime('now', '-1 seconds') "
+                   "WHERE ticket_hash = ?");
+    expire.addBindValue(staleHash);
+    QVERIFY(expire.exec());
+    QVERIFY(!m_db->validateFileTicket(staleHash, "download").has_value());
+    QVERIFY(!m_db->renewFileTicket(stale->id, 300, 24 * 3600));
+    // 续期失败后仍不可用（不得被"续期尝试"意外复活）
+    QVERIFY(!m_db->validateFileTicket(staleHash, "download").has_value());
+
+    // 入参兜底
+    QVERIFY(!m_db->renewFileTicket(0, 300, 24 * 3600));
+    QVERIFY(!m_db->renewFileTicket(-1, 300, 24 * 3600));
+    QVERIFY(!m_db->renewFileTicket(999999, 300, 24 * 3600));   // 不存在的 id
 }
 
 void TestDatabaseManager::fileAccessRequiresMessageReference()

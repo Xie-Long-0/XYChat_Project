@@ -56,7 +56,7 @@
 ### M0：工程基线（2026-07-01）
 
 - 交付：README、`.gitignore`、`docs/` 四文档、GitHub Actions CI（configure/build/test）、Qt Test 框架与 `TestEncryptionManager`、顶层 CMake 统一（C++20、警告选项、`XYCHAT_BUILD_TESTS`）。
-- **更正（2026-09-09 周度审查）**：上述"CI 全流程通过"自 2026-08-03 起已不成立——`.github/workflows/cmake.yml` 随 `31622df` 被删，连续 5 周无任何机器门禁，期间各里程碑的 "`ctest` 6/6" 仅靠本地手工运行得出（并因此遗漏一项约 50% 概率失败的单测，见 M9）。工作流已于 2026-09-09 重建（windows-latest + Qt 6.8.3，三步 + 失败上传 `LastTest.log`）；**重建后的首次运行即暴露配置缺陷**——安装器默认只装 Qt base，而项目依赖的 Multimedia/HttpServer 属独立 add-on 模块，configure 阶段报 `Failed to find required Qt component "Multimedia"`。2026-09-16 连修两处：① 补 `modules` 声明，解决 configure 阶段的 add-on 模块缺失；② 修 build 阶段 `TestGroupRepro` 的 `certs` 目录自我拷贝竞态（详见 §10）。**仍待一次绿色运行确认**。
+- **更正（2026-09-09 周度审查）**：上述"CI 全流程通过"自 2026-08-03 起已不成立——`.github/workflows/cmake.yml` 随 `31622df` 被删，连续 5 周无任何机器门禁，期间各里程碑的 "`ctest` 6/6" 仅靠本地手工运行得出（并因此遗漏一项约 50% 概率失败的单测，见 M9）。工作流已于 2026-09-09 重建（windows-latest + Qt 6.8.3，三步 + 失败上传 `LastTest.log`）；**重建后的首次运行即暴露配置缺陷**——安装器默认只装 Qt base，而项目依赖的 Multimedia/HttpServer 属独立 add-on 模块，configure 阶段报 `Failed to find required Qt component "Multimedia"`。2026-09-16 连修两处：① 补 `modules` 声明，解决 configure 阶段的 add-on 模块缺失；② 修 build 阶段 `TestGroupRepro` 的 `certs` 目录自我拷贝竞态（详见 §10）。**2026-09-17 已确认绿色通过**，门禁自 2026-09-09 重建以来的悬空状态就此销账。
 
 ### M1：网络协议层（2026-07-01）
 
@@ -120,8 +120,10 @@
 
 集中管理所有已识别但未实施的修复/功能项；销账或新增时更新本表（优先级 P1 最高）。
 
-> **近期销账（历史，明细见 §10）**：2026-09-10 M8 前置 P2/P3 清理（三端点限流、编辑/删除多槽匹配与队列串行、`TestNetworkManager`、`AGENTS.md`）；2026-09-11 M8.2（数据面未实施、票据校验无生产调用点）；2026-09-14 M10 Phase 4（上传 hashing 与 `saveToFile` 异步化、传输横幅多任务、QML 状态更新 O(n)→Map、文件消息重发引导、Theme 装饰性注释）。异步化采**单线程时间片增量泵送**（非工作线程）——无数据竞争、密文逐字节不变，规避了规划中标注的并发损坏风险。同轮 CodeReview 的已修项（含 M8.2 的 3 项 P0：清单密钥经非推送路径泄入 QML、任务容器悬垂引用、泵送中 erase 致迭代器失效）不在下表。
+> **近期销账（历史，明细见 §10）**：2026-09-10 M8 前置 P2/P3 清理（三端点限流、编辑/删除多槽匹配与队列串行、`TestNetworkManager`、`AGENTS.md`）；2026-09-11 M8.2（数据面未实施、票据校验无生产调用点）；2026-09-14 M10 Phase 4（上传 hashing 与 `saveToFile` 异步化、传输横幅多任务、QML 状态更新 O(n)→Map、文件消息重发引导、Theme 装饰性注释）；**2026-09-17 下载票据生命周期修复（P2「TTL 与大文件下载不匹配且中途不续期」销账；两条相关 P3 口径修正，见下）**。异步化采**单线程时间片增量泵送**（非工作线程）——无数据竞争、密文逐字节不变，规避了规划中标注的并发损坏风险。同轮 CodeReview 的已修项（含 M8.2 的 3 项 P0：清单密钥经非推送路径泄入 QML、任务容器悬垂引用、泵送中 erase 致迭代器失效）不在下表。
 > **未销账**：P2「文件控制面五处理器无自动化测试」仍成立——M8.2 补的是**数据面**与**客户端引擎**的集成测试，`RequestHandler` 的五个 M8 处理器（鉴权与入参顺序、限流、幂等、finalize 分类）依旧只有人工复核。下表含 2026-09-11 M8.2 与 2026-09-14 M10 审查提出但**未修**的项。
+>
+> **新增（2026-09-17 发现，非本轮功能引入）**：P3「`TestNetworkManager::largePageEmittedOnceInOrderAcrossSlices` 的 5 秒预算不足」——该用例以 300 条 × 2 KB 正文构造跨时间片大页，`QTRY_COMPARE` 默认 5000 ms 预算；同一二进制 5 次实跑 100% 复现，泵稳定需要 14500-14900 ms（隔离跑与整卷跑一致，与负载无关）。失败形态是 QTest 的**超时溢出**（它自身报告"约 14.6 s 即可满足"）而非 emit 次数或顺序不符，已登记见下表。**该条不可当偶发忽略**，但属测试预算问题而非产品缺陷。
 
 | 优先级 | 类别 | 条目 | 来源 | 影响/说明 |
 | --- | --- | --- | --- | --- |
@@ -141,15 +143,14 @@
 | P3 | 工程 | `TestNetworkManager` 未覆盖 pump 与编辑解密回退路径 | 2026-09-10 CodeReview | 现有用例锁定 requestId 多槽匹配/消费、去重、断线清理；但 `pumpPrivateEditFetch`+`handleFetchKeysResponse` 编辑分支（需模拟 fetch 响应、会写 socket）与 88 推送“解密失败不写空”幂等回退不变量因难构造无网络环境而未断言；属测设完善，不阻塞 |
 | P2 | 工程 | 对象存储为单机本地文件系统，无副本/无冗余 | 2026-09-10 M8.1 | `LocalFileStorage` 磁盘损坏即文件丢失；限流与并发配额为单实例/单库口径，多实例部署需换共享对象存储（`IObjectStorage` 已抽象，可接 S3/MinIO）并把配额改为全局口径 |
 | P2 | 工程 | 文件控制面五处理器无自动化测试 | 2026-09-10 M8.1 | `RequestHandler` 的 M8 处理器（鉴权与入参校验顺序、限流、幂等、finalize 结果分类、枚举预言机合并）只有人工复核；数据层（14 用例）、存储层（19 用例）、**数据面（11 用例）与客户端引擎（12 用例，M8.2 补）**已覆盖。建议复用 `TestNetworkManager` 的 friend 注入范式补 handler 级测试 |
-| P2 | 功能 | 下载票据 TTL（300s）与大文件下载不匹配，且中途不续期 | 2026-09-11 CodeReview | 2 GiB / 4 MiB = 512 次串行 Range GET，慢链路下总时长易超 300s；票据过期后回 401，而 4xx 被判为非瞬时故障 → 直接失败并删临时文件，**已下载的全部进度丢弃且无续传**。建议：提高 TTL 或改为按“最后一次使用”滑动续期，并在客户端收到 401 且 `downloadIndex > 0` 时走“重新申请票据 + 从断点续传”分支 |
 | P2 | 安全 | `QHttpServer` 在进入 handler 前已缓冲整个请求体 | 2026-09-11 CodeReview | `QHttpServerRequest::body()` 返回已缓冲的 `QByteArray`，因此代码里的“超大分片早退 413”发生在内存已被消耗之后；`QAbstractHttpServer` 无内建请求体上限，**未认证**客户端可用巨大 `Content-Length` 的 PUT 造成内存放大（而 per-IP 限流只计失败，对首次请求无效）。建议：前置一层自行解析请求头做 `Content-Length` 预检，或强制要求数据面部署在带 body 上限的反向代理之后（当前 `--http-host` 默认仅回环是正确的）；并补已授权请求的并发数与字节速率上限 |
 | P3 | 工程 | `LocalStore.messages` 表无 `file_id` 列 | 2026-09-11 CodeReview | 从本地缓存回填的消息不带 `fileId`，现由 `attachFileInfo` 从清单内取回（清单经 E2EE 保护且自带 `fileId`，功能等价），但少了服务端权威字段的交叉校验，且每次回填都要解一次清单 JSON。建议下一轮客户端迁移（V11）补列 |
 | P3 | 工程 | `clearCache` 会删掉在途下载的临时文件 | 2026-09-11 CodeReview | `entryList(QDir::Files)` 会匹配 `<sha>.<uuid>.tmp` 并删除，随后还可能 rmdir 桶目录，使在途任务下次写入失败；返回的删除条数也把 `.tmp` 计入。影响有限（任务会明确失败而不是静默写坏缓存），建议跳过 `*.tmp` 或先取消在途下载 |
 | P3 | 工程 | `finalizeDownload` 的 exists + rename 存在 TOCTOU | 2026-09-11 CodeReview | 两个任务并发下载同一文件时，Windows 的 `rename` 不覆盖已存在文件 → 报“Cannot move ... into the cache”，而缓存其实已完好。建议 rename 失败后重新 `isCached` 判定，命中即视为成功 |
-| P3 | 安全 | `markFileTicketUsed` 仍无生产调用点；过期票据行以 `used=0` 残留 | 2026-09-11 CodeReview | 下载票据刻意允许 TTL（300s）内重复使用以支持 Range 分段，因此不消费是设计意图；但 `FileProtocol.h` 附近的注释把它描述成一次性票据，应修正；过期行由 `pruneExpiredFileTickets` 每小时清理，若需更严可改为每段单独签发或绑定数据面会话 |
+| P3 | 安全 | `markFileTicketUsed` 仍无生产调用点；过期票据行以 `used=0` 残留 | 2026-09-11 CodeReview | **注释失实部分已于 2026-09-17 修正**：`FileProtocol.h` 原文写“一次性、短时效”，与“刻意允许窗口内重复使用”的实际语义相反，现已改为准确表述（空闲容忍窗口 + 绝对寿命上限），并同步 `SECURITY.md`/`PROTOCOL.md`。**仍然成立的是设计取舍本身**：下载票据不消费（一次性消费与 `Range` 分段互斥），过期行由 `pruneExpiredFileTickets` 每小时清理，若需更严可改为每段单独签发或绑定数据面会话 |
 | P3 | 功能 | 视频播放无动态画面（只输出音频轨 + 静态封面） | 2026-09-11 M8.3b | `MediaPlaybackManager` 用 C++ QMediaPlayer + `DecryptingIODevice` 流式解密播放（明文不落盘），但 QML VideoOutput 无法绑定 C++ QVideoSink（无公开 videoSink 属性），且 QML Video 元素的 source 只接受 URL 不支持自定义 QIODevice。当前视频播放只闻其声不见其画（静态封面取自清单 thumb）；补齐需自定义 QSGNode/QQuickPaintedItem 渲染 QVideoFrame，或在 C++ 侧 qobject_cast QML VideoOutput 调 setVideoSink（脆弱） |
 | P3 | 功能 | 无按用户的存储用量配额 | 2026-09-10 M8.1 | 现有约束为单文件 ≤2 GiB + 并发上传 ≤8 + 48 小时超期回收，但已就绪文件可无限累积（仅受消息删除联动回收影响）；需按用户/按会话的字节配额与用量统计接口 |
-| P3 | 安全 | 下载票据在 TTL 内可重复使用 | 2026-09-10 M8.1 | 为支持 `Range` 分段与断点续下而刻意允许（TTL 300 秒），泄露后可在窗口内重放下载该文件；一次性消费（`markFileTicketUsed`）与分段下载互斥，属取舍。大文件场景下 TTL 不足的风险另见上方 P2 |
+| P3 | 安全 | 下载票据在窗口内可重复使用 | 2026-09-10 M8.1 | 为支持 `Range` 分段与断点续下而刻意允许（一次性消费与分段下载互斥），泄露后可在窗口内重放下载该文件。**2026-09-17 修复后的口径**：窗口由“固定 300 秒”改为“最后一次使用起算的空闲容忍窗口”，但以 `DownloadTicketMaxLifetimeSeconds`（自签发起算 24 小时）为绝对上限封顶——上限不可省，否则持续使用的泄露票据可无限续命。真实暴露面由“300 秒”变为“最多 24 小时”，属**风险后移而非消除**，故本条保留。原先“大文件下 TTL 不足”的风险已随同轮修复销账 |
 | P3 | 工程 | `putChunk` 不入条带锁 | 2026-09-10 CodeReview | 依赖 `finalize` 的逐片长度 + 整体 SHA-256 关卡兜底：并发写同一片只会导致组装判失败（要求重传），不会把损坏对象推上下载路径；代价是极端并发下多一次重传 |
 | P3 | 工程 | 回收查询每轮 `limit=100`，积压大时需多轮收敛 | 2026-09-10 M8.1 | `getStaleUploads`/`getTerminalFiles`/`getUnreferencedReadyFiles` 均为每轮上限 100 行、每小时一轮；大量遗留时收敛慢且无积压告警指标 |
 | P3 | 工程 | 文件回收任务在主线程做同步磁盘 I/O | 2026-09-10 CodeReview | `pruneFileUploads` 由 Server（主）线程的定时器驱动，该线程同时承担 `incomingConnection` 与 `onMessageForUser` 路由；`remove()`（内部 `removeRecursively`）为阻塞调用，三轮合计每轮最多约 300 次删除，大文件/多分片目录时可能短时阻塞连接接受与消息转发。量级有界（每小时、limit=100）且定时器不重入，属响应性隐患而非正确性缺陷；积压增大后可移至独立维护线程或工作池 |
@@ -157,6 +158,7 @@
 | P3 | 安全 | `processDeleteConversationRequest` 对非成员暴露“会话是否存在”的错误码差异（存在性 oracle） | 2026-09-14 M10 CodeReview | 权限校验顺序为 形态→限流→`getConversation`(存在性)→`isConversationMember`→群主校验；非成员探测时“存在但非成员”回 `PermissionDenied`、“不存在”回 `ConversationNotFound`，二者可区分。会话 ID 自增需先验知识、成员间本已互知，信息增益极低。建议（可选）对“非成员”与“不存在”统一错误码消除区分度 |
 | P3 | 工程 | M12 消息页泵的"真正跨时间片"续做无确定性用例 | 2026-09-16 CodeReview | 分片预算 `kMessagePageSliceNs` 是编译期常量、无注入点，测试只能构造"大页"提高跨片概率（`largePageEmittedOnceInOrderAcrossSlices` 断言的是"整页单次 emit 且保序"，不依赖实际片数）。续做逻辑本身由泵的"只从队列头取、片内续用成员"结构保证，真机大页已验；如需锁死多片路径需为预算加测试接缝 |
 | P3 | 工程 | 客户端 sync_messages 在途请求与页队列无超时/上限 | 2026-09-16 CodeReview | `m_pendingSyncRequests` 仅在响应或断线时清理（服务端漏答则该登记项残留到断开），`m_messagePageQueue` 无条数上限（每个任务 ≤100 行密文 + 已解密正文）。实际增长受"视图数 ≤8 + 用户切换速率"约束，暂未观察到堆积；限流/超时清扫可与既有欠账（编辑/删除在途请求无超时清扫）一并实施 |
+| P3 | 工程 | `TestNetworkManager::largePageEmittedOnceInOrderAcrossSlices` 的 5 秒预算不足 | 2026-09-17 实跑发现 | 用例以 300 条 × 2 KB 正文构造跨时间片大页，`QTRY_COMPARE` 用默认 5000 ms 预算；**同一二进制 5 次实跑（3 次只跑该函数 + 2 次整卷）100% 复现**，泵所需时间稳定在 14500-14900 ms（隔离跑与整卷跑几乎一致，故**与机器负载无关**，是该配置下大页的固有开销）。每次失败都是 QTest 的 `timeout was too short, ~14.6 s would have been sufficient`——即**被等待的条件最终确实成立**，失败发生在任何逻辑断言求值之前，属**时间预算**问题而非正确性缺陷；该用例也不触及 2026-09-17 的改动（不构造 `FileTransferManager`、不碰 `DatabaseManager`/`FileHttpService`），同期三个相关套件 65/65、12/12、22/22 全绿。**注意它不可当"偶发抖动"忽略**（100% 复现）。建议：显式传 `QTRY_COMPARE_WITH_TIMEOUT(..., 60000)` 或缩小页规模，使其只保留"整页单次 emit + 保序"的原意 |
 
 ## 4. 未来里程碑规划
 
@@ -182,7 +184,7 @@
 - QML UI：`MessageInput` 附件按钮 + `FileDialog`（`QUrl` 原样交给 C++，由 `fileTransfer.toLocalPath()` 转本地路径）；`MessageBubble` 文件面板（图标/名/大小/进度/下载/另存，编辑项对文件消息禁用）；`ChatView` 新字段与信号 + `updateFileState`/`updateFileProgress`；`MainPage` 传输横幅、另存对话框、`Connections` 接线；引擎注册为 context property `fileTransfer`。
 - 验证：`TestFileHttpService`（11）、`TestFileTransfer`（12，含 2.5 MiB 跨 3 片文件端到端字节级往返 + "服务端只见密文"断言）、`TestNetworkManager` +1（P0 回归 `fileManifestNeverReachesUiLayer`）、`TestFileProtocol` +1；`ctest` **11/11**；`qmllint` 零错误。集成测试当场抓到编译期无法发现的真实缺陷：`QAbstractHttpServer::bind()` 要求 server 已在监听，原顺序反了（生产同样会启动失败）。
 - 审查：CodeReview 发现 **3 项 P0 均已修**（① 清单密钥只在实时推送路径脱敏，`sync_messages`/本地缓存回填/`sync_events` 三条路径会把含密钥的 JSON 渲染进气泡 → 收口为唯一出口 + "形态像清单就置空"兜底；② `finishTask`/`failTask` 的 `token` 参数常是容器内元素的引用，`erase` 后悬垂而 `emit` 还要读它（每次成功/失败/取消都走到）；③ `pumpNext` 在 `QHash` 遍历中 erase 当前节点致迭代器失效 + 递归泵送破坏串行承诺）；3 项 P1 已修（重试预算被成功查询清零致活锁、下载气泡永久卡"下载中"、发送方无法下载自己发的文件）；P2/P3 各修两项。未修项已登记 §3。
-- 已知限制：hashing 与 `saveToFile` 解密曾在 GUI 线程同步（已由 M10 P4.4/P4.3 销账）；下载票据 TTL 对不匹配大文件且无断点续传；数据面无请求体上限预检；**双客户端实机联调尚未做**（属人工验证）。
+- 已知限制：hashing 与 `saveToFile` 解密曾在 GUI 线程同步（已由 M10 P4.4/P4.3 销账）；下载票据寿命与大文件下载不匹配、且客户端无断点续传（已由 2026-09-17 修复，见 §10）；数据面无请求体上限预检（§3 P2）；**双客户端实机联调尚未做**（属人工验证）。
 
 #### M8.3 多媒体元数据（M8.3a/b/c 全部已完成 2026-09-11）
 
@@ -276,7 +278,7 @@
 
 下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**M12 聊天流畅性与多会话体验已完成（§4.7）**；其余候选待讨论确定：
 
-1. **解决历史遗留 P2 欠账**（§3 中 P2 优先）：大群分发超限、群密钥"先落盘后分发"窗口、TLS 端到端集成测试、下载票据 TTL 与断点续传、数据面请求体上限预检、文件控制面 handler 级测试。
+1. **解决历史遗留 P2 欠账**（§3 中 P2 优先）：大群分发超限、群密钥"先落盘后分发"窗口、TLS 端到端集成测试、数据面请求体上限预检、文件控制面 handler 级测试（下载票据 TTL 与断点续传已于 2026-09-17 销账）。
 2. **M11B 消息交互增强（§4.4）**，片内顺序：B1 多选模式 → B3 消息转发（依赖 B1 的选择集）→ B2 消息回复/引用（含 V11 迁移与服务端改动，**单独提交以便回滚**）→ B4 emoji 选择器。B2 是 M11 唯一一次协议扩展，宜排在纯 QML 的 B1/B3/B4 之后单独入库。
 3. **M11C 群聊与布局完善（§4.5）**，片内顺序：C1 群信息抽屉 → C3 响应式布局（依赖 C1 的抽屉组件）；C2 最后在线时间（需服务端回填）可并行。
 4. **M11 稳定性剩余项（§4.6）**：指标监控、崩溃捕获与客户端日志上报、备份恢复演练、压测（持续，可与 M11B/M11C 并行）。
@@ -359,3 +361,4 @@
 | 2026-09-16 | M12.3 完成：QML 增量应用消息 | `ChatView.setMessages` 由 `msgModel.clear()` + 全量重建改为**按 messageId 合并**：已存在的行原地更新（不销毁 delegate）、新消息按 id 序插入、未读分隔线只在首次填充放置；状态更新加秩比较（只前进不回退，与 `LocalStore::statusRank` 同口径），附件下载进度/状态不再被刷新页重置（此前 `fileState`/`fileProgress` 会随重建丢失）；首次填充即置贴底意图，消除服务端页在 50ms 定时器窗口内到达时误报 FAB 徽标。顺带修复旧实现的隐性丢行——clear+重建会丢弃不在到达页内的既有消息（如本地缓存有 100 条而服务端页只回 50 条时，前半截从视图消失）。10 项 Qt Quick Test（`out/`，负向对照对旧实现 6 项失败）、`qmllint` 零错误、无头冒烟无 QML 错误、`ctest` 12/12 |
 | 2026-09-16 | M12.4 完成：会话视图堆叠（M12 结项） | 会话区由单个 `ChatView` 改为**按会话堆叠**：`chatViews`（键 `c<conversationId>`，新会话首条消息前为 `p<peerUserId>` 待绑定键）+ `activeViewKey` 活跃指针，已打开会话再切回只切可见性、实例与消息/滚动位置/输入框草稿/附件下载进度全部原样保留；`ChatView.clearMessages` 随之删除（视图不复用、只销毁）。细则：`openConversation` 复用既有视图（私聊会认领同对端的待绑定视图，避免同一会话两个实例）、`confirmSentMessage` 按幂等键找回发起视图并把新会话迁移到服务端 ID（补进 `currentConversationId` 与列表高亮）；LRU 上限 8 实例，驱逐最久未用的非活动视图并转存其输入框文本，重建时恢复；MainWindow 消息页/新消息推送/文件回显按 conversationId 分发，消息状态与传输进度按 messageId 扫描落到所属（可为隐藏）视图；切回已打开会话**不回放本地缓存页**，只 `loadMessagesRequested(convId, lastMessageId)` 补收离线窗口的增量（补 `ingestSyncEvents` 只落库不发 UI 事件留下的空洞）；已读回执从"当前会话消息页到达"改挂新增的 `conversationActivated` 信号（切回旧会话没有页到达，角标否则永不清零）；`messageSendFailed` 携带失败消息的幂等键，QML 精确标记发起视图的气泡，只有无键的整批失败才退回启发式；系统消息映射抽到 `components/ChatText.js`（气泡与会话预览共用唯一实现）。验证：新增 8 项 Qt Quick Test（`out/tst_mainpage_stack.qml`：实例复用、增量补收、LRU、草稿转存、待绑定迁移、隐藏视图传输路由、删除会话关闭视图、登出销毁全部视图），负向对照（把切换改回"销毁其它视图"）4 项失败；M12.3 的 10 项用例同步适配（`clearMessages` 已移除）；`qmllint` 无新增类别告警、无头冒烟无 QML 错误、`ctest` 12/12 |
 | 2026-09-16 | M12.4 代码审查修复：分页续拉、孤儿视图、失败精确标记 | 代码审查发现并修复四项（均为 M12 引入）：① `messagesSynced` 的 `hasMore` 被丢弃——视图 `lastMessageId` 被实时消息推高后，下次激活的增量补收从更高 id 起算，中间那段成为取不回来的**永久空洞**，现按"本页末条 messageId"链式续拉直到取完（`MainPage.updateMessages`）；② `adoptPendingView` 无条件覆盖目标键，被覆盖视图脱离 `chatViews` 成为既不被淘汰也不被 `resetUi` 销毁的**孤儿**（已解密消息驻留到进程退出），现保留原视图、销毁待绑定实例并补收一次；③ `messageSendFailed` 不带幂等键导致失败标记靠猜测（加好友失败还会借道该信号误标在途气泡），现信号携带 `clientMessageId` 由 `pendingSentKeys` 精确定位，加好友失败改走独立 `addContactFailed`；④ `destroyView` 残留 `pendingSentKeys` 记录（会话键复用后会让失败标记落到新视图的无关气泡）。另修正 `LocalStore::upsertMessages` 注释的提交粒度口径（消息页泵按片提交、非整页）。验证：新增 Qt Quick Test 3 项（续拉起点、占用键迁移、失败精确标记）且负向对照各失败 1 项；`TestNetworkManager` 新增跨片整页单次 emit 用例（6 次重复无抖动）；`qmllint` 无新增类别、无头冒烟无 QML 错误、`ctest` 12/12。
+| 2026-09-17 | 下载票据生命周期修复（销账 §3 P2「TTL 与大文件下载不匹配且中途不续期」） | 服务端下载票据改**按“最后一次使用”滑动续期**（新增 `DatabaseManager::renewFileTicket`，由 `FileHttpService::authorizeTicket` 在下载授权通过时调用），并以 `created_at + DownloadTicketMaxLifetimeSeconds(24h)` 为**绝对上限**封顶（`min()` 标量重载；仅对仍有效且未消费的票据生效，不复活失效票据；续期失败不改变本次授权结论，故授权路径不因它 fail-closed）。客户端 `FileTransferManager` 收到 401 时**重新申请票据并从断点续传**（保留 `downloadIndex`/`tmpPath`；续写前校验临时文件长度与记账一致，不符则退回从头下载；`MaxTicketRenewals=3` 单独封顶以防“申请－再 401”活锁，且该封顶是**连续**预算——任一分片成功落盘即清零，否则一台休眠过几次的机器下载大文件时会因累计满 3 次而永久失败并丢掉全部进度，正是本项要消除的症状；等待新票据期间清空票据，复用 `pumpNext` 的“票据非空”门防止用旧票据重打）。顺带修正 `FileProtocol.h` 将下载票据写成“一次性”的失实注释，并同步 `SECURITY.md`/`PROTOCOL.md` 口径。验证：`TestDatabaseManager` +1（滑动续期、绝对上限、不复活失效/已消费票据、入参兜底）、`TestFileHttpService` +1（一次 GET 后寿命被推回完整窗口且票据继续可用）、`TestFileTransfer` +2（首片落盘后吊销票据 → 重申请并断点续传且**字节级一致**；每张票据皆废 → 4 次申请后明确失败且不留半截缓存）；**三处修复分别做负向对照，失败点精确落在各自的 `ttlAfterRenew <= 300`、`ttlAfter >= Ttl-10`、`download did not finish` 断言上**；`ctest` 11/12——`TestNetworkManager::largePageEmittedOnceInOrderAcrossSlices` 因 5 秒预算超时失败，同一二进制 5 次实跑（3 次只跑该函数 + 2 次整卷）100% 复现、泵稳定需 14500-14900 ms（隔离与整卷一致，与负载无关，QTest 自身报告“约 14.6 s 即可满足”），已登记 §3 P3，与本轮改动无因果（该用例不触及本轮任何改动）。**第二轮复核**另修掉自己引入的 3 处缺陷：`FileProtocol.h` 注释对齐、`DatabaseManager.cpp` 函数间空行、以及 `ticketRenewals` 由**累计**改为**连续**预算（真问题，见上）。**本轮改动未提交**：仓库 `.git` 对象库已空（`git fsck` 报 ref/reflog 指向不存在的对象，`count-objects` 显示 0 对象、无 pack），历史与暂存区均不可用，详见当轮报告 |

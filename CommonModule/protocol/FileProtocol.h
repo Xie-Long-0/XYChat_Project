@@ -39,7 +39,14 @@ inline constexpr int MaxThumbnailBytes = 4096;
 
 // 票据与生命周期
 inline constexpr int UploadTicketTtlSeconds = 24 * 3600;   // 上传票据：覆盖大文件慢速上传
-inline constexpr int DownloadTicketTtlSeconds = 300;       // 下载票据：一次性、短时效
+// 下载票据**不是**一次性票据：单次 GET 受 MaxSingleGetBytes 约束，2 GiB 文件按 1 MiB
+// 分片需要 2048 次串行 Range GET，若签发即固定过期时间，慢链路必然中途失效。因此
+// 其过期时间按"最后一次使用"滑动续期（见 DatabaseManager::renewFileTicket），300 秒
+// 是**空闲容忍窗口**而非总寿命；总寿命另由下面这条绝对上限封顶，避免泄露的票据被
+// 无限续命（一次性消费 markFileTicketUsed 与分段下载互斥，故不走那条路）
+inline constexpr int DownloadTicketTtlSeconds = 300;       // 空闲容忍窗口
+// 绝对寿命上限（自签发起算）：滑动续期不得越过它，否则持续使用的泄露票据可无限续命
+inline constexpr int DownloadTicketMaxLifetimeSeconds = 24 * 3600;
 inline constexpr int StaleUploadHours = 48;                // 未完成上传保留期（超期回收）
 inline constexpr int MaxConcurrentUploadsPerUser = 8;      // 每用户并发上传配额
 

@@ -52,6 +52,9 @@ private slots:
     void downloadHonoursRangeAndLimits();
     void chunkPutOverwritesIdempotently();
     void revokedTicketStopsWorking();
+    // M8 欠账修复：下载票据按"最后一次使用"滑动续期。单次 GET 有 4 MiB 上限，
+    // 2 GiB 文件要 2048 次串行 Range GET，固定 300 秒 TTL 会让慢链路下载中途失效
+    void downloadRenewsTicketLifetime();
     // 必须最后执行：本用例会令本机 IP 进入失败限流窗口，之后的请求都会 429
     void repeatedAuthFailuresAreRateLimited();
 
@@ -602,6 +605,53 @@ void TestFileHttpService::makeReadyFile(int chunkCount, qint64 chunkSize, Fixtur
 
     out->downloadTicket = issueTicket(out->fileId, Protocol::FileTicketKind::Download, 300);
     QVERIFY(!out->downloadTicket.isEmpty());
+}
+
+void TestFileHttpService::downloadRenewsTicketLifetime()
+{
+    Fixture f;
+    makeReadyFile(1, Protocol::DefaultChunkSize, &f);
+
+    // 票据剩余寿命（秒）：直接问 SQLite，避免把日期串比较写进断言
+    const auto remainingSeconds = [this](const QString &ticket) {
+        QSqlQuery q(QSqlDatabase::database(m_connName));
+        q.prepare("SELECT CAST(strftime('%s', expires_at) AS INTEGER) "
+                  "- CAST(strftime('%s', 'now') AS INTEGER) FROM file_tickets "
+                  "WHERE ticket_hash = ?");
+        q.addBindValue(FileCrypto::ticketHash(ticket));
+        if (!q.exec() || !q.next()) {
+            return -1000000;
+        }
+        return q.value(0).toInt();
+    };
+
+    // 把寿命拨到只剩 10 秒：等价于"大文件下载进行到一半，票据即将到期"。
+    // 留 10 秒而非 1 秒是抗调度停顿——本条与下面那次 GET 之间若被抢占超过窗口，
+    // 票据会真的过期（401），那属于用例自身的假失败
+    {
+        QSqlQuery shrink(QSqlDatabase::database(m_connName));
+        shrink.prepare("UPDATE file_tickets SET expires_at = datetime('now', '+10 seconds') "
+                       "WHERE ticket_hash = ?");
+        shrink.addBindValue(FileCrypto::ticketHash(f.downloadTicket));
+        QVERIFY(shrink.exec());
+    }
+    QVERIFY(remainingSeconds(f.downloadTicket) <= 11);
+
+    // 一次成功 GET 即续期：授权处按"最后一次使用"把寿命推回完整窗口
+    // 注意必须拼 m_base：裸路径 QUrl("/file/1") 是相对 URL，无 host 则请求直接失败
+    //（表现为 status 0 而非任何 HTTP 码）
+    const QString path = m_base + "/" + QString::number(f.fileId);
+    const HttpReply first = get(path, f.downloadTicket);
+    QCOMPARE(first.status, 200);
+    QCOMPARE(first.body, f.blob);
+    const int ttlAfter = remainingSeconds(f.downloadTicket);
+    QVERIFY(ttlAfter >= Protocol::DownloadTicketTtlSeconds - 10);
+    QVERIFY(ttlAfter <= Protocol::DownloadTicketTtlSeconds);
+
+    // 续期后的票据继续可用（未续期时此刻它已经失效）
+    const HttpReply second = get(path, f.downloadTicket);
+    QCOMPARE(second.status, 200);
+    QCOMPARE(second.body, f.blob);
 }
 
 QTEST_GUILESS_MAIN(TestFileHttpService)

@@ -369,6 +369,14 @@ public:
                                                      const QString &kind);
     // 标记票据已消费（一次性票据用毕置位，重复使用即失效）
     bool markFileTicketUsed(qint64 ticketId);
+    // 滑动续期：把过期时间推到 now + ttlSeconds，但以 created_at + maxLifetimeSeconds
+    // 为绝对上限封顶。用于下载票据——单次 GET 有字节上限，大文件必须分多段 Range 取，
+    // 固定 TTL 会让慢链路下载中途失效（客户端只能从头再来）。绝对上限不可省：否则
+    // 泄露的票据只要被持续使用就能无限续命，把"短时效"变成"永久有效"。
+    // 仅对仍然有效且未消费的票据生效：续期不得复活已失效的票据。
+    // 返回 false 表示票据不存在 / 已消费 / 已过期 / SQL 错误（调用方不得据此拒绝本次
+    // 请求，续期失败只意味着下次可能过期，本请求的授权结论已经成立）
+    bool renewFileTicket(qint64 ticketId, int ttlSeconds, int maxLifetimeSeconds);
     // 吊销某文件某类型的全部票据，返回删除条数（入参非法或 SQL 错误返回 -1）。
     // 上传完成或取消后立即调用：票据已无用途，而上传票据 TTL 长达 24 小时，
     // 留着只会白白延长泄露窗口（分片在完成后已被组装回收，持票也无处可用）

@@ -1426,14 +1426,42 @@ void FileTransferManager::onDownloadTicket(qint64 seq, bool ok, const QString &t
         return;
     }
 
-    const QString finalPath = cachePathFor(task->sha256Hex);
-    QDir().mkpath(QFileInfo(finalPath).absolutePath());
-    // 临时名带随机后缀：同一文件被并发下载两次也不会互相覆写
-    task->tmpPath = finalPath + QLatin1String(".")
-        + QUuid::createUuid().toString(QUuid::Id128) + QLatin1String(".tmp");
+    // 是首次申请还是"票据失效后重新申请"？后者必须保住已下载的分片：
+    // 密文支持随机访问、分片又是独立 AEAD，续写与整体 SHA-256 自校验都不受影响
+    bool resuming = !task->tmpPath.isEmpty() && task->downloadIndex > 0;
+    if (resuming) {
+        // 临时文件必须仍在且长度与记账一致才能续写。若已消失（被 clearCache 或
+        // 外部清理删掉），按 Append 打开会新建一个空文件，而 downloadIndex 不回退，
+        // 于是后面的分片被写到错误偏移，最终只会得到"长度/摘要不符"且无法定位——
+        // 这种情形必须退回从头下载，而不是继续续写
+        QFile existing(task->tmpPath);
+        if (!existing.exists() || existing.size() != task->bytesDone) {
+            if (existing.exists()) {
+                existing.remove();
+            }
+            resuming = false;
+        }
+    }
+
+    if (!resuming) {
+        const QString finalPath = cachePathFor(task->sha256Hex);
+        QDir().mkpath(QFileInfo(finalPath).absolutePath());
+        if (task->tmpPath.isEmpty()) {
+            // 临时名带随机后缀：同一文件被并发下载两次也不会互相覆写
+            task->tmpPath = finalPath + QLatin1String(".")
+                + QUuid::createUuid().toString(QUuid::Id128) + QLatin1String(".tmp");
+        }
+        // 从头下载：清掉可能残留的半截文件（其长度已与记账不符，留着只会
+        // 让最终的长度/摘要校验失败）。首片即 401 时该文件尚未创建，此处为空操作
+        QFile::remove(task->tmpPath);
+        task->downloadIndex = 0;
+        task->bytesDone = 0;
+    }
     task->downloadTicket = ticket;
-    task->downloadIndex = 0;
-    task->bytesDone = 0;
+    // 新票据视为新的重试预算：401 不是分片故障，不该消耗分片的 3 次机会。
+    // 循环风险由 ticketRenewals（MaxTicketRenewals=3）单独封顶，与上传侧
+    // "分片 3 次 + 恢复 5 轮"的双层预算是同一道理
+    task->attempts = 0;
     task->phase = QLatin1String("downloading");
     pumpNext();
 }
@@ -1517,6 +1545,26 @@ void FileTransferManager::onGetFinished(Task &task, QNetworkReply *reply)
     const bool statusOk = (status == 206 || status == 200) && networkError == QNetworkReply::NoError;
     if (!statusOk) {
         ++task.attempts;
+        // 401 = 下载票据已失效（空闲超过 DownloadTicketTtlSeconds，或触及
+        // DownloadTicketMaxLifetimeSeconds 绝对上限）。此时已下载的分片依然有效，
+        // 丢弃它们等于让大文件永远下不完（2 GiB 在慢链路下必然跨过票据寿命）。
+        // 重新申请一张票据后从 downloadIndex 继续；次数由 MaxTicketRenewals 封顶，
+        // 避免"申请-再 401"形成活锁（与恢复轮次必须单独封顶同一教训）
+        if (status == 401 && task.ticketRenewals < MaxTicketRenewals) {
+            FileManifest renewManifest;
+            if (manifestFor(task.messageId, &renewManifest) && renewManifest.fileId > 0) {
+                ++task.ticketRenewals;
+                task.attempts = 0;
+                task.phase = QLatin1String("renewing");
+                // 清空票据同时充当"等待新票据"的互斥标记：pumpNext 只推进票据非空的
+                // 下载任务，否则等待期间任一其他任务释放传输槽都会把本任务用旧票据
+                // 再打一次（又一次 401，白白吃掉一次续期预算）
+                task.downloadTicket.clear();
+                emit downloadTicketRequested(requestSeq(task.token), renewManifest.fileId);
+                return;
+            }
+            // 清单已不在（登出/断线清空）时无法重新申请，落到下面的失败分支
+        }
         if (isTransientFailure(networkError, status) && task.attempts <= MaxChunkAttempts) {
             task.phase = QLatin1String("recovering");
             pumpDownload(task);
@@ -1554,6 +1602,11 @@ void FileTransferManager::onGetFinished(Task &task, QNetworkReply *reply)
     }
 
     task.attempts = 0;
+    // 有分片真正落盘 => 续期预算是"连续"而非"累计"的：清零它，使长时间下载
+    // （笔记本多次休眠、链路多次中断）不会因累计满 3 次续期而永久失败并丢掉全部
+    // 进度——那正是本项要消除的症状。活锁仍然被封住：无进展时计数只增不减，
+    // 且单分片成功本身就把总轮次限定在 chunkCount（≤4096）以内
+    task.ticketRenewals = 0;
     task.bytesDone += data.size();
     ++task.downloadIndex;
     emit taskProgress(task.token, task.phase, task.bytesDone, task.cipherSize);

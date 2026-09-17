@@ -2911,6 +2911,32 @@ bool DatabaseManager::markFileTicketUsed(qint64 ticketId)
     return q.numRowsAffected() > 0;
 }
 
+bool DatabaseManager::renewFileTicket(qint64 ticketId, int ttlSeconds, int maxLifetimeSeconds)
+{
+    if (ticketId <= 0 || ttlSeconds <= 0 || maxLifetimeSeconds <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 两个界限都交给 SQLite 算，与 issueFileTicket/validateFileTicket 共用同一时钟源
+    // 与格式（字符串比较要成立，格式必须完全一致）。min() 取标量重载，故此处
+    // 无论续多少次，expires_at 都不会越过 created_at + maxLifetime。
+    // 条件里保留"未过期"：续期只能延长仍然有效的票据，绝不能把已失效的票据复活
+    // （否则一个泄露的旧票据被重新拾起就又能用；生产中调用点虽在验证成功之后，
+    // 但把这层不变量写进语句才不依赖调用方的顺序）
+    q.prepare("UPDATE file_tickets "
+              "SET expires_at = min(datetime('now', ?), datetime(created_at, ?)) "
+              "WHERE id = ? AND used = 0 AND expires_at >= datetime('now')");
+    q.addBindValue(QString("+%1 seconds").arg(ttlSeconds));
+    q.addBindValue(QString("+%1 seconds").arg(maxLifetimeSeconds));
+    q.addBindValue(ticketId);
+    if (!q.exec()) {
+        qWarning() << "[DB] renewFileTicket failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
 int DatabaseManager::revokeFileTickets(qint64 fileId, const QString &kind)
 {
     if (fileId <= 0 || kind.isEmpty()) {
