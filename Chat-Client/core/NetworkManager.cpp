@@ -4,6 +4,7 @@
 #include <QJsonObject>
 #include <QSysInfo>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QUuid>
 #include <QSslConfiguration>
 #include <QFile>
@@ -29,6 +30,10 @@ namespace {
 constexpr qint64 kRenewBeforeExpirySecs = 86400;   // 过期前 1 天
 constexpr int kRenewRetryDelayMs = 300000;          // 瞬时失败退避 5 分钟
 constexpr int kRenewResponseTimeoutMs = 60000;      // 续期响应看门狗 60 秒
+
+// M12: 消息页时间片预算。单片吃满 8ms 即交还事件循环，整页（最多 100 条）
+// 分若干片推进，界面在两帧之间保持可响应（与 FileTransferManager 同口径）
+constexpr qint64 kMessagePageSliceNs = 8 * 1000 * 1000;
 } // namespace
 
 NetworkManager::NetworkManager(QObject *parent) :
@@ -194,6 +199,15 @@ void NetworkManager::onDisconnected()
     m_pendingFileSends.clear();
     m_groupSenderKeys.clear();
     m_healQueue.clear();
+    // M12: 中止消息页泵并清空在途页（页内含已解密的明文）与同步请求登记
+    //（断链后响应不可达；登出与断线是两条独立路径，两处都必须清）
+    if (m_messagePagePump) {
+        m_messagePagePump->stop();
+    }
+    m_messagePageQueue.clear();
+    m_messagePageJob = MessagePageJob();
+    m_messagePageActive = false;
+    m_pendingSyncRequests.clear();
     // M9 欠账修复：在途编辑/删除随连接失效。必须复位 m_editFetchInFlight
     // 与清空私聊编辑队列，否则自动重连（不经 resetAuthState）后
     // pumpPrivateEditFetch 首行即因在途标记恒真而 return，本会话所有后续
@@ -756,6 +770,15 @@ void NetworkManager::resetAuthState()
     m_pendingFileSends.clear();
     m_groupSenderKeys.clear();
     m_healQueue.clear();
+    // M12: 中止消息页泵并清空在途页（页内含已解密的明文）与同步请求登记
+    //（断链后响应不可达；登出与断线是两条独立路径，两处都必须清）
+    if (m_messagePagePump) {
+        m_messagePagePump->stop();
+    }
+    m_messagePageQueue.clear();
+    m_messagePageJob = MessagePageJob();
+    m_messagePageActive = false;
+    m_pendingSyncRequests.clear();
     // M9 欠账修复：清空在途编辑/删除状态与等待密钥的私聊编辑队列
     m_pendingEdits.clear();
     // M8.2: 中止在途传输并清零已登记的清单密钥（含文件密钥，不得跨会话驻留）。
@@ -1288,14 +1311,24 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
             return;
         }
         if (code == static_cast<int>(ErrorCode::CannotSendToSelf)) {
-            // 确定性失败：移除该用户的待发项（含持久化 outbox）并上报
+            // 确定性失败：移除该用户的待发项（含持久化 outbox）并上报。
+            // 逐条带幂等键上报：这些消息不会再发出去，各自的气泡都要显示失败，
+            // 且它们可能分属不同会话（用户已切走），只有带键才能标对
+            QStringList failedIds;
             for (int i = m_outbox.size() - 1; i >= 0; --i) {
                 if (m_outbox.at(i).toUserId == target) {
+                    failedIds.append(m_outbox.at(i).clientMessageId);
                     m_localStore.removeOutboxItem(m_outbox.at(i).clientMessageId);
                     m_outbox.removeAt(i);
                 }
             }
-            emit messageSendFailed(message);
+            if (failedIds.isEmpty()) {
+                emit messageSendFailed(message);
+            } else {
+                for (const QString &failedId : failedIds) {
+                    emit messageSendFailed(message, failedId);
+                }
+            }
         } else if (code == static_cast<int>(ErrorCode::KeyBundleUnavailable)
                    || code == static_cast<int>(ErrorCode::AccountNotFound)) {
             // 修复：对方尚未注册 E2EE 密钥（从未登录/未上线）是产品上的
@@ -1385,9 +1418,11 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
         if (envelope.isEmpty()) {
             qWarning() << "[NetMgr] E2EE encryption failed for message"
                        << item.clientMessageId;
-            m_localStore.removeOutboxItem(item.clientMessageId);
+            // 先取幂等键副本再移除：removeAt 之后 item 已悬空
+            const QString failedId = item.clientMessageId;
+            m_localStore.removeOutboxItem(failedId);
             m_outbox.removeAt(i);
-            emit messageSendFailed("End-to-end encryption failed");
+            emit messageSendFailed("End-to-end encryption failed", failedId);
             break;
         }
 
@@ -2256,11 +2291,16 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     // M6.5: 首页拉取先立即展示本地缓存（重启后即刻可见、离线可查），
     // 随后服务端响应到达时以权威数据覆盖
     if (afterId == 0 && conversationId > 0) {
-        const QJsonArray cached = m_localStore.loadMessages(conversationId, limit);
+        // M12: 只做取行（索引查询，微秒级），逐行解密与脱敏交给消息页泵在
+        // 时间片内完成——点击会话不再同步处理整页（此前是切会话卡顿的主因）。
+        // 本地缓存表无 file_id 列，回填的消息正文可能是清单（含密钥），
+        // 同样经受泵内 sanitizeForUi 的脱敏出口
+        const QJsonArray cached = m_localStore.loadMessageRows(conversationId, limit);
         if (!cached.isEmpty()) {
-            // M8.2: 本地缓存表无 file_id 列，回填的消息正文可能是清单（含密钥），
-            // 同样必经脱敏出口（attachFileInfo 会从清单里取回 fileId 并登记）
-            emit messagesSynced(conversationId, sanitizeArrayForUi(cached), false);
+            MessagePageJob job;
+            job.conversationId = conversationId;
+            job.messages = cached;
+            enqueueMessagePage(job);
         }
     }
 
@@ -2277,7 +2317,7 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     packet.messageType = MessageType::SyncMessagesRequest;
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    m_pendingSyncMessagesRequestId = packet.requestId;
+    m_pendingSyncRequests.insert(packet.requestId, conversationId);
     sendPacket(packet);
 }
 
@@ -2300,7 +2340,9 @@ void NetworkManager::handleAddContactResponse(const Packet &packet)
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
-        emit messageSendFailed(response.value("message").toString("Failed to add contact"));
+        // 加好友失败不是"消息发送失败"：复用同一信号会让 QML 把在途气泡
+        // 误标为失败（该失败与任何消息无关）
+        emit addContactFailed(response.value("message").toString("Failed to add contact"));
     }
 }
 
@@ -2350,8 +2392,9 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
                     value = conv;
                 }
             }
-            m_localStore.upsertConversation(conv);
         }
+        // M12: 整表一次事务提交（逐条提交会为每个会话付一次 fsync）
+        m_localStore.upsertConversations(conversations);
         emit conversationsResult(conversations);
     }
 }
@@ -2448,7 +2491,8 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
                 flushOutbox();
             });
         }
-        emit messageSendFailed(response.value("message").toString("Send failed"));
+        emit messageSendFailed(response.value("message").toString("Send failed"),
+                               clientMessageId);
     }
 }
 
@@ -2514,17 +2558,76 @@ void NetworkManager::handleAckMessageResponse(const Packet &packet)
 
 void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
 {
-    if (packet.requestId != m_pendingSyncMessagesRequestId) return;
-    m_pendingSyncMessagesRequestId = 0;
+    // M12: 多槽匹配。快速切换会话时多个 sync 请求同时在途，逐个响应都必须
+    // 处理；单槽（旧实现）会被后发请求覆盖，先发的页到达即成孤儿被静默丢弃，
+    // 表现为"点回去的会话缺消息、要再点一次才出来"
+    const auto pending = m_pendingSyncRequests.constFind(packet.requestId);
+    if (pending == m_pendingSyncRequests.constEnd()) {
+        return;
+    }
+    const qint64 conversationId = pending.value();
+    m_pendingSyncRequests.erase(pending);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
-    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
-        const QJsonObject data = response.value("data").toObject();
-        // M6: 逐条解密同步到的消息正文
-        QJsonArray messages = data.value("messages").toArray();
-        QJsonArray visibleMessages;
-        for (QJsonValueRef value : messages) {
-            QJsonObject msg = value.toObject();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    // M12: 整页工作（逐条解密、落库、脱敏）改由时间片泵推进：本函数立即
+    // 返回，GUI 线程不再被整页处理占住
+    MessagePageJob job;
+    job.conversationId = conversationId;
+    job.fromServer = true;
+    job.hasMore = data.value("hasMore").toBool();
+    job.messages = data.value("messages").toArray();
+    enqueueMessagePage(job);
+}
+
+// M12: 消息页时间片泵
+
+void NetworkManager::enqueueMessagePage(MessagePageJob job)
+{
+    m_messagePageQueue.enqueue(job);
+    startMessagePagePump();
+}
+
+void NetworkManager::startMessagePagePump()
+{
+    if (!m_messagePagePump) {
+        m_messagePagePump = new QTimer(this);
+        m_messagePagePump->setInterval(0);
+        connect(m_messagePagePump, &QTimer::timeout, this, &NetworkManager::runMessagePageSlice);
+    }
+    if (!m_messagePagePump->isActive()) {
+        m_messagePagePump->start();
+    }
+}
+
+void NetworkManager::runMessagePageSlice()
+{
+    if (!m_messagePageActive) {
+        if (m_messagePageQueue.isEmpty()) {
+            if (m_messagePagePump) {
+                m_messagePagePump->stop();
+            }
+            return;
+        }
+        // 页取到成员再推进：片内 emit 与附件登记都可能同步回调进本类并
+        // 再次入队，持有队列头部引用会在队列扩容时悬空
+        m_messagePageJob = m_messagePageQueue.dequeue();
+        m_messagePageActive = true;
+    }
+
+    MessagePageJob &job = m_messagePageJob;
+    const int total = job.messages.size();
+    QElapsedTimer slice;
+    slice.start();
+    QJsonArray toPersist;
+    while (job.nextIndex < total) {
+        QJsonObject msg = job.messages.at(job.nextIndex).toObject();
+        ++job.nextIndex;
+        if (job.fromServer) {
             const QString ct = msg.value("contentType").toString();
             const QString c = msg.value("content").toString();
             // M7b: 群聊 Sender Key 分发消息只处理、不展示、不落库
@@ -2534,22 +2637,44 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
                 continue;
             }
             decryptMessageObject(msg);
-            // M6.5: 写入本地缓存（加密存储，保留清单原文以便重启后恢复）
-            m_localStore.upsertMessage(msg);
-            // M8.2: 落库之后再脱敏：交给 UI 的消息不得携带清单（含文件密钥）
-            sanitizeForUi(msg);
-            visibleMessages.append(msg);
+            // M8.2: 先落库后脱敏——文件消息的清单（含 32 字节密钥）必须原样
+            // 入库（本地库加密存储），而交给 UI 的副本必须是脱敏后的
+            toPersist.append(msg);
+        } else {
+            // 缓存页：正文密文按行解密（与 loadMessages 共用同一实现，
+            // 保证两条加载路径的消息形状一致）
+            m_localStore.decryptRowContent(msg);
         }
-        // 修复：emit 解密后的 visibleMessages（原始 messages 的 content 为 envelope
-        // 密文且无 undecryptable 标记，直接渲染会把密文当正文显示——私聊离线/群聊历史）
-        // 边界保护：本页全为不可见消息（如密钥分发）时跳过 emit，
-        // 避免用空列表覆盖此前由本地缓存填充的聊天视图
-        if (messages.isEmpty() || !visibleMessages.isEmpty()) {
-            emit messagesSynced(
-                data.value("conversationId").toVariant().toLongLong(),
-                visibleMessages,
-                data.value("hasMore").toBool());
+        // M8.2: 通往 QML 的唯一脱敏出口（缓存页的清单原文也必须经它降级）
+        sanitizeForUi(msg);
+        job.visible.append(msg);
+        if (slice.nsecsElapsed() >= kMessagePageSliceNs) {
+            break;
         }
+    }
+    if (!toPersist.isEmpty()) {
+        m_localStore.upsertMessages(toPersist);
+    }
+    if (job.nextIndex >= total) {
+        finishMessagePageJob();
+    }
+}
+
+void NetworkManager::finishMessagePageJob()
+{
+    const qint64 conversationId = m_messagePageJob.conversationId;
+    const bool hasMore = m_messagePageJob.hasMore;
+    const bool emptyInput = m_messagePageJob.messages.isEmpty();
+    const QJsonArray visible = m_messagePageJob.visible;
+    m_messagePageJob = MessagePageJob();
+    m_messagePageActive = false;
+
+    // 修复：emit 解密后的 visibleMessages（原始 messages 的 content 为 envelope
+    // 密文且无 undecryptable 标记，直接渲染会把密文当正文显示——私聊离线/群聊历史）
+    // 边界保护：本页全为不可见消息（如密钥分发）时跳过 emit，
+    // 避免用空列表覆盖此前由本地缓存填充的聊天视图
+    if (emptyInput || !visible.isEmpty()) {
+        emit messagesSynced(conversationId, visible, hasMore);
     }
 }
 
@@ -2860,17 +2985,6 @@ void NetworkManager::sanitizeForUi(QJsonObject &message)
         }
         message["content"] = QString();
     }
-}
-
-QJsonArray NetworkManager::sanitizeArrayForUi(const QJsonArray &messages)
-{
-    QJsonArray result;
-    for (const QJsonValue &value : messages) {
-        QJsonObject msg = value.toObject();
-        sanitizeForUi(msg);
-        result.append(msg);
-    }
-    return result;
 }
 
 void NetworkManager::handleNewMessageNotification(const Packet &packet)

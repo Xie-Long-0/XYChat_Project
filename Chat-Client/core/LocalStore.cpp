@@ -548,6 +548,39 @@ bool LocalStore::upsertMessage(const QJsonObject &msg)
     if (!ensureUsableDb()) {
         return false;
     }
+    return upsertMessageRow(msg);
+}
+
+bool LocalStore::upsertMessages(const QJsonArray &msgs)
+{
+    if (!ensureUsableDb()) {
+        return false;
+    }
+    if (msgs.isEmpty()) {
+        return true;
+    }
+    // 整批一次提交：逐条自动提交（SQLite 默认 journal 模式下每语句一次
+    // fsync）在页级导入时随消息数线性放大，是同步响应处理阻塞 GUI 的来源
+    const bool useTransaction = m_db.transaction();
+    if (!useTransaction) {
+        qWarning() << "[LocalStore] upsertMessages without transaction:"
+                   << m_db.lastError().text();
+    }
+    bool ok = true;
+    for (const QJsonValue &value : msgs) {
+        if (!upsertMessageRow(value.toObject())) {
+            ok = false;
+        }
+    }
+    if (useTransaction && !m_db.commit()) {
+        qWarning() << "[LocalStore] upsertMessages commit failed:" << m_db.lastError().text();
+        return false;
+    }
+    return ok;
+}
+
+bool LocalStore::upsertMessageRow(const QJsonObject &msg)
+{
     const qint64 messageId = msg.value("messageId").toVariant().toLongLong();
     const qint64 conversationId = msg.value("conversationId").toVariant().toLongLong();
     if (messageId <= 0 || conversationId <= 0) {
@@ -631,6 +664,17 @@ bool LocalStore::upsertMessage(const QJsonObject &msg)
 
 QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
 {
+    QJsonArray rows = loadMessageRows(conversationId, limit);
+    for (QJsonValueRef value : rows) {
+        QJsonObject msg = value.toObject();
+        decryptRowContent(msg);
+        value = msg;
+    }
+    return rows;
+}
+
+QJsonArray LocalStore::loadMessageRows(qint64 conversationId, int limit) const
+{
     QJsonArray result;
     if (!m_open || conversationId <= 0 || limit <= 0) {
         return result;
@@ -646,7 +690,8 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
         return result;
     }
 
-    // 查询按 messageId 降序，输出翻转为升序
+    // 查询按 messageId 降序，输出翻转为升序。正文以密文形态（contentCipher）
+    // 交给调用方逐行解密：整页解密随消息数线性增长，不应压在单次调用里
     QList<QJsonObject> rows;
     while (query.next()) {
         QJsonObject msg;
@@ -654,18 +699,9 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
         msg["conversationId"] = query.value(1).toLongLong();
         msg["senderId"] = query.value(2).toLongLong();
         msg["senderUsername"] = query.value(3).toString();
-        const bool deleted = query.value(9).toInt() != 0;
-        // 密文解密失败（密钥不匹配/条目缺失）时标记 undecryptable，
-        // 与实时接收路径的消息形状保持一致
-        const QString content = decryptText(query.value(4).toString());
-        if (deleted) {
-            msg["content"] = QString();
+        msg["contentCipher"] = query.value(4).toString();
+        if (query.value(9).toInt() != 0) {
             msg["deleted"] = true;
-        } else if (!content.isEmpty()) {
-            msg["content"] = content;
-        } else {
-            msg["content"] = QString();
-            msg["undecryptable"] = true;
         }
         msg["contentType"] = query.value(5).toString();
         msg["status"] = query.value(6).toString();
@@ -681,6 +717,25 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
         result.append(rows.at(i));
     }
     return result;
+}
+
+void LocalStore::decryptRowContent(QJsonObject &row) const
+{
+    const QString cipher = row.take("contentCipher").toString();
+    if (row.value("deleted").toBool()) {
+        // 软删除行不展示正文（密文已清空，也不应把历史明文带出）
+        row["content"] = QString();
+        return;
+    }
+    // 密文解密失败（密钥不匹配/条目缺失）时标记 undecryptable，
+    // 与实时接收路径的消息形状保持一致
+    const QString content = decryptText(cipher);
+    if (!content.isEmpty()) {
+        row["content"] = content;
+    } else {
+        row["content"] = QString();
+        row["undecryptable"] = true;
+    }
 }
 
 bool LocalStore::updateMessageStatus(qint64 messageId, const QString &status)
@@ -785,6 +840,39 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
     if (!ensureUsableDb()) {
         return false;
     }
+    return upsertConversationRow(conv);
+}
+
+bool LocalStore::upsertConversations(const QJsonArray &convs)
+{
+    if (!ensureUsableDb()) {
+        return false;
+    }
+    if (convs.isEmpty()) {
+        return true;
+    }
+    // 与服务端会话列表响应对齐：整表一次提交，避免每会话一次 fsync
+    const bool useTransaction = m_db.transaction();
+    if (!useTransaction) {
+        qWarning() << "[LocalStore] upsertConversations without transaction:"
+                   << m_db.lastError().text();
+    }
+    bool ok = true;
+    for (const QJsonValue &value : convs) {
+        if (!upsertConversationRow(value.toObject())) {
+            ok = false;
+        }
+    }
+    if (useTransaction && !m_db.commit()) {
+        qWarning() << "[LocalStore] upsertConversations commit failed:"
+                   << m_db.lastError().text();
+        return false;
+    }
+    return ok;
+}
+
+bool LocalStore::upsertConversationRow(const QJsonObject &conv)
+{
     const qint64 conversationId = conv.value("conversationId").toVariant().toLongLong();
     if (conversationId <= 0) {
         return false;
@@ -1171,7 +1259,10 @@ QJsonArray LocalStore::searchMessages(const QString &query, int limit,
         msg["conversationName"] = it.value();
         msg["senderId"] = sql.value(2).toLongLong();
         msg["senderUsername"] = sql.value(3).toString();
-        msg["content"] = content;
+        // M8.2 同类拦截：文件消息的"明文"就是清单本身（含 32 字节文件密钥），
+        // 而搜索结果同样通向 QML（字符串一旦进入 JS 堆就无法可靠清零）。
+        // 降级实现只保留 Protocol::filePreviewText 一处，绝不回退成清单原文
+        msg["content"] = looksLikeFileManifest(content) ? filePreviewText(content) : content;
         msg["contentType"] = sql.value(5).toString();
         msg["createdAt"] = sql.value(6).toString();
         result.append(msg);

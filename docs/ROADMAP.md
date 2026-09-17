@@ -12,7 +12,7 @@
 - **一致性要求**：涉及协议/安全/架构事实的表述必须与 `docs/PROTOCOL.md`、`docs/SECURITY.md`、`docs/ARCHITECTURE.md` 及代码一致；发现文档与代码不符时，以代码为准并在当期修正文档。
 - **完成定义**：见第 9 节；里程碑勾选"已完成"前必须通过对应自动化测试与代码审查。
 
-## 1. 项目现状总览（截至 2026-09-15）
+## 1. 项目现状总览（截至 2026-09-16）
 
 ### 1.1 里程碑状态总表
 
@@ -34,6 +34,7 @@
 | M9 | 多端同步与离线一致性 | 已完成 | 2026-09-09 | 已读多端同步 + `sync_events` 保留清理（09-04）；特性栈：会话置顶/免打扰 + 消息编辑/删除（软删除留墓碑），协议 81-87 + V9 迁移 + 三类事件（09-05，提交 `8224464`）；09-09 修复群编辑解密链路（补 `senderId`/`originDeviceId`、跳序密钥缓存、推送覆盖本人其他设备、删除 fail-closed），验收标准自此成立 |
 | M10 | UI 重构与体验完善（保守范围） | 已完成 | 2026-09-14 | Phase 0-2 纯 QML 重构（Theme token 分层、SVG 图标库 + `Icon`、基础组件库、全局反馈层、`MainPage` 拆 9 个 Dialog、消息气泡重构、未读分隔线 + 跳到底部 FAB、输入区多行、会话/消息右键菜单）；Phase 3 两项新协议（会话整表删除 `100-102` + "正在输入" `103-105`）；Phase 4 六项历史欠账清理。`ctest` 12/12、`qmllint` 零错误。原任务的搜索/通知/草稿/emoji/设置页/响应式/国际化经用户确认明确排除 |
 | M11 | 体验完善与稳定性 | 进行中 | — | **M11A 基础体验与系统集成（已完成 2026-09-15）**：设置页（`AppSettings` 统一管理 + `SettingsDialog` 四节）、系统托盘（`TrayManager` + 最小化到托盘）、桌面通知（免打扰/预览开关/点击跳转）、草稿（会话切换保留输入）、本地消息搜索（`LocalStore.searchMessages` 解密后 LIKE + `LocalSearchDialog` + 跳转滚动）。`ctest` 12/12、`qmllint` 零错误。M11B（消息交互增强，§4.4）与 M11C（群聊与布局完善，§4.5）未开始；原 M11 稳定性/可观测性任务（指标监控/崩溃捕获/压测）并行推进，见 §4.6 |
+| M12 | 聊天流畅性与多会话体验 | 已完成 | 2026-09-16 | 修复两项用户报告的运行时问题：发送消息后视图滚出边界、切换会话时整页加载阻塞界面。① 滚动越界修复（贴底定位以末行 delegate 真实末端 `layoutExtent` 为准并据此夹取 `contentY`，贴底请求经 `Qt.callLater` 合并延迟，规避 ListView 布局重入）；② 消息加载异步化（C++ 单线程时间片泵 8ms/片、`sync_messages` 多槽路由、落库整页单事务；本地搜索命中的文件清单补过脱敏口径）；③ QML 增量应用消息（`setMessages` 按 messageId 合并：已存在行原地更新、新消息按 id 序插入，未读分隔线与附件下载进度不再被刷新页重置，状态只前进不回退）；④ 按会话堆叠 ChatView（每会话一个实例 + 活跃指针，切换只改可见性，消息/滚动/草稿/附件进度各视图自持；LRU 上限 8 实例并在驱逐时转存草稿；MainWindow 按 conversationId 路由消息页与推送、传输事件按 messageId 路由；切回已打开会话只补收 `lastMessageId` 之后的增量，已读回执改挂激活点）。测试：Qt Quick Test 10 + 11 项（含审查修复项 3 项负向对照）；`ctest` 12/12（`TestNetworkManager` +1，含跨片整页单次 emit 用例）。详见 §4.7 |
 
 ### 1.2 能力矩阵
 
@@ -154,6 +155,8 @@
 | P3 | 工程 | 文件回收任务在主线程做同步磁盘 I/O | 2026-09-10 CodeReview | `pruneFileUploads` 由 Server（主）线程的定时器驱动，该线程同时承担 `incomingConnection` 与 `onMessageForUser` 路由；`remove()`（内部 `removeRecursively`）为阻塞调用，三轮合计每轮最多约 300 次删除，大文件/多分片目录时可能短时阻塞连接接受与消息转发。量级有界（每小时、limit=100）且定时器不重入，属响应性隐患而非正确性缺陷；积压增大后可移至独立维护线程或工作池 |
 | P3 | 工程 | `runHashSlice` 从 hashing 转 creating 时 emit 后仍持有 `Task&` 引用（理论悬空） | 2026-09-14 M10 CodeReview | 完成分支先 `clearLocalStateForToken(token)` 再 `emit taskProgress`/`uploadCreateRequested`，其间持续经 `Task &t = tit.value()` 访问 task；若某 `taskProgress` 的 QML 槽同步触发 `cancelTask → finishTask → m_tasks.erase`，`t`/`tit` 将悬空。当前 QML 未在 `taskProgress` 回调中调 `cancelTask`，且此为原同步版 `beginHashing` 既有模式（非 M10 新引入），故实际不触发。建议 emit 前把 phase/cipherSize/chunkSize/chunkCount/sha256Hex 全拷入局部、emit 序列不再解引用 `t` |
 | P3 | 安全 | `processDeleteConversationRequest` 对非成员暴露“会话是否存在”的错误码差异（存在性 oracle） | 2026-09-14 M10 CodeReview | 权限校验顺序为 形态→限流→`getConversation`(存在性)→`isConversationMember`→群主校验；非成员探测时“存在但非成员”回 `PermissionDenied`、“不存在”回 `ConversationNotFound`，二者可区分。会话 ID 自增需先验知识、成员间本已互知，信息增益极低。建议（可选）对“非成员”与“不存在”统一错误码消除区分度 |
+| P3 | 工程 | M12 消息页泵的"真正跨时间片"续做无确定性用例 | 2026-09-16 CodeReview | 分片预算 `kMessagePageSliceNs` 是编译期常量、无注入点，测试只能构造"大页"提高跨片概率（`largePageEmittedOnceInOrderAcrossSlices` 断言的是"整页单次 emit 且保序"，不依赖实际片数）。续做逻辑本身由泵的"只从队列头取、片内续用成员"结构保证，真机大页已验；如需锁死多片路径需为预算加测试接缝 |
+| P3 | 工程 | 客户端 sync_messages 在途请求与页队列无超时/上限 | 2026-09-16 CodeReview | `m_pendingSyncRequests` 仅在响应或断线时清理（服务端漏答则该登记项残留到断开），`m_messagePageQueue` 无条数上限（每个任务 ≤100 行密文 + 已解密正文）。实际增长受"视图数 ≤8 + 用户切换速率"约束，暂未观察到堆积；限流/超时清扫可与既有欠账（编辑/删除在途请求无超时清扫）一并实施 |
 
 ## 4. 未来里程碑规划
 
@@ -261,9 +264,17 @@
   - 压力测试：长连接数、消息吞吐、离线同步峰值。
 - **验收标准**：能回答"当前多少在线用户、消息延迟多少、失败率多少"；服务端异常重启后不丢已确认消息；压测报告可指导扩容。
 
+### 4.7 M12：聊天流畅性与多会话体验（已完成）
+
+- **目标**：修复两项用户报告的运行时问题——① 发送消息后消息列表滚出边界，需手动滚动才回到正确位置；② 点击/切换会话时整页加载阻塞 GUI 线程。要求任何加载与界面操作异步、不阻塞主线程；会话切换不得影响其它会话视图的状态。
+- **Phase 与执行顺序**：M12.1 滚动越界修复（**已完成**，纯 QML，§10 2026-09-16 条目）→ M12.2 消息加载异步化（**已完成**：C++ 单线程时间片泵 + 批量落库 + `sync_messages` 多槽路由，含本地搜索脱敏补漏）→ M12.3 QML 增量应用消息（**已完成**：`ChatView.setMessages` 按 messageId 合并替换 clear+全量重建，未读分隔线/滚动位置/附件下载进度不再被刷新页重置，10 项 Qt Quick Test + 负向对照）→ M12.4 按会话堆叠 ChatView（**已完成**：`conversationId → ChatView` 实例映射 + `activeViewKey` 活跃指针，切换只改可见性不重建；新会话首条消息前以 `p<peerUserId>` 建"待绑定"视图、确认后迁移到 `c<conversationId>`；LRU 上限 8 个实例，驱逐转存输入框草稿并在重建时恢复；MainWindow 消息页/推送按 conversationId 路由、状态与传输进度按 messageId 落到所属视图；切回已打开会话不重载缓存页、只补收 `lastMessageId` 之后的增量；已读回执从"消息页到达"改挂 `conversationActivated` 激活点；8 项 Qt Quick Test + 负向对照 4 项失败；**审查修复**：页未取完（`hasMore`）时按本页末条 messageId 续拉（视图 `lastMessageId` 被实时消息推高后，不续拉会在中间留下永久空洞）、待绑定迁移遇目标键已占用时保留原视图并销毁待绑定实例（杜绝脱离`chatViews` 的孤儿视图）、`messageSendFailed` 带幂等键精确落到发起视图的气泡（加好友失败改走独立 `addContactFailed`）、`destroyView` 清理在途发送记录（新增 3 项用例，负向对照 3 项失败））。
+- **协议影响**：无（纯客户端改动，无服务端改动与数据库迁移）。
+- **关键约束**：M12.3/M12.4 必须尊重 M12.2 建立的 emit 契约（每页一次 `messagesSynced`、非空才 emit、页内全不可见消息时跳过）；堆叠视图的滚动位置、未读分隔线、文件进度绑定等状态由各 ChatView 自身持有，切换不得重置；LRU 驱逐复用 M11A 草稿机制保存输入。
+- **交付与验收**：`ctest` 12/12 全绿、`qmllint` 零错误、无头冒烟启动无 QML 错误；实机验证发送后稳定贴底不越界、快速连点多个会话无卡顿且各会话消息与滚动位置互不污染；文档同步 ARCHITECTURE/SECURITY/ROADMAP。
+
 ## 5. 推荐执行顺序（2026-09-16 更新）
 
-下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**：
+下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**M12 聊天流畅性与多会话体验已完成（§4.7）**；其余候选待讨论确定：
 
 1. **解决历史遗留 P2 欠账**（§3 中 P2 优先）：大群分发超限、群密钥"先落盘后分发"窗口、TLS 端到端集成测试、下载票据 TTL 与断点续传、数据面请求体上限预检、文件控制面 handler 级测试。
 2. **M11B 消息交互增强（§4.4）**，片内顺序：B1 多选模式 → B3 消息转发（依赖 B1 的选择集）→ B2 消息回复/引用（含 V11 迁移与服务端改动，**单独提交以便回滚**）→ B4 emoji 选择器。B2 是 M11 唯一一次协议扩展，宜排在纯 QML 的 B1/B3/B4 之后单独入库。
@@ -344,3 +355,7 @@
 | 2026-09-16 | M11A 复审修复 + 规划补全 | 复审发现 1 项 P1 功能回退——消息搜索顶替了侧边栏搜索按钮，致"用户搜索→发起一对一会话"（M4.5 能力）失去 UI 入口：已修为会话列表工具栏独立"消息搜索"按钮（新增 `search-messages` 图标），原搜索按钮恢复打开 `SearchDialog`；并补"目标会话已不在列表"的提示。ROADMAP 补全 M11B/M11C 规划章节（§4.4/§4.5，原 M11 稳定性任务顺延为 §4.6）与 §5 片内执行顺序 |
 | 2026-09-16 | 修复 CI 配置缺陷：Qt add-on 模块缺失 | 重建后的 CI 首次运行在 configure 阶段失败：`jurplel/install-qt-action` 默认只装 Qt base（qtbase + qtdeclarative/qtquickcontrols2），而项目依赖的 `Qt6Multimedia`（客户端元数据提取与播放器、测试）与 `Qt6HttpServer`（服务端数据面、测试）属独立 add-on 模块；且 `Qt6HttpServer` 的 CMake 包 `find_dependency` 了 `Qt6WebSockets`。修为在安装步骤显式声明 `modules: qtmultimedia qthttpserver qtwebsockets` 并固定 `arch: win64_msvc2022_64`，不再依赖安装器的模块依赖自动解析。OpenSSL/QWindowKit/zlib 仍由已提交的 `3rdparty/` 提供，CI 无需另行安装 |
 | 2026-09-16 | 修复 CI 构建缺陷：`certs` 目录自我拷贝竞态 | 上一修复后 CI 推进至 build 阶段，`TestGroupRepro` 的 POST_BUILD 失败于 `cmake -E copy_directory`：其源与目标同为 `build/Release/certs`——`qt_standard_project_setup()` 在 Windows 上把 `CMAKE_RUNTIME_OUTPUT_DIRECTORY` 统一指向构建根目录（理由：Windows 无 RPATH，DLL 须与 exe 同目录，见 `Qt6CoreMacros.cmake`），故本目标与 `Chat-Server` 输出到同一目录。自我拷贝本身可通过，但它要求源已存在，而 `Chat-Server` 的 `make_directory` POST_BUILD 与之并发（MSBuild `--parallel`），全新构建目录下必然抢跑失败。修为改用幂等的 `make_directory`，不再依赖目标构建顺序（本地已复刻全新构建目录场景：移走 `certs` + 强制重链，ninja 退出码 0）；顺带更正 `Chat-Server/CMakeLists.txt` 中"拷贝证书生成脚本"的失实注释。另为 Install Qt 步骤加 `cache: true` 缩短后续 CI。`ctest` 12/12 |
+| 2026-09-16 | M12 前半完成：滚动越界修复 + 消息加载异步化 | ① 发送消息后视图滚出边界：贴底定位改以**末行 delegate 真实末端**（`layoutExtent`）为准并据此夹取 `contentY`（`ListView.contentHeight` 为按可见行估算，未创建行多时误差可达数百 px 幽灵空白），贴底请求统一经 `Qt.callLater` 合并延迟（在 delegate 布局信号内直接 `positionViewAtEnd` 是对布局逻辑的重入）；② 消息加载改**单线程时间片泵**（`QTimer(0)` + 8ms/片，逐条解密/落库/脱敏；与 M10 传输泵同口径），`sync_messages` 改 requestId→conversationId **多槽路由**（快速切会话不再丢页），落库整页单事务，每页仍只 emit 一次 `messagesSynced`；③ 本地消息搜索命中的文件清单补过脱敏口径（M11A A5 漏网，文件密钥曾随搜索结果进 JS 堆；负向对照验证用例有效）。`ctest` 12/12（`TestLocalStore` +2、`TestNetworkManager` +2）。M12 剩余：QML 增量应用消息、按会话堆叠 ChatView（§4.7） |
+| 2026-09-16 | M12.3 完成：QML 增量应用消息 | `ChatView.setMessages` 由 `msgModel.clear()` + 全量重建改为**按 messageId 合并**：已存在的行原地更新（不销毁 delegate）、新消息按 id 序插入、未读分隔线只在首次填充放置；状态更新加秩比较（只前进不回退，与 `LocalStore::statusRank` 同口径），附件下载进度/状态不再被刷新页重置（此前 `fileState`/`fileProgress` 会随重建丢失）；首次填充即置贴底意图，消除服务端页在 50ms 定时器窗口内到达时误报 FAB 徽标。顺带修复旧实现的隐性丢行——clear+重建会丢弃不在到达页内的既有消息（如本地缓存有 100 条而服务端页只回 50 条时，前半截从视图消失）。10 项 Qt Quick Test（`out/`，负向对照对旧实现 6 项失败）、`qmllint` 零错误、无头冒烟无 QML 错误、`ctest` 12/12 |
+| 2026-09-16 | M12.4 完成：会话视图堆叠（M12 结项） | 会话区由单个 `ChatView` 改为**按会话堆叠**：`chatViews`（键 `c<conversationId>`，新会话首条消息前为 `p<peerUserId>` 待绑定键）+ `activeViewKey` 活跃指针，已打开会话再切回只切可见性、实例与消息/滚动位置/输入框草稿/附件下载进度全部原样保留；`ChatView.clearMessages` 随之删除（视图不复用、只销毁）。细则：`openConversation` 复用既有视图（私聊会认领同对端的待绑定视图，避免同一会话两个实例）、`confirmSentMessage` 按幂等键找回发起视图并把新会话迁移到服务端 ID（补进 `currentConversationId` 与列表高亮）；LRU 上限 8 实例，驱逐最久未用的非活动视图并转存其输入框文本，重建时恢复；MainWindow 消息页/新消息推送/文件回显按 conversationId 分发，消息状态与传输进度按 messageId 扫描落到所属（可为隐藏）视图；切回已打开会话**不回放本地缓存页**，只 `loadMessagesRequested(convId, lastMessageId)` 补收离线窗口的增量（补 `ingestSyncEvents` 只落库不发 UI 事件留下的空洞）；已读回执从"当前会话消息页到达"改挂新增的 `conversationActivated` 信号（切回旧会话没有页到达，角标否则永不清零）；`messageSendFailed` 携带失败消息的幂等键，QML 精确标记发起视图的气泡，只有无键的整批失败才退回启发式；系统消息映射抽到 `components/ChatText.js`（气泡与会话预览共用唯一实现）。验证：新增 8 项 Qt Quick Test（`out/tst_mainpage_stack.qml`：实例复用、增量补收、LRU、草稿转存、待绑定迁移、隐藏视图传输路由、删除会话关闭视图、登出销毁全部视图），负向对照（把切换改回"销毁其它视图"）4 项失败；M12.3 的 10 项用例同步适配（`clearMessages` 已移除）；`qmllint` 无新增类别告警、无头冒烟无 QML 错误、`ctest` 12/12 |
+| 2026-09-16 | M12.4 代码审查修复：分页续拉、孤儿视图、失败精确标记 | 代码审查发现并修复四项（均为 M12 引入）：① `messagesSynced` 的 `hasMore` 被丢弃——视图 `lastMessageId` 被实时消息推高后，下次激活的增量补收从更高 id 起算，中间那段成为取不回来的**永久空洞**，现按"本页末条 messageId"链式续拉直到取完（`MainPage.updateMessages`）；② `adoptPendingView` 无条件覆盖目标键，被覆盖视图脱离 `chatViews` 成为既不被淘汰也不被 `resetUi` 销毁的**孤儿**（已解密消息驻留到进程退出），现保留原视图、销毁待绑定实例并补收一次；③ `messageSendFailed` 不带幂等键导致失败标记靠猜测（加好友失败还会借道该信号误标在途气泡），现信号携带 `clientMessageId` 由 `pendingSentKeys` 精确定位，加好友失败改走独立 `addContactFailed`；④ `destroyView` 残留 `pendingSentKeys` 记录（会话键复用后会让失败标记落到新视图的无关气泡）。另修正 `LocalStore::upsertMessages` 注释的提交粒度口径（消息页泵按片提交、非整页）。验证：新增 Qt Quick Test 3 项（续拉起点、占用键迁移、失败精确标记）且负向对照各失败 1 项；`TestNetworkManager` 新增跨片整页单次 emit 用例（6 次重复无抖动）；`qmllint` 无新增类别、无头冒烟无 QML 错误、`ctest` 12/12。

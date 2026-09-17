@@ -124,6 +124,8 @@ M10 采“保守主体（纯 QML 层重构）+ 精选新能力（两项新协议
 - 存储密钥：每账号+设备随机生成 32 字节密钥，经 `KeyStorage` DPAPI 保护（`localstore/<account>_<device>.key`）；密钥无法持久化时 fail-closed 禁用缓存；密钥文件存在但 DPAPI 还原失败时拒绝启用（绝不用新密钥覆盖导致旧密文永久不可解）。
 - 写入路径：发送确认（含正文）、`sync_messages`/`NewMessageNotification`/`sync_events` 解密后入库、`MessageStatusUpdate` 与回执事件更新状态（状态只前进不回退，`status_rank` 比较）；已解密正文同步写入解密缓存表，供后续 envelope 重复投递命中。
 - 展示路径：登录后立即 emit 缓存会话列表（服务端响应到达后刷新，预览为占位符时先从解密缓存回填真实明文）；`syncMessages` 首页拉取先 emit 本地缓存再由服务端**解密后的**消息覆盖；`NewMessageNotification`/`sync_messages`/`sync_events` 三入口统一先解密再交 UI，解密失败标记 `undecryptable` 显示占位符，绝不把 envelope 原文当正文（2026-09-03 修复 `sync_messages` 曾 emit 未解密数组的缺陷）。
+- **消息页时间片泵（M12，2026-09-16）**：`syncMessages` 的整页工作（逐条解密、落库、脱敏）此前同步执行，点击/切换会话时阻塞 GUI 线程；现改为**单线程时间片泵**推进（`QTimer(0)` + 8ms/片预算，与 M10 传输泵同口径）：本地缓存页只做索引查询（`loadMessageRows`）即入泵，`sync_messages` 响应改 **requestId → conversationId 多槽路由**（快速切换会话时多个请求同时在途，旧单槽被后发请求覆盖会使先发的页成为孤儿，表现为"点回去的会话缺消息"）。泵内每片最多推进 8ms，解密/脱敏仍逐条经 `sanitizeForUi`，落库整页一次事务（逐条提交会为每条付一次 fsync）；**每页只 emit 一次** `messagesSynced`（页内全为不可见消息如 sender-key 分发时跳过 emit，不用空列表覆盖已由缓存填充的视图）；断线/登出中止泵并清空在途页（页内含已解密明文）。
+- **会话视图堆叠（M12.4，2026-09-16）**：聊天区不再是单个 `ChatView`，而是 `chatStack` 容器 + `MainPage.chatViews` 实例映射（键 `c<conversationId>`；新会话首条消息发出前尚无服务端 ID，先以 `p<peerUserId>` 建"待绑定"视图，`confirmSentMessage` 时迁到正式键（目标键已被别的实例占用时保留原视图、销毁待绑定实例并补收一次，杜绝脱离 `chatViews` 映射的孤儿视图——它既不参与淘汰也不被 `resetUi` 销毁，其模型里的已解密消息会驻留到进程退出））+ `activeViewKey` 活跃指针，视图由 `chatViewComponent` 动态创建。**切换会话只改各视图 `visible`**：消息模型、滚动位置、输入框草稿、附件下载进度都留在各自视图里，切走再切回不重建（因此 `ChatView.clearMessages` 被删除，视图不复用、只销毁）。LRU 上限 `maxCachedViews`（8）个实例，超出时淘汰最久未用的非活动视图并把输入框文本转存到 `drafts`，重建视图时恢复。切回**已打开**的会话不回放本地缓存页，只 `loadMessagesRequested(convId, lastMessageId)` 补收隐藏期间错过的增量——`ingestSyncEvents`（断线重连回放）只写本地库、不发 UI 事件，缺这条补收会让隐藏视图停在旧状态；服务端页带 `hasMore`（本页满 100 条）时立即按**本页末条 messageId** 续拉直到取完——视图的 `lastMessageId` 会被实时消息推高，不续拉则下次补收从更高的 id 起算，中间那段成为取不回来的永久空洞；已读回执从"当前会话消息页到达"改挂 `MainPage.conversationActivated` 信号（切回旧会话没有页到达，角标否则永不清零）。`MainWindow` 侧按目标路由：`messagesSynced`/`newMessageReceived`/`fileMessageSent` 按 conversationId 分发到对应视图，消息状态与文件传输进度按 messageId 扫描落到持有该行的视图（下载期间切走会话后进度仍落在原气泡）；`messageSendFailed` 携带失败消息的幂等键（C++ 侧出队时带出），QML 据此把气泡精确标到发起视图（会话可能已切走甚至已被淘汰）；只有无键的整批失败（无效参数/密钥包不可用）才退回启发式（活动视图优先，否则仅当在途发送出自唯一视图才落标签），多视图并发在途时宁可不标也不误伤别的会话。加好友失败改走独立的 `addContactFailed` 信号，不再借道发送失败。系统消息（`contentType=system`）的结构化正文到可读文本的映射抽到 `components/ChatText.js`，由消息气泡 delegate 与会话列表预览共用同一份实现。
 - 生命周期：登出时 `clearUserData()` 清除用户可见数据（消息/会话/outbox/同步游标）；**解密缓存与存储密钥作为 E2EE 密钥材料保留**——一次性预密钥消费后不可恢复，登出重登必须依靠解密缓存兜底（与 M6 产品承诺一致）；E2EE 身份密钥同样由 `KeyStorage` 保留复用；切换账号同样只清用户数据不毁密钥材料；`closeAndDestroy()`（删库+删密钥）仅保留给彻底销毁场景。
 - **限制**：本地缓存为展示层缓存，不提供离线发送以外的完整离线能力；联系人列表仍按需从服务端拉取。
 
@@ -192,7 +194,7 @@ FileTransferManager                                FileTransferManager
 ```
 
 - **职责划分**：`NetworkManager` 只负责 TCP 控制面（五个请求/响应 + `requestId`→`seq` 映射）与清单登记/脱敏；`FileTransferManager` 只负责 HTTP 数据面与分片加解密/缓存，**不持有 socket**（经信号请求控制面、经回调接收结果），因此可脱离网络单测。引擎经 `main.cpp` 注册为 QML context property `fileTransfer`。
-- **隐私边界（关键）**：清单含 32 字节文件密钥，**只在 C++ 侧流转**。所有通向 QML 的消息经唯一脱敏出口 `sanitizeForUi`（四条路径：实时推送、`sync_messages` 历史/离线补收、`sync_events`、本地缓存回填），正文置空、只给脱敏展示字段；另有“形态像清单就置空”兜底，使将来新增出口不会重蹈覆辙（M8.2 P0 教训，由 `TestNetworkManager::fileManifestNeverReachesUiLayer` 锁定）。
+- **隐私边界（关键）**：清单含 32 字节文件密钥，**只在 C++ 侧流转**。所有通向 QML 的消息经唯一脱敏出口 `sanitizeForUi`（四条路径：实时推送、`sync_messages` 历史/离线补收、`sync_events`、本地缓存回填），正文置空、只给脱敏展示字段；本地消息搜索（M11A A5）不经此函数，由 `LocalStore::searchMessages` 按同一降级规则处理（命中清单只出 `Protocol::filePreviewText`，M12 补齐）；另有“形态像清单就置空”兜底，使将来新增出口不会重蹈覆辙（M8.2 P0 教训，由 `TestNetworkManager::fileManifestNeverReachesUiLayer` 与 `TestLocalStore::searchMessagesNeverReturnsFileManifest` 锁定）。
 - **本地缓存**：密文原样落盘（`<AppData>/XYChat/filecache/<sha256[0..1]>/<sha256>`，无后缀），零额外加密开销且磁盘上不是明文；明文只在用户“另存为”时写出。缓存命中判定只看“存在且字节数相符”，内容完整性由入库前的整体 SHA-256 与解密时的逐片 GCM 认证两道关卡保证（损坏则删缓存并回退到可重下状态，一次性自愈）。
 - **串行调度与重入护栏**：一次只跑一个分片（避免带宽争抢、内存峰值与服务端 per-IP 限流）；`pumpNext` 先取 token 快照再遍历（循环体内可能同步 `failTask` → `erase` 当前节点）+ `m_pumping` 防嵌套；`reset()` 用 `m_resetting` 护栏并显式复位在途 reply（`abort()` 会同步触发回调）；`finishTask`/`failTask` 先取 `token` 副本再 `erase`（否则 `emit` 时读已释放内存）。
 - **重试与恢复**：分片失败先问控制面“服务端实际收了哪些片”再决定跳过/重传（处理“响应丢失但数据已落盘”）；重试预算双层（分片 3 次 + 总恢复轮次 5 轮），后者防止数据面持续 5xx 而控制面正常时“成功的查询”不断清零预算而形成活锁。
@@ -229,7 +231,7 @@ Chat-Client
   ├── QML UI 层（resources/）
   │     ├── main.qml（登录窗口根，objectName=loginRoot）
   │     ├── pages/（LoginPage.qml, MainPage.qml, MainWindow.qml 主窗口根，objectName=mainWindow）
-  │     ├── components/（既有：TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton；M10 基础组件库：Icon, AppButton, AppTextField, AppDialog, Avatar, Toast, EmptyState, LoadingIndicator, NetworkStatusBar）
+  │     ├── components/（既有：TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton；M10 基础组件库：Icon, AppButton, AppTextField, AppDialog, Avatar, Toast, EmptyState, LoadingIndicator, NetworkStatusBar；M12.4：ChatText.js 系统消息映射，气泡与会话预览共用）
   │     ├── dialogs/（M10：MainPage 拆出的 9 个对话框 Search/CreateGroup/GroupInfo/Invite/EditMessage/ConfirmDelete/ImagePreview/MediaPlayback/SaveFile）
   │     ├── icons/（M10：34 个单色 SVG，经 Icon.qml 按 name 加载并可 tint）
   │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册；M10 扩展 elevation/状态色/avatarColor(id)/字号 scale/动画曲线 token）
@@ -248,7 +250,7 @@ Chat-Client
 - `main.cpp` 依次 `engine.load()` 加载 `main.qml`（登录窗口）与 `pages/MainWindow.qml`（主窗口），两者均为独立根窗口；主窗口按 `objectName` 查找后注入登录窗口的 `mainWindow` 属性。**不能把主窗口声明在登录窗口 QML 内部**，否则会成为 transient 子窗口而不在 Windows 任务栏显示。
 - 窗口流转：启动→登录窗口→（登录成功）隐藏登录窗口并显示主窗口；登出→隐藏主窗口并重新显示登录窗口；关闭主窗口退出应用，主窗口打开时关闭登录窗口仅隐藏。
 - 主题：`Theme.qml` 全部颜色属性为 `darkMode ? 暗色 : 亮色` 绑定表达式，`main.qml` 用 `Binding` 将 `Theme.darkMode` 绑定到 `appSettings.darkMode`，标题栏切换按钮写入 `appSettings` 即全局生效并持久化。
-- 聊天区：`ChatView` 消息列表直接用 `ListView`（不用外层 ScrollView 包 `height: contentHeight` 的 ListView，否则不可滚动）；自动贴底由 50ms Timer + `stayAtBottom`/`programmaticScroll` 标志实现（用户手动上滚时暂停贴底）。
+- 聊天区：`ChatView` **按会话一实例**（M12.4 堆叠，见上文"会话视图堆叠"），消息列表直接用 `ListView`（不用外层 ScrollView 包 `height: contentHeight` 的 ListView，否则不可滚动）；自动贴底由 50ms Timer + `stayAtBottom`/`programmaticScroll` 标志实现（用户手动上滚时暂停贴底）。定位与“是否在底部”的判定一律以**末行 delegate 的真实末端**（`layoutExtent` = `last.y + last.height`）为准，并据此把估算出的 `contentHeight`/`contentY` 夹回真实内容范围：`ListView.contentHeight` 是按可见行平均高度估算的（Qt 源码 `qquicklistview.cpp` 的 `originPosition`/`lastPosition`），未创建行越多误差越大（实测 31 行时多出 600+px 幽灵空白），按它直接算 `contentY` 会越界到空白区（历史缺陷：发送消息后视图滚出边界、需手动滚回）。贴底请求统一经 `scheduleStick()` 合并后延迟到下一事件循环执行（`Qt.callLater`）：在 ListView 布局过程中（delegate 创建/高度变化信号里）直接调 `positionViewAtEnd` 是对同一套布局逻辑的重入，会把外层定位算坏。
 
 M7a 群聊 UI（子任务三新增）：
 

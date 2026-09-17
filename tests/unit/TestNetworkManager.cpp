@@ -329,7 +329,7 @@ private slots:
         QCOMPARE(nm.m_fileTransfer->m_incoming.value(1002).key, key.key);
         QCOMPARE(nm.m_fileTransfer->m_incoming.value(1002).iv, key.iv);
 
-        // ④ 批量出口（sync_messages 与本地缓存批量回填）逐条脱敏，
+        // ④ 逐条脱敏（消息页泵对每一条消息都调用同一出口），
         //    且不得误伤普通文本消息
         QJsonObject plain;
         plain["messageId"] = 1003;
@@ -344,11 +344,10 @@ private slots:
         batch.append(fromCache);
         batch.append(plain);
         batch.append(offline);
-        const QJsonArray sanitized = nm.sanitizeArrayForUi(batch);
-        QCOMPARE(sanitized.size(), qsizetype(4));
         bool sawPlain = false;
-        for (const QJsonValue &value : sanitized) {
-            const QJsonObject msg = value.toObject();
+        for (const QJsonValue &value : batch) {
+            QJsonObject msg = value.toObject();
+            nm.sanitizeForUi(msg);
             const QString content = msg.value("content").toString();
             QVERIFY2(!content.contains(keyB64), "file key leaked into a UI payload");
             if (msg.value("messageId").toVariant().toLongLong() == 1003) {
@@ -539,6 +538,140 @@ private slots:
         bad.payload = payloadBytes(QJsonObject{{"conversationId", 0}, {"operatorId", 8}});
         nm.handleConversationDeletedNotification(bad);
         QCOMPARE(deletedSpy.count(), 0);
+    }
+
+    // M12：sync_messages 响应改为多槽匹配 + 时间片泵异步 emit。
+    // ① 单槽实现下后发请求会覆盖先发，先发的页响应到达即被静默丢弃；
+    // ② 整页处理必须推迟到时间片泵（handler 返回时尚未 emit）
+    void syncMessagesResponsesRoutedByMultiSlotAndEmittedAsync()
+    {
+        NetworkManager nm;
+        QSignalSpy syncedSpy(&nm, &NetworkManager::messagesSynced);
+
+        const auto makeResponse = [](quint64 requestId, bool hasMore) {
+            Packet packet;
+            packet.messageType = MessageType::SyncMessagesResponse;
+            packet.requestId = requestId;
+            QJsonArray messages;
+            QJsonObject msg;
+            msg["messageId"] = 11;
+            msg["conversationId"] = 100;
+            msg["senderId"] = 7;
+            msg["senderUsername"] = "peer";
+            // 存量明文（非 envelope）：解密路径原样通过，测试无需密钥
+            msg["content"] = "hello";
+            msg["contentType"] = "text";
+            msg["status"] = "delivered";
+            msg["createdAt"] = "2026-09-05T12:00:00Z";
+            messages.append(msg);
+            QJsonObject data;
+            data["conversationId"] = 100;
+            data["hasMore"] = hasMore;
+            data["messages"] = messages;
+            QJsonObject json;
+            json["code"] = static_cast<int>(ErrorCode::Ok);
+            json["data"] = data;
+            packet.payload = payloadBytes(json);
+            return packet;
+        };
+
+        // 两个在途请求（切会话）：单槽会丢掉第一个
+        nm.m_pendingSyncRequests.insert(1, 100);
+        nm.m_pendingSyncRequests.insert(2, 200);
+        nm.handleSyncMessagesResponse(makeResponse(1, false));
+        nm.handleSyncMessagesResponse(makeResponse(2, true));
+
+        // 未登记的 requestId：忽略且不影响在途登记
+        Packet stray = makeResponse(3, false);
+        nm.handleSyncMessagesResponse(stray);
+        QCOMPARE(nm.m_pendingSyncRequests.size(), 0);
+
+        // 异步：handler 已返回，页面推进交给时间片泵
+        QCOMPARE(syncedSpy.count(), 0);
+        QTRY_COMPARE(syncedSpy.count(), 2);
+        QList<QVariant> first = syncedSpy.at(0);
+        QCOMPARE(first.at(0).toLongLong(), qint64(100));  // conversationId
+        QCOMPARE(first.at(1).toJsonArray().size(), 1);
+        QCOMPARE(first.at(1).toJsonArray().at(0).toObject().value("content").toString(),
+                 QString("hello"));
+        QCOMPARE(first.at(2).toBool(), false);            // hasMore
+        QList<QVariant> second = syncedSpy.at(1);
+        QCOMPARE(second.at(0).toLongLong(), qint64(200));
+        QCOMPARE(second.at(2).toBool(), true);
+    }
+
+    // M12：整页（大页需跨多个时间片）只 emit 一次、消息保持原序——
+    // 若按片 emit，QML 侧会把后半页当成新到的一页重复处理
+    void largePageEmittedOnceInOrderAcrossSlices()
+    {
+        NetworkManager nm;
+        QSignalSpy syncedSpy(&nm, &NetworkManager::messagesSynced);
+
+        NetworkManager::MessagePageJob job;
+        job.conversationId = 77;
+        job.fromServer = true;
+        job.hasMore = true;
+        const int kCount = 300;
+        for (int i = 0; i < kCount; ++i) {
+            QJsonObject msg;
+            msg["messageId"] = 1000 + i;
+            msg["conversationId"] = 77;
+            msg["senderId"] = 7;
+            msg["senderUsername"] = "peer";
+            msg["content"] = QString(2048, QLatin1Char('x'));
+            msg["contentType"] = "text";
+            msg["status"] = "delivered";
+            msg["createdAt"] = "2026-09-05T12:00:00Z";
+            job.messages.append(msg);
+        }
+        nm.enqueueMessagePage(job);
+
+        QCOMPARE(syncedSpy.count(), 0);
+        QTRY_COMPARE(syncedSpy.count(), 1);
+        const QList<QVariant> args = syncedSpy.at(0);
+        QCOMPARE(args.at(0).toLongLong(), qint64(77));
+        QCOMPARE(args.at(2).toBool(), true);
+        const QJsonArray emitted = args.at(1).toJsonArray();
+        QCOMPARE(emitted.size(), kCount);
+        QCOMPARE(emitted.first().toObject().value("messageId").toVariant().toLongLong(),
+                 qint64(1000));
+        QCOMPARE(emitted.last().toObject().value("messageId").toVariant().toLongLong(),
+                 qint64(1000 + kCount - 1));
+        QVERIFY(!nm.m_messagePageActive);
+        QVERIFY(nm.m_messagePageQueue.isEmpty());
+    }
+
+    // M12：缓存页（切会话时先展示本地缓存）的解密与脱敏同样在时间片泵内完成，
+    // 且不落库、不崩溃（本地库未打开）。取行阶段正文以 contentCipher 交给泵
+    //（正常路径见 TestLocalStore::batchUpsertAndRowDecryptMatchSinglePath）；
+    // 这里锁住兜底语义：行内没有密文时绝不放行任何正文
+    void cachePageNeverLeaksContentWithoutCipher()
+    {
+        NetworkManager nm;
+        QSignalSpy syncedSpy(&nm, &NetworkManager::messagesSynced);
+
+        NetworkManager::MessagePageJob cacheJob;
+        cacheJob.conversationId = 42;
+        QJsonObject cached;
+        cached["messageId"] = 1;
+        cached["conversationId"] = 42;
+        cached["senderId"] = 7;
+        cached["content"] = "must not pass through";
+        cached["contentType"] = "text";
+        cacheJob.messages.append(cached);
+        nm.enqueueMessagePage(cacheJob);
+
+        // 异步：入队不立即 emit，由泵在下一轮事件循环推进
+        QCOMPARE(syncedSpy.count(), 0);
+        QTRY_COMPARE(syncedSpy.count(), 1);
+        const QList<QVariant> args = syncedSpy.at(0);
+        QCOMPARE(args.at(0).toLongLong(), qint64(42));
+        QCOMPARE(args.at(2).toBool(), false);
+        const QJsonObject emitted = args.at(1).toJsonArray().at(0).toObject();
+        QVERIFY(emitted.value("content").toString().isEmpty());
+        QVERIFY(emitted.value("undecryptable").toBool());
+        QVERIFY(!nm.m_messagePageActive);
+        QVERIFY(nm.m_messagePageQueue.isEmpty());
     }
 };
 

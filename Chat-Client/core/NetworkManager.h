@@ -125,7 +125,10 @@ signals:
     void contactsResult(const QJsonArray &contacts);
     void conversationsResult(const QJsonArray &conversations);
     void messageSent(qint64 messageId, qint64 conversationId, const QString &clientMessageId);
-    void messageSendFailed(const QString &error);
+    // clientMessageId 为失败消息的幂等键；整批/参数类失败（无具体消息可指）
+    // 时为空，QML 侧据此决定"精确标记该条气泡"还是退回启发式
+    void messageSendFailed(const QString &error, const QString &clientMessageId = QString());
+    void addContactFailed(const QString &error);
     void newMessageReceived(const QJsonObject &message);
     // M8.2: 本人发出的文件消息在服务端确认后的本地回显（脱敏后的 UI 对象）。
     // 与 newMessageReceived 分开：那是"服务端推送给我的他人消息"，
@@ -301,7 +304,6 @@ private:
     // 进入 JS 引擎就无法可靠清零，因此每一条通向 UI 的消息都必须经此处。
     // 兼作兜底防线：即使 fileId 缺失或清单解析失败，只要正文形态像清单就置空
     void sanitizeForUi(QJsonObject &message);
-    QJsonArray sanitizeArrayForUi(const QJsonArray &messages);
     // M8.2: 文件消息（正文是清单）发送确认后的本地回显：通过 attachFileInfo
     // 补登记清单到传输引擎，并把脱敏后的消息对象 emit fileMessageSent 给 QML
     // 立即插入气泡。clientMessageId 未命中在途登记（普通文本消息）时不做任何事
@@ -315,6 +317,23 @@ private:
     void emitCachedConversations();
     // 将 sync_events 事件写入本地缓存并推进游标（hasMore 时自动续拉）
     void ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, bool hasMore);
+
+    // M12: 消息页的时间片泵。逐条解密/落库/脱敏的工作量随页大小线性增长
+    //（一页最多 100 条），整页同步做完会阻塞 GUI 线程——点击/切换会话时的
+    // 卡顿即来源于此。改为每片最多 8ms 分片推进，片间交还事件循环
+    struct MessagePageJob
+    {
+        qint64 conversationId = 0;
+        bool fromServer = false; // 服务端页需落库；缓存页只解密展示
+        bool hasMore = false;
+        QJsonArray messages;     // 待处理消息（服务端页为密文行，缓存页为原始行）
+        int nextIndex = 0;
+        QJsonArray visible;      // 已处理、应展示的消息（已过脱敏出口）
+    };
+    void enqueueMessagePage(MessagePageJob job);
+    void startMessagePagePump();
+    void runMessagePageSlice();
+    void finishMessagePageJob();
 
 private:
     QSslSocket *m_sslSocket;
@@ -354,7 +373,16 @@ private:
     quint64 m_pendingGetContactsRequestId = 0;
     quint64 m_pendingGetConversationsRequestId = 0;
     quint64 m_pendingAckMessageRequestId = 0;
-    quint64 m_pendingSyncMessagesRequestId = 0;
+    // M12: sync_messages 改为多槽（requestId → conversationId）。单槽在快速
+    // 切换会话时被后发请求覆盖，先发的页响应到达即成孤儿而被静默丢弃；
+    // conversationId 以本地登记为准，响应 data 缺失时仍可正确路由
+    QHash<quint64, qint64> m_pendingSyncRequests;
+
+    // M12: 消息页时间片泵（同一时刻只推进一个页，其余排队；每片最多 8ms）
+    QQueue<MessagePageJob> m_messagePageQueue;
+    MessagePageJob m_messagePageJob;
+    bool m_messagePageActive = false;
+    QTimer *m_messagePagePump = nullptr;
 
     // M5.5: TLS fail-closed 标记（CA 缺失且未显式允许明文时拒绝连接）
     bool m_tlsUnavailable = false;

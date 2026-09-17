@@ -60,8 +60,22 @@ public:
     // msg 需含 messageId/conversationId/content 等 sync_messages 响应字段；
     // undecryptable=true 且已有可解密正文时保留旧明文不覆盖
     bool upsertMessage(const QJsonObject &msg);
+    // 批量落库：整批共用一次事务提交。逐条自动提交会为每行付一次 fsync，
+    // 一页（最多 100 条）的同步导入因此成为会话切换卡顿的主要来源。
+    // 消息页泵按时间片调用本函数（每片一次提交），故提交粒度是"片"而非"页"：
+    // 页越大 fsync 次数仍远少于逐条，且单片工作量有上界
+    // 单行失败（字段非法/加密失败）只跳过该行：行级故障与整页无关，
+    // 回滚整批会让好行也一起丢缓存
+    bool upsertMessages(const QJsonArray &msgs);
     // 按 messageId 升序返回该会话最近 limit 条消息（字段同服务端响应）
     QJsonArray loadMessages(qint64 conversationId, int limit = 100) const;
+    // 首页加载的逐行版本：只取原始行（正文密文放在 contentCipher，未解密），
+    // 调用方可在时间片内逐行 decryptRowContent，避免整页解密阻塞 GUI 线程；
+    // loadMessages 即"取行 + 逐行解密"的同步封装
+    QJsonArray loadMessageRows(qint64 conversationId, int limit = 100) const;
+    // 就地把行的 contentCipher 解密为 content：deleted 行置空、解不出置
+    // undecryptable（与 loadMessages 同一实现，两条加载路径语义一致）
+    void decryptRowContent(QJsonObject &row) const;
     // 读取单条消息的本地解密正文（content_enc 解密；无或 undecryptable 返回空）
     QString loadMessageContent(qint64 messageId) const;
     bool updateMessageStatus(qint64 messageId, const QString &status);
@@ -79,6 +93,8 @@ public:
 
     // 会话缓存（lastMessage 预览加密存储）
     bool upsertConversation(const QJsonObject &conv);
+    // 批量落库（同 upsertMessages：整批一次提交）
+    bool upsertConversations(const QJsonArray &convs);
     QJsonArray loadConversations() const;
     // 仅更新已存在的会话行（避免事件流缺字段时产生幻影会话）
     bool bumpConversationPreview(qint64 conversationId, const QString &preview,
@@ -153,6 +169,9 @@ public:
 
 private:
     bool ensureSchema();
+    // 行级 upsert：假定连接已就绪，供单条与批量两条路径共用
+    bool upsertMessageRow(const QJsonObject &msg);
+    bool upsertConversationRow(const QJsonObject &conv);
     // M7a: 列存在性检查（存量库幂等补列）
     bool hasColumn(const QString &table, const QString &column) const;
     bool ensureStorageKey(const QString &username, const QString &deviceId);

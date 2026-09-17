@@ -16,7 +16,9 @@
 #include "KeyStorage.h"
 #include "LocalStore.h"
 #include "encryption/E2eeCrypto.h"
+#include "encryption/FileCrypto.h"
 #include "encryption/GroupE2eeCrypto.h"
+#include "protocol/FileProtocol.h"
 
 namespace
 {
@@ -400,6 +402,125 @@ private slots:
         messages = store.loadMessages(20);
         QCOMPARE(messages.at(0).toObject().value("content").toString(),
                  "re-decrypted");
+        store.closeAndDestroy();
+    }
+
+    // M12: 批量落库与逐行解密（会话切换的异步分片加载依赖这两条路径）
+    void batchUpsertAndRowDecryptMatchSinglePath()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        QJsonArray batch;
+        for (int i = 1; i <= 5; ++i) {
+            batch.append(makeMessage(i, 40, QString("batch %1").arg(i)));
+        }
+        QVERIFY(store.upsertMessages(batch));
+
+        // 批量写入与单条写入等价：升序且在库中可解密
+        const QJsonArray messages = store.loadMessages(40);
+        QCOMPARE(messages.size(), 5);
+        for (int i = 0; i < messages.size(); ++i) {
+            const QJsonObject msg = messages.at(i).toObject();
+            QCOMPARE(msg.value("messageId").toVariant().toLongLong(), qint64(i + 1));
+            QCOMPARE(msg.value("content").toString(), QString("batch %1").arg(i + 1));
+        }
+
+        // 逐行路径（先取行、时间片内解密）与同步封装输出一致
+        const QJsonArray rows = store.loadMessageRows(40);
+        QCOMPARE(rows.size(), 5);
+        for (int i = 0; i < rows.size(); ++i) {
+            QJsonObject row = rows.at(i).toObject();
+            QVERIFY2(row.contains("contentCipher"), "取行阶段不得携带明文");
+            QVERIFY(!row.contains("content"));
+            store.decryptRowContent(row);
+            QVERIFY(!row.contains("contentCipher"));
+            QCOMPARE(row.value("messageId").toVariant().toLongLong(), qint64(i + 1));
+            QCOMPARE(row.value("content").toString(), QString("batch %1").arg(i + 1));
+            QVERIFY(!row.contains("undecryptable"));
+            // 与同步路径逐字段等价
+            const QJsonObject reference = messages.at(i).toObject();
+            QCOMPARE(row.value("contentType").toString(),
+                     reference.value("contentType").toString());
+            QCOMPARE(row.value("status").toString(), reference.value("status").toString());
+            QCOMPARE(row.value("createdAt").toString(), reference.value("createdAt").toString());
+            QCOMPARE(row.contains("deleted"), reference.contains("deleted"));
+            QCOMPARE(row.contains("edited"), reference.contains("edited"));
+        }
+
+        // 软删除行：两条路径都不带出正文
+        QVERIFY(store.upsertMessage(makeMessage(9, 40, "will be deleted")));
+        QVERIFY(store.markMessageDeleted(9));
+        const QJsonArray withDeleted = store.loadMessages(40);
+        const QJsonObject deletedMsg = withDeleted.at(withDeleted.size() - 1).toObject();
+        QCOMPARE(deletedMsg.value("messageId").toVariant().toLongLong(), qint64(9));
+        QVERIFY(deletedMsg.value("deleted").toBool());
+        QVERIFY(deletedMsg.value("content").toString().isEmpty());
+        QJsonObject deletedRow = store.loadMessageRows(40).at(5).toObject();
+        store.decryptRowContent(deletedRow);
+        QVERIFY(deletedRow.value("deleted").toBool());
+        QVERIFY(deletedRow.value("content").toString().isEmpty());
+
+        // 批量会话写入同样落库
+        QJsonArray convs;
+        QJsonObject convA;
+        convA["conversationId"] = 40;
+        convA["type"] = "private";
+        convA["peerUserId"] = 2;
+        convA["peerUsername"] = "bob";
+        convA["lastMessage"] = "batch 5";
+        convA["lastMessageAt"] = "2026-08-21T00:00:00Z";
+        QJsonObject convB = convA;
+        convB["conversationId"] = 41;
+        convB["lastMessage"] = "second";
+        convs.append(convA);
+        convs.append(convB);
+        QVERIFY(store.upsertConversations(convs));
+        QCOMPARE(store.loadConversations().size(), 2);
+        store.closeAndDestroy();
+    }
+
+    // M12 补漏：本地搜索命中的正文同样不得把文件清单（含 32 字节密钥）
+    // 交给 QML——降级为 "[File] 名"，绝不回退成清单原文
+    void searchMessagesNeverReturnsFileManifest()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        const auto fileKey = XYChat::Security::FileCrypto::generateFileKey();
+        XYChat::Protocol::FileManifest manifest;
+        manifest.fileId = 77;
+        manifest.name = "searchable-report.pdf";
+        manifest.mime = "application/pdf";
+        manifest.chunkSize = 1024 * 1024;
+        manifest.plainSize = XYChat::Protocol::plainSizeOfChunk(manifest.chunkSize);
+        manifest.cipherSize = manifest.plainSize + 16;
+        manifest.sha256Hex = XYChat::Security::FileCrypto::sha256Hex("ciphertext-placeholder");
+        manifest.key = fileKey.key;
+        manifest.iv = fileKey.iv;
+        const QString manifestJson = XYChat::Protocol::encodeFileManifest(manifest);
+        QVERIFY(XYChat::Protocol::looksLikeFileManifest(manifestJson));
+        QVERIFY(store.upsertMessage(makeMessage(1, 45, manifestJson)));
+        QVERIFY(store.upsertMessage(makeMessage(2, 45, "plain searchable text")));
+
+        const QJsonArray hits = store.searchMessages("searchable");
+        QCOMPARE(hits.size(), 2);
+        bool sawPreview = false;
+        for (const QJsonValue &value : hits) {
+            const QJsonObject msg = value.toObject();
+            const qint64 id = msg.value("messageId").toVariant().toLongLong();
+            const QString content = msg.value("content").toString();
+            if (id == 1) {
+                QCOMPARE(content, QString("[File] searchable-report.pdf"));
+                QVERIFY2(!content.contains(manifest.sha256Hex), "manifest leaked into search hits");
+                sawPreview = true;
+            } else {
+                QCOMPARE(content, QString("plain searchable text"));
+            }
+        }
+        QVERIFY(sawPreview);
         store.closeAndDestroy();
     }
 

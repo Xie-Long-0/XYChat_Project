@@ -7,6 +7,7 @@
         <file>components/TitleBar.qml</file>
         <file>components/ConversationList.qml</file>
         <file>components/ChatView.qml</file>
+        <file>components/ChatText.js</file>
         <file>components/MessageInput.qml</file>
         <file>components/MessageBubble.qml</file>
         <file>components/Icon.qml</file>

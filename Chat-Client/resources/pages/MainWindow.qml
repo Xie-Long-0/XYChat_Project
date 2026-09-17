@@ -156,6 +156,13 @@ Window {
                 networkManager.sendTyping(conversationId, typing)
             }
 
+            // M12.4: 会话被激活（含"切到已打开会话"这条不再重新加载的路径）。
+            // 已读回执原先挂在"当前会话的消息页到达"上，切回旧会话时没有页
+            // 到达，角标会一直留着，故在激活点补发
+            onConversationActivated: {
+                sendReadAck()
+            }
+
             // P3.1: 会话整表删除
             onDeleteConversationRequested: function(conversationId) {
                 networkManager.deleteConversation(conversationId)
@@ -177,25 +184,32 @@ Window {
         }
 
         function onMessagesSynced(conversationId, messages, hasMore) {
-            // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
-            if (conversationId == mainPage.currentConversationId) {
-                var msgs = []
-                for (var i = 0; i < messages.length; i++) {
-                    msgs.push(messages[i])
-                }
-                mainPage.updateMessages(msgs)
+            var msgs = []
+            for (var i = 0; i < messages.length; i++) {
+                msgs.push(messages[i])
+            }
+            // M12.4: 页按会话路由到对应视图（可能是切走后仍保留的后台视图）；
+            // 视图已不存在（被淘汰/未打开过）时该页无处可放，直接丢弃——
+            // 视图重建时 afterId=0 会重新拉取
+            if (mainPage.updateMessages(conversationId, msgs, hasMore)) {
                 // M4.5: 打开会话时对最后一条对方消息发送已读回执
-                sendReadAck()
+                // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+                if (conversationId == mainPage.currentConversationId) {
+                    sendReadAck()
+                }
             }
         }
 
         function onNewMessageReceived(message) {
             var convId = message.conversationId
             // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
-            if (convId == mainPage.currentConversationId) {
-                mainPage.appendMessage(message)
+            var active = (convId == mainPage.currentConversationId)
+            var msgId = message.messageId || 0
+            // M12.4: 消息写入该会话的视图——当前打开的与后台保留的都要写，
+            // 否则切回去只能靠补收页，实时性丢失
+            mainPage.appendMessage(convId, message)
+            if (active) {
                 // M4.5: 会话打开期间收到新消息，发送已读回执
-                var msgId = message.messageId || 0
                 if (msgId > 0) {
                     networkManager.ackMessage(msgId, "read")
                 }
@@ -215,9 +229,8 @@ Window {
         // 下一次历史同步（手动刷新/重进会话）才看得到自己的文件气泡。
         // 与 onNewMessageReceived 的区别：这是自己发的消息，不回已读回执
         function onFileMessageSent(message) {
-            if (message.conversationId == mainPage.currentConversationId) {
-                mainPage.appendMessage(message)
-            }
+            // M12.4: 回显到该会话的视图（发完就切走的会话仍持有其乐观气泡所在的气泡列）
+            mainPage.appendMessage(message.conversationId, message)
             // 会话列表不本地拼预览：文件消息的正文已被脱敏出口置空，本地拼出来
             // 是空串；而且自己的消息不该计未读。预览文本与未读数一律以服务端
             // 为准（服务端 lastMessage 经脱敏出口转成 "[File] 文件名"）
@@ -225,16 +238,21 @@ Window {
         }
 
         function onMessageSent(messageId, conversationId, clientMessageId) {
-            // M4.5: 首条消息成功后绑定服务端会话 ID，并确认乐观消息
-            mainPage.bindNewConversation(conversationId)
-            mainPage.confirmMessage(clientMessageId, messageId)
+            // M12.4: 按幂等键找回发起视图确认乐观气泡（用户可能已切走）；
+            // 新会话的首条消息还会把"待绑定"视图迁到服务端会话 ID 上
+            mainPage.confirmSentMessage(conversationId, clientMessageId, messageId)
             networkManager.getConversations()
         }
 
-        function onMessageSendFailed(error) {
+        function onMessageSendFailed(error, clientMessageId) {
             globalToast.error("发送失败：" + error)
-            // P2.2: 把当前会话中“发送中”的乐观气泡标记为 failed，供点击重发
-            mainPage.handleSendFailed()
+            // P2.2: 把对应会话中“发送中”的乐观气泡标记为 failed，供点击重发
+            mainPage.handleSendFailed(clientMessageId)
+        }
+
+        // 加好友与消息发送失败分开：它不是消息失败，不该碰任何气泡状态
+        function onAddContactFailed(error) {
+            globalToast.error("添加联系人失败：" + error)
         }
 
         // M4.5: 消息状态推送（已送达/已读）实时更新气泡状态
