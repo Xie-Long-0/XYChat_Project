@@ -55,6 +55,10 @@ private slots:
     // M8 欠账修复：下载票据按"最后一次使用"滑动续期。单次 GET 有 4 MiB 上限，
     // 2 GiB 文件要 2048 次串行 Range GET，固定 300 秒 TTL 会让慢链路下载中途失效
     void downloadRenewsTicketLifetime();
+    // 2026-09-17 修复：数据面此前无条件绑 QHostAddress::Any（默认监听全部网卡），
+    // 而未认证的请求体会在票据校验之前被读进内存。必须验：默认仅回环、
+    // 非回环需显式 opt-in、非法地址绝不静默退回 Any
+    void dataPlaneBindsLoopbackByDefault();
     // 必须最后执行：本用例会令本机 IP 进入失败限流窗口，之后的请求都会 429
     void repeatedAuthFailuresAreRateLimited();
 
@@ -98,6 +102,12 @@ private:
     void makeReadyFile(int chunkCount, qint64 chunkSize, Fixture *out,
                        qint64 lastChunkBytes = -1);
     QString issueTicket(qint64 fileId, const QString &kind, int ttlSeconds);
+    // 2026-09-17: 起一个"绑定地址可配"的数据面实例（独立内存库 + 共享对象存储），
+    // 返回实际绑定地址；启动失败返回空 QHostAddress 并经 okOut 报告。
+    // 独立成函数而非 lambda：QVERIFY/QCOMPARE 失败路径是裸 return，不能用在
+    // 有返回值的 lambda 里
+    QHostAddress startServiceWithBind(const QString &connSuffix, const QString &bindHost,
+                                      bool allowPublic, bool *okOut);
 
     QTemporaryDir *m_dir = nullptr;
     std::unique_ptr<LocalFileStorage> m_storage;
@@ -652,6 +662,60 @@ void TestFileHttpService::downloadRenewsTicketLifetime()
     const HttpReply second = get(path, f.downloadTicket);
     QCOMPARE(second.status, 200);
     QCOMPARE(second.body, f.blob);
+}
+
+QHostAddress TestFileHttpService::startServiceWithBind(const QString &connSuffix,
+                                                       const QString &bindHost, bool allowPublic,
+                                                       bool *okOut)
+{
+    const QString conn = "test_file_http_bind_" + connSuffix;
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", conn);
+        db.setDatabaseName(":memory:");
+        if (!db.open()) {
+            *okOut = false;
+            return QHostAddress();
+        }
+    }
+    // 栈上实例：析构时其 DatabaseManager 会 removeDatabase，连接名不会残留
+    FileHttpService svc(nullptr, conn);
+    svc.setObjectStorage(m_storage.get());
+    if (!bindHost.isEmpty()) {
+        svc.setBindAddress(bindHost);
+    }
+    svc.setAllowPublicBind(allowPublic);
+    *okOut = svc.start(0, QSslConfiguration(), false, true);
+    return *okOut ? svc.serverAddress() : QHostAddress();
+}
+
+void TestFileHttpService::dataPlaneBindsLoopbackByDefault()
+{
+    // initTestCase 建的那个服务走的就是生产默认路径（Server 从不设绑定地址）：
+    // 必须落在回环上。2026-09-17 之前它绑的是 QHostAddress::Any——未认证的请求体
+    // 在票据校验之前就被 QHttpServer 读进内存，等于把内存放大面默认敞开在整个局域网
+    QVERIFY(m_service->serverPort() > 0);
+    QVERIFY(m_service->isListening());
+    QVERIFY(m_service->serverAddress().isLoopback());
+
+    bool ok = false;
+
+    // 非法地址：fail-closed。绝不能静默退回 Any——否则"地址打错"与"有意对外"
+    // 在行为上完全一样，而这个错误恰恰是最危险的配置错误
+    startServiceWithBind("bad", "not-an-ip", false, &ok);
+    QVERIFY(!ok);
+
+    // 非回环且未显式确认：拒绝启动（延用 TLS/明文那套 fail-closed 口径）
+    startServiceWithBind("public_noconfirm", "0.0.0.0", false, &ok);
+    QVERIFY(!ok);
+
+    // 显式确认后允许绑定（前置条件：带请求体上限的反向代理）。
+    // 不断言具体地址字面量：绑 Any 时 Qt 可能给出 0.0.0.0 或 IPv6 双栈的 ::
+    // 两种等价表示。要断言的是"opt-in 真的生效了"——即没有静默退回回环
+    const QHostAddress bound
+        = startServiceWithBind("public_confirmed", "0.0.0.0", true, &ok);
+    QVERIFY(ok);
+    QVERIFY(bound != QHostAddress());
+    QVERIFY(!bound.isLoopback());
 }
 
 QTEST_GUILESS_MAIN(TestFileHttpService)

@@ -224,9 +224,16 @@ void NetworkManager::onDisconnected()
     m_fileSeqByRequestId.clear();
     m_privateEditQueue.clear();
     m_editFetchInFlight = false;
+    m_privateEditFetchDeadlineMs = 0;
     m_pendingDeleteRequestIds.clear();
     // M10：清空在途会话删除请求与 typing 节流状态（同 M9，两处都必须清）
     m_pendingDeleteConversationRequests.clear();
+    // M9/M12 欠账修复：在途登记表的截止时刻随登记项一起作废（清空后无在途，
+    // 定时器随之停表，不留空转唤醒）
+    m_pendingDeadlines.clear();
+    if (m_inFlightSweepTimer) {
+        m_inFlightSweepTimer->stop();
+    }
     m_lastTypingSentMs.clear();
     for (int i = 0; i < pendingEditFailures; ++i) {
         emit messageEditFailed("Connection lost");
@@ -788,9 +795,16 @@ void NetworkManager::resetAuthState()
     m_fileSeqByRequestId.clear();
     m_privateEditQueue.clear();
     m_editFetchInFlight = false;
+    m_privateEditFetchDeadlineMs = 0;
     m_pendingDeleteRequestIds.clear();
     // M10：清空在途会话删除请求与 typing 节流状态（同 M9 两处都必须清）
     m_pendingDeleteConversationRequests.clear();
+    // M9/M12 欠账修复：在途登记表的截止时刻随登记项一起作废（清空后无在途，
+    // 定时器随之停表，不留空转唤醒）
+    m_pendingDeadlines.clear();
+    if (m_inFlightSweepTimer) {
+        m_inFlightSweepTimer->stop();
+    }
     m_lastTypingSentMs.clear();
     XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
     m_identityKey = {};
@@ -1304,6 +1318,7 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
         if (m_editFetchInFlight && !m_privateEditQueue.isEmpty()
             && m_privateEditQueue.head().peerUserId == target) {
             m_editFetchInFlight = false;
+            m_privateEditFetchDeadlineMs = 0;
             m_privateEditQueue.dequeue();
             emit messageEditFailed(message);
             flushOutbox();
@@ -1357,6 +1372,7 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
         if (m_editFetchInFlight && !m_privateEditQueue.isEmpty()
             && m_privateEditQueue.head().peerUserId == target) {
             m_editFetchInFlight = false;
+            m_privateEditFetchDeadlineMs = 0;
             m_privateEditQueue.dequeue();
             emit messageEditFailed("Key bundle unavailable");
             pumpPrivateEditFetch();
@@ -1372,6 +1388,7 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
     if (m_editFetchInFlight && !m_privateEditQueue.isEmpty()
         && m_privateEditQueue.head().peerUserId == target) {
         m_editFetchInFlight = false;
+        m_privateEditFetchDeadlineMs = 0;
         const PrivateEditWait w = m_privateEditQueue.dequeue();
         const QString envelope = encryptForUser(target, bundles, w.plaintext);
         if (envelope.isEmpty()) {
@@ -2282,6 +2299,7 @@ void NetworkManager::deleteConversation(qint64 conversationId)
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
     m_pendingDeleteConversationRequests.insert(packet.requestId, conversationId);
+    trackInFlightRequest(packet.requestId);
     sendPacket(packet);
 }
 
@@ -2318,6 +2336,7 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
     m_pendingSyncRequests.insert(packet.requestId, conversationId);
+    trackInFlightRequest(packet.requestId);
     sendPacket(packet);
 }
 
@@ -2567,6 +2586,7 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
     }
     const qint64 conversationId = pending.value();
     m_pendingSyncRequests.erase(pending);
+    forgetInFlightRequest(packet.requestId);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
@@ -2588,6 +2608,15 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
 
 void NetworkManager::enqueueMessagePage(MessagePageJob job)
 {
+    // M12 欠账修复：队列无上限时，快速连点大量会话会把每一页（≤100 行密文 +
+    // 已解密明文）都留在内存里。视图 LRU 上限为 8，故 16 已足够覆盖"活跃会话 +
+    // hasMore 链式续拉"；超限丢最旧——被丢的会话下次激活会重新请求该页，
+    // 而保留最新的更符合"用户当前在看什么"。丢弃不发信号：与 finishMessagePageJob
+    // 的"页内全不可见消息时跳过 emit"是同一口径，QML 侧本就不依赖每页必有响应
+    while (m_messagePageQueue.size() >= MaxQueuedMessagePages) {
+        m_messagePageQueue.dequeue();
+        qWarning() << "[NetMgr] Message page queue overflow, dropping the oldest page";
+    }
     m_messagePageQueue.enqueue(job);
     startMessagePagePump();
 }
@@ -2675,6 +2704,101 @@ void NetworkManager::finishMessagePageJob()
     // 避免用空列表覆盖此前由本地缓存填充的聊天视图
     if (emptyInput || !visible.isEmpty()) {
         emit messagesSynced(conversationId, visible, hasMore);
+    }
+}
+
+// M9/M12 欠账修复：在途请求登记表的超时清扫
+
+void NetworkManager::trackInFlightRequest(quint64 requestId)
+{
+    if (requestId == 0) {
+        return;
+    }
+    m_pendingDeadlines.insert(requestId, QDateTime::currentMSecsSinceEpoch() + InFlightTimeoutMs);
+    startInFlightSweep();
+}
+
+void NetworkManager::forgetInFlightRequest(quint64 requestId)
+{
+    if (m_pendingDeadlines.isEmpty()) {
+        // 快路径：绝大多数响应到达时表里可能本就没有本请求（如未登记的响应）
+        return;
+    }
+    m_pendingDeadlines.remove(requestId);
+    if (m_pendingDeadlines.isEmpty() && m_inFlightSweepTimer) {
+        // 没有在途请求就停表：避免空转唤醒（与消息页泵"无工作即停"同一取舍）
+        m_inFlightSweepTimer->stop();
+    }
+}
+
+void NetworkManager::startInFlightSweep()
+{
+    if (!m_inFlightSweepTimer) {
+        m_inFlightSweepTimer = new QTimer(this);
+        m_inFlightSweepTimer->setInterval(InFlightSweepIntervalMs);
+        connect(m_inFlightSweepTimer, &QTimer::timeout, this,
+                &NetworkManager::sweepInFlightRequests);
+    }
+    if (!m_inFlightSweepTimer->isActive()) {
+        m_inFlightSweepTimer->start();
+    }
+}
+
+void NetworkManager::sweepInFlightRequests()
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    // 先收集过期 id 再逐个处理：处理过程中会 emit 失败信号，QML 槽可能同步发起
+    // 新的编辑/删除并写入 m_pendingDeadlines，直接在 QHash 上边迭代边写入会失效
+    QList<quint64> expired;
+    for (auto it = m_pendingDeadlines.constBegin(); it != m_pendingDeadlines.constEnd(); ++it) {
+        if (it.value() <= now) {
+            expired.append(it.key());
+        }
+    }
+    for (const quint64 requestId : expired) {
+        m_pendingDeadlines.remove(requestId);
+        // 逐个登记表反查：requestId 全局唯一，故最多命中一张表。上报沿用断线
+        // 路径的失败信号，让 UI 回退乐观态（编辑/删除都没有 outbox 重发兜底）。
+        // 用 contains + remove 而非比较 remove() 的返回值：Qt 各容器 remove 的
+        // 返回类型并不一致（bool / qsizetype），比较会触发 C4804 且更不可读
+        if (m_pendingEdits.contains(requestId)) {
+            m_pendingEdits.remove(requestId);
+            emit messageEditFailed("Request timed out");
+        }
+        if (m_pendingDeleteRequestIds.contains(requestId)) {
+            m_pendingDeleteRequestIds.remove(requestId);
+            emit messageDeleteFailed("Request timed out");
+        }
+        if (m_pendingDeleteConversationRequests.contains(requestId)) {
+            m_pendingDeleteConversationRequests.remove(requestId);
+            emit conversationDeleteFailed("Request timed out");
+        }
+        // 消息页同步请求没有对应失败信号：登记项本身就是唯一要回收的资源。
+        // 清掉后该会话下次激活会重新请求（视图保留 lastMessageId），
+        // 因此不需要额外通知
+        m_pendingSyncRequests.remove(requestId);
+    }
+
+    // 私聊编辑的 fetch_keys 槽位：漏答时 m_editFetchInFlight 恒真会让队列里
+    // 所有后续编辑静默停摆。清退方式与"密钥包不可用"分支完全一致——出队上报、
+    // 泵送下一条。同时清掉槽位登记，否则 pumpPrivateEditFetch 会因槽位非空而拒绝
+    // 再占用；槽位是 requestId 匹配的，晚到的响应会被 handleFetchKeysResponse
+    // 首行的 requestId 校验丢弃，不会重复消费
+    if (m_editFetchInFlight && m_privateEditFetchDeadlineMs > 0
+        && m_privateEditFetchDeadlineMs <= now) {
+        m_editFetchInFlight = false;
+        m_privateEditFetchDeadlineMs = 0;
+        m_pendingFetchKeysRequestId = 0;
+        m_fetchKeysTargetUserId = 0;
+        if (!m_privateEditQueue.isEmpty()) {
+            m_privateEditQueue.dequeue();
+        }
+        emit messageEditFailed("Request timed out");
+        pumpPrivateEditFetch();
+    }
+
+    if (m_pendingDeadlines.isEmpty() && m_inFlightSweepTimer) {
+        m_inFlightSweepTimer->stop();
     }
 }
 
@@ -3724,6 +3848,7 @@ void NetworkManager::handleDeleteConversationResponse(const Packet &packet)
         return;
     }
     const qint64 pendingConvId = m_pendingDeleteConversationRequests.take(rid);
+    forgetInFlightRequest(rid);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
@@ -3816,6 +3941,8 @@ void NetworkManager::pumpPrivateEditFetch()
         return; // 传输槽被发送/其他拉取占用，其响应回调中会再次泵送
     }
     m_editFetchInFlight = true;
+    // 与 requestId 登记表同一套超时口径：漏答时由 sweepInFlightRequests 清退
+    m_privateEditFetchDeadlineMs = QDateTime::currentMSecsSinceEpoch() + InFlightTimeoutMs;
     sendFetchKeysRequest(m_privateEditQueue.head().peerUserId);
 }
 
@@ -3837,6 +3964,7 @@ quint64 NetworkManager::sendEditMessageRequest(qint64 messageId, qint64 conversa
     // M9 欠账修复：以 requestId 为键登记上下文（镜像 m_pendingSendByRequestId），
     // 连续编辑的多条响应均能匹配不被丢弃
     m_pendingEdits.insert(packet.requestId, EditContext{messageId, conversationId, plaintext});
+    trackInFlightRequest(packet.requestId);
     sendPacket(packet);
     return packet.requestId;
 }
@@ -3871,6 +3999,7 @@ void NetworkManager::handleEditMessageResponse(const Packet &packet)
     }
     const EditContext ctx = it.value();
     m_pendingEdits.erase(it);
+    forgetInFlightRequest(packet.requestId);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
@@ -3944,6 +4073,7 @@ void NetworkManager::handleDeleteMessageResponse(const Packet &packet)
         return;
     }
     m_pendingDeleteRequestIds.remove(packet.requestId);
+    forgetInFlightRequest(packet.requestId);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));

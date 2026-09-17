@@ -673,6 +673,121 @@ private slots:
         QVERIFY(!nm.m_messagePageActive);
         QVERIFY(nm.m_messagePageQueue.isEmpty());
     }
+
+    // M9/M12 欠账修复：在途请求超时清扫。断线/登出会清空登记项，但"服务端漏答而
+    // 连接未断"没有回收路径——登记项会残留到下次登出（编辑/删除还会一直挂在 UI 的
+    // 乐观态上）。这里锁住：到期即清退并复用失败信号上报，未到期的必须原样保留
+    void inFlightRequestsTimeOutAndReportFailures()
+    {
+        NetworkManager nm;
+        QSignalSpy editSpy(&nm, &NetworkManager::messageEditFailed);
+        QSignalSpy deleteSpy(&nm, &NetworkManager::messageDeleteFailed);
+        QSignalSpy convSpy(&nm, &NetworkManager::conversationDeleteFailed);
+
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        // 四类登记表各一条，全部已到期
+        nm.m_pendingEdits.insert(101, NetworkManager::EditContext{1, 2, "x"});
+        nm.m_pendingDeadlines.insert(101, now - 1);
+        nm.m_pendingDeleteRequestIds.insert(102);
+        nm.m_pendingDeadlines.insert(102, now - 1);
+        nm.m_pendingDeleteConversationRequests.insert(103, 9);
+        nm.m_pendingDeadlines.insert(103, now - 1);
+        nm.m_pendingSyncRequests.insert(104, 7);
+        nm.m_pendingDeadlines.insert(104, now - 1);
+        // 一条尚未到期的编辑：不得被误清（否则用户刚发出的编辑会被立刻判失败）
+        nm.m_pendingEdits.insert(105, NetworkManager::EditContext{2, 2, "y"});
+        nm.m_pendingDeadlines.insert(105, now + 60000);
+
+        nm.sweepInFlightRequests();
+
+        QCOMPARE(editSpy.count(), 1);
+        QCOMPARE(editSpy.at(0).at(0).toString(), QString("Request timed out"));
+        QCOMPARE(deleteSpy.count(), 1);
+        QCOMPARE(convSpy.count(), 1);
+        QVERIFY(!nm.m_pendingEdits.contains(101));
+        QVERIFY(!nm.m_pendingDeleteRequestIds.contains(102));
+        QVERIFY(!nm.m_pendingDeleteConversationRequests.contains(103));
+        QVERIFY(!nm.m_pendingSyncRequests.contains(104));
+        // 未到期的原样保留，且其截止登记仍在（否则它会永远等不到清扫）
+        QVERIFY(nm.m_pendingEdits.contains(105));
+        QVERIFY(nm.m_pendingDeadlines.contains(105));
+    }
+
+    // 正常响应到达时必须撤销截止登记：否则表只增不减，定时器永不停止空转唤醒
+    void inFlightDeadlineIsClearedOnResponse()
+    {
+        NetworkManager nm;
+        // 惰性创建：无在途请求时不应存在定时器，更不能空转
+        QVERIFY(!nm.m_inFlightSweepTimer);
+
+        nm.trackInFlightRequest(201);
+        QVERIFY(nm.m_inFlightSweepTimer);
+        QVERIFY(nm.m_inFlightSweepTimer->isActive());
+        QVERIFY(nm.m_pendingDeadlines.contains(201));
+
+        nm.m_pendingEdits.insert(201, NetworkManager::EditContext{100, 5, "newtext"});
+        Packet p;
+        p.messageType = MessageType::EditMessageResponse;
+        p.requestId = 201;
+        QJsonObject json;
+        json["code"] = static_cast<int>(ErrorCode::Ok);
+        json["data"] = QJsonObject{{"conversationId", 5}, {"editedAt", "2026-09-05T12:00:00Z"}};
+        p.payload = payloadBytes(json);
+        nm.handleEditMessageResponse(p);
+
+        QVERIFY(!nm.m_pendingDeadlines.contains(201));   // 登记随之作废
+        QVERIFY(!nm.m_inFlightSweepTimer->isActive());   // 表空即停表
+    }
+
+    // M12：消息页队列必须封顶。每页含 ≤100 行密文与已解密正文，无上限时快速连点
+    // 大量会话会把它们全留在内存；丢最旧的（该会话下次激活会重新请求该页）
+    void messagePageQueueIsBounded()
+    {
+        NetworkManager nm;
+        const int kOver = 5;
+        for (int i = 0; i < NetworkManager::MaxQueuedMessagePages + kOver; ++i) {
+            NetworkManager::MessagePageJob job;
+            job.conversationId = 100 + i;
+            nm.enqueueMessagePage(job);
+        }
+        // 入队后不跑事件循环：泵尚未推进，此刻看到的就是队列上限本身
+        QCOMPARE(nm.m_messagePageQueue.size(),
+                 static_cast<qsizetype>(NetworkManager::MaxQueuedMessagePages));
+        QCOMPARE(nm.m_messagePageQueue.head().conversationId, qint64(100 + kOver));
+        QCOMPARE(nm.m_messagePageQueue.last().conversationId,
+                 qint64(100 + NetworkManager::MaxQueuedMessagePages + kOver - 1));
+        for (const NetworkManager::MessagePageJob &job : nm.m_messagePageQueue) {
+            QVERIFY(job.conversationId >= 100 + kOver);
+        }
+    }
+
+    // M9 欠账修复（续）：私聊编辑等 fetch_keys 传输槽时，若响应漏答而连接未断，
+    // m_editFetchInFlight 恒真会让队列里所有后续编辑静默停摆到下次重连。
+    // 必须出队上报卡住的那条并解除槽位占用，使队列继续推进
+    void privateEditFetchTimeoutUnsticksQueue()
+    {
+        NetworkManager nm;
+        nm.m_privateEditQueue.enqueue(NetworkManager::PrivateEditWait{1, 2, 42, "p"});
+        nm.m_privateEditQueue.enqueue(NetworkManager::PrivateEditWait{3, 4, 42, "q"});
+        nm.m_editFetchInFlight = true;
+        nm.m_privateEditFetchDeadlineMs = QDateTime::currentMSecsSinceEpoch() - 1;
+        nm.m_pendingFetchKeysRequestId = 777;
+        nm.m_fetchKeysTargetUserId = 42;
+
+        QSignalSpy failSpy(&nm, &NetworkManager::messageEditFailed);
+        nm.sweepInFlightRequests();
+
+        QCOMPARE(failSpy.count(), 1);
+        QCOMPARE(failSpy.at(0).at(0).toString(), QString("Request timed out"));
+        // 只清掉卡住的队首：后面那条仍排队等待，不得被一起丢弃
+        QCOMPARE(nm.m_privateEditQueue.size(), qsizetype(1));
+        QCOMPARE(nm.m_privateEditQueue.head().messageId, qint64(3));
+        // 续泵：队列未空 -> 立刻为新队首重新占用槽位（新 requestId，绝不沿用旧的
+        // 777，否则晚到的旧响应会被误认成本次请求的应答）
+        QVERIFY(nm.m_editFetchInFlight);
+        QVERIFY(nm.m_pendingFetchKeysRequestId != 0);
+        QVERIFY(nm.m_pendingFetchKeysRequestId != 777);
+    }
 };
 
 QTEST_GUILESS_MAIN(TestNetworkManager)

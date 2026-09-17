@@ -37,6 +37,12 @@ void Server::setFileHttpEndpoint(quint16 port, const QString &advertisedHost)
     }
 }
 
+void Server::setFileHttpBind(const QString &bindHost, bool allowPublicBind)
+{
+    m_fileHttpBindHost = bindHost;
+    m_fileHttpAllowPublic = allowPublicBind;
+}
+
 QString Server::fileTransferBaseUrl() const
 {
     return m_fileHttp ? m_fileHttp->baseUrl() : QString();
@@ -119,6 +125,9 @@ bool Server::start(quint16 port, bool allowPlaintext)
     if (m_objectStorage) {
         auto fileHttp = std::make_unique<XYChat::Server::FileHttpService>();
         fileHttp->setAdvertisedHost(m_fileHttpHost);
+        // 绑定地址与对外通告地址分开（见 FileHttpService::setBindAddress）
+        fileHttp->setBindAddress(m_fileHttpBindHost);
+        fileHttp->setAllowPublicBind(m_fileHttpAllowPublic);
         fileHttp->setObjectStorage(m_objectStorage.get());
         if (fileHttp->start(m_fileHttpPort, m_sslConfig, m_tlsEnabled, allowPlaintext)) {
             m_fileHttp = std::move(fileHttp);

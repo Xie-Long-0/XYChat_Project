@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QHostAddress>
 #include <QHttpServer>
 #include <QObject>
 #include <QString>
@@ -61,6 +62,18 @@ public:
     void setAdvertisedHost(const QString &host);
     QString baseUrl() const;
 
+    // 实际绑定的地址（数值 IP，默认 127.0.0.1）。**必须与 advertisedHost 分开**：
+    // 对外通告的可以是 NAT/反代后的域名，而绑定地址只能是本机网卡地址。
+    // 2026-09-17 修复：此前 start() 无条件绑 QHostAddress::Any，于是数据面默认
+    // 监听全部网卡——而未认证请求体会在票据校验之前就被 QHttpServer 读入内存
+    // （见 handleChunkPut 的说明），等于把内存放大面默认敞开在整个局域网。
+    // 现在默认仅回环；绑非回环地址必须显式 setAllowPublicBind(true)，且那意味着
+    // 前置了带请求体上限的反向代理
+    void setBindAddress(const QString &host);
+    void setAllowPublicBind(bool allow);
+    // 供启动日志与测试断言"默认仅回环"用
+    QHostAddress serverAddress() const;
+
     // 单次 GET 的字节上限。客户端必须按分片边界用 Range 分段取：
     // 分片是独立 AEAD 加密的，客户端本来就只能逐片解密，全量下载并无用处，
     // 而无上限的 readRange 会让单个请求把整个文件（最大 2 GiB）读进内存
@@ -96,6 +109,8 @@ private:
     DatabaseManager m_db;
 
     QString m_advertisedHost = "127.0.0.1";
+    QString m_bindHost;  // 空 = 回环（见 setBindAddress 说明）
+    bool m_allowPublicBind = false;
     quint16 m_port = 0;
     bool m_tls = false;
 

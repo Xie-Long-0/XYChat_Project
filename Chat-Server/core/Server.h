@@ -54,6 +54,10 @@ public:
     // M8.2: 文件传输数据面（HTTP(S)）的监听端口与对外通告主机名，须在 start()
     // 前调用。主机名由运维指定：服务端无法自知 NAT/反向代理后的对外地址
     void setFileHttpEndpoint(quint16 port, const QString &advertisedHost);
+    // 2026-09-17：数据面的实际绑定地址（数值 IP）。bindHost 为空 = 仅回环；
+    // 绑非回环地址必须同时 allowPublicBind=true，且那意味着前置了带请求体上限的
+    // 反向代理——未认证的请求体会在票据校验前被读进内存（见 FileHttpService）
+    void setFileHttpBind(const QString &bindHost, bool allowPublicBind);
     // 下发给客户端的数据面基地址（登录响应 fileTransferBaseUrl）。
     // 数据面未启动时为空，客户端据此禁用文件能力而不是猜端口
     QString fileTransferBaseUrl() const;
@@ -98,6 +102,8 @@ private:
     std::unique_ptr<XYChat::Server::FileHttpService> m_fileHttp;
     quint16 m_fileHttpPort = 12346;
     QString m_fileHttpHost = "127.0.0.1";
+    QString m_fileHttpBindHost;  // 空 = 回环（见 setFileHttpBind）
+    bool m_fileHttpAllowPublic = false;
 
     // userId -> set of sessionIds
     QHash<qint64, QSet<qint64>> m_onlineSessions;

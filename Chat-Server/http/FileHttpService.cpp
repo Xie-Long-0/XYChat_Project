@@ -175,10 +175,45 @@ bool FileHttpService::start(quint16 port, const QSslConfiguration &sslConfig, bo
     } else {
         server = new QTcpServer(this);
     }
+
+    // 绑定地址解析：默认仅回环。**绝不静默退回 Any**——那正是 2026-09-17 之前的
+    // 行为，会让"配错地址"与"有意对外"看起来一模一样
+    QHostAddress bindAddress = QHostAddress::LocalHost;
+    if (!m_bindHost.isEmpty()) {
+        if (!bindAddress.setAddress(m_bindHost)) {
+            qCritical() << "[FileHttp] Invalid bind address" << m_bindHost
+                        << "; expected a numeric IPv4/IPv6 address."
+                           " Default (loopback) is used only when the option is absent,"
+                           " never as a silent fallback for a typo";
+            delete server;
+            return false;
+        }
+    }
+    const bool loopback = bindAddress.isLoopback();
+    if (!loopback && !m_allowPublicBind) {
+        // fail-closed：未认证的请求体会在票据校验之前被 QHttpServer 读进内存
+        //（QAbstractHttpServer 无内建请求体上限），因此对外绑定必须是一个
+        // 有意识、有前置条件的动作，而不是默认行为
+        qCritical() << "[FileHttp] Refusing to bind the data plane to non-loopback address"
+                    << bindAddress.toString()
+                    << "; it buffers request bodies before authentication."
+                       " Put a reverse proxy with a request-body limit in front,"
+                       " then pass --http-allow-public to confirm";
+        delete server;
+        return false;
+    }
+    if (!loopback) {
+        qWarning() << "[FileHttp] Data plane bound to a non-loopback address"
+                   << bindAddress.toString()
+                   << "; a front proxy enforcing a request-body limit is REQUIRED"
+                      " (unauthenticated request bodies are buffered in memory)";
+    }
+
     // 顺序不可颠倒：QAbstractHttpServer::bind() 要求 server 已在监听，
     // 否则直接失败并告警 "The TCP server ... is not listening."
-    if (!server->listen(QHostAddress::Any, port)) {
-        qCritical() << "[FileHttp] Failed to listen on port" << port << ":" << server->errorString();
+    if (!server->listen(bindAddress, port)) {
+        qCritical() << "[FileHttp] Failed to listen on" << bindAddress.toString() << "port"
+                    << port << ":" << server->errorString();
         delete server;
         return false;
     }
@@ -193,10 +228,12 @@ bool FileHttpService::start(quint16 port, const QSslConfiguration &sslConfig, bo
     // 因此下发给客户端的地址依然正确（集成测试靠此避开端口冲突）
     m_port = server->serverPort();
 
-    qInfo() << "[FileHttp] Data plane ready at" << baseUrl()
+    qInfo() << "[FileHttp] Data plane ready at" << baseUrl() << "listening on"
+            << server->serverAddress().toString()
             << (m_tls ? "(TLS)" : "(PLAINTEXT, development only)");
     StructuredLogger::event(XYChat::Security::LogLevel::Info, "file.http_started")
         .field("port", m_port)
+        .field("bindAddress", server->serverAddress().toString())
         .field("tls", m_tls)
         .write();
     return true;
@@ -217,6 +254,21 @@ void FileHttpService::setAdvertisedHost(const QString &host)
     if (!host.isEmpty()) {
         m_advertisedHost = host;
     }
+}
+
+void FileHttpService::setBindAddress(const QString &host)
+{
+    m_bindHost = host;
+}
+
+void FileHttpService::setAllowPublicBind(bool allow)
+{
+    m_allowPublicBind = allow;
+}
+
+QHostAddress FileHttpService::serverAddress() const
+{
+    return m_server ? m_server->serverAddress() : QHostAddress();
 }
 
 QString FileHttpService::baseUrl() const

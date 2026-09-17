@@ -335,6 +335,15 @@ private:
     void runMessagePageSlice();
     void finishMessagePageJob();
 
+    // M9/M12 欠账修复：在途请求登记的超时清扫（镜像 token 续期看门狗）。
+    // 断线/登出会把所有登记项清零并上报失败，但"服务端漏答而连接未断"没有任何
+    // 回收路径——登记项会残留到下次登出。这里给每个在途请求记一个截止时刻，
+    // 由单个周期定时器统一清退并复用既有的失败信号让 UI 回退乐观态
+    void trackInFlightRequest(quint64 requestId);
+    void forgetInFlightRequest(quint64 requestId);
+    void startInFlightSweep();
+    void sweepInFlightRequests();
+
 private:
     QSslSocket *m_sslSocket;
     QTimer *m_heartbeatTimer;
@@ -428,6 +437,23 @@ private:
     // 对齐 M9 m_pendingEdits/m_pendingDeleteRequestIds；conversationId 以本地登记为准，
     // 即使响应 data 缺失也可靠（避免单值被后发请求覆盖导致首个删除静默丢失）
     QHash<quint64, qint64> m_pendingDeleteConversationRequests;
+
+    // M9/M12 欠账修复：上述在途登记表（编辑/删除/会话删除/消息页同步）的统一
+    // 超时清扫。requestId 由 nextRequestId() 全局单调分配、永不复用，因此四张表
+    // 共用一份"requestId -> 截止时刻"即可，无需改动各自的值类型——改类型会波及
+    // 既有用例与全部响应路径，收益为零
+    QHash<quint64, qint64> m_pendingDeadlines;
+    QTimer *m_inFlightSweepTimer = nullptr;
+    static constexpr int InFlightSweepIntervalMs = 5000;
+    static constexpr qint64 InFlightTimeoutMs = 30000;
+    // M9 欠账修复（续）：私聊编辑等待 fetch_keys 传输槽的截止时刻。它不占
+    // requestId 登记表（槽位与普通发送共用 m_pendingFetchKeysRequestId），
+    // 因此单独记一个字段；漏答时若不复位 m_editFetchInFlight，队列里所有
+    // 后续私聊编辑会静默停摆到下次重连
+    qint64 m_privateEditFetchDeadlineMs = 0;
+    // M12：消息页队列上限。视图 LRU 上限为 8，加上 hasMore 链式续拉仍有余量；
+    // 超限丢最旧（被丢的会话下次激活时会重新请求该页）
+    static constexpr int MaxQueuedMessagePages = 16;
 
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem
