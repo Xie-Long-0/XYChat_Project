@@ -272,8 +272,24 @@ private:
     bool ensureGroupSenderKey(qint64 conversationId,
                               XYChat::Security::GroupE2eeCrypto::SenderKey &key);
     void sendFetchGroupKeysRequest(qint64 conversationId);
-    QString buildGroupSenderKeyDistribution(qint64 conversationId,
-                                            const QJsonObject &bundlesByUser);
+    // 生成本群的新 Sender Key 并切成可分发的分片。**不落盘也不激活**——新 key 在
+    // 分片全部被服务端确认前不得用于加密（见 m_pendingSenderKeyDist）。
+    // 失败时 wipe 掉 key 内的密钥材料后返回 false
+    bool buildGroupSenderKeyDistribution(qint64 conversationId,
+                                         const QJsonObject &bundlesByUser,
+                                         XYChat::Security::GroupE2eeCrypto::SenderKey &key,
+                                         QList<QString> &chunks);
+    // P2 修复：登记一次待提交的分发（convId → {key, 未 ACK 分片}）并逐片发出
+    void beginGroupSenderKeyDistribution(qint64 conversationId,
+                                         const XYChat::Security::GroupE2eeCrypto::SenderKey &key,
+                                         const QList<QString> &chunks);
+    // 全部分片确认：落盘 + 进内存缓存，新 key 自此才可用于加密
+    void commitPendingGroupSenderKey(qint64 conversationId);
+    // 任一分片失败/超时（或构建失败）：丢弃待提交密钥（wipe）、清退其全部在途
+    // 登记，并置退避避免立刻重拉造成 fetch 风暴
+    void failGroupSenderKeyDistribution(qint64 conversationId, const QString &reason);
+    // 断线/登出：丢弃全部待提交密钥（含密钥材料）
+    void discardPendingGroupSenderKeys();
     bool processGroupSenderKeyDistribution(const QJsonObject &msg);
     QString encryptGroupMessage(qint64 conversationId, const QString &plaintext);
     bool decryptGroupMessageObject(QJsonObject &msg);
@@ -406,9 +422,23 @@ private:
     // M7b: 群 E2EE 引导状态
     quint64 m_pendingFetchGroupKeysRequestId = 0;
     qint64 m_fetchGroupKeysTargetConvId = 0;
-    QSet<QString> m_pendingGroupDistributions; // clientMessageId 集合：等待 ACK 的分发消息
     QHash<qint64, XYChat::Security::GroupE2eeCrypto::SenderKey> m_groupSenderKeys; // 内存缓存
     QSet<qint64> m_healQueue; // P1-3: 待轮换重分发的群（单发槽位占用时排队）
+
+    // P2 修复：Sender-Key 分发改为“全部分片 ACK 后启用”。新 key 在确认前既不落盘
+    // 也不进 m_groupSenderKeys，分发在途时该群一律不发（fail-closed）——既不能用
+    // 尚未分发的新 key 加密（其他成员无解），也不能在轮换期继续用旧 key 加密
+    //（新成员读不到、被移除成员仍可读）
+    struct PendingSenderKeyDistribution
+    {
+        XYChat::Security::GroupE2eeCrypto::SenderKey key;
+        QHash<QString, quint64> chunkRequestIds; // 未 ACK 分片：clientMessageId → requestId
+    };
+    QHash<qint64, PendingSenderKeyDistribution> m_pendingSenderKeyDist; // convId → 待提交
+    QHash<QString, qint64> m_pendingDistChunkConv;   // 分片 clientMessageId → convId
+    QHash<quint64, qint64> m_pendingDistRequestConv; // 分片 requestId → convId（供超时清扫）
+    QHash<qint64, qint64> m_groupDistBackoffUntil;   // convId → 分发失败后的重试退避（秒）
+    bool m_groupDistRetryScheduled = false;          // 退避到期的重试定时器已排（单发护栏）
 
     // M9 特性栈：会话偏好与消息编辑/删除
     quint64 m_pendingSetPrefsRequestId = 0;
@@ -446,6 +476,10 @@ private:
     QTimer *m_inFlightSweepTimer = nullptr;
     static constexpr int InFlightSweepIntervalMs = 5000;
     static constexpr qint64 InFlightTimeoutMs = 30000;
+    // P2 修复：群 Sender-Key 分发失败后的重试退避。分发失败多为确定性（超大群
+    // 超长被拒、成员密钥包不可解），立刻重拉只会空耗 fetch_group_keys 预算并
+    // 放大预密钥消耗；退避期内 flushOutbox 对该群不发拉取，到期后重试一次
+    static constexpr int GroupDistRetryBackoffSecs = 30;
     // M9 欠账修复（续）：私聊编辑等待 fetch_keys 传输槽的截止时刻。它不占
     // requestId 登记表（槽位与普通发送共用 m_pendingFetchKeysRequestId），
     // 因此单独记一个字段；漏答时若不复位 m_editFetchInFlight，队列里所有

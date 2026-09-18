@@ -105,6 +105,25 @@ public:
                                           const SenderKey &key,
                                           const QList<DistributionEntry> &entries);
 
+    // 单条分发消息正文的长度预算。服务端以 RequestHandler::MaxGroupMessageLength
+    // (16384) 校验群消息正文，超出即 InvalidRequest 且无重试价值；此处留约 8% 余量，
+    // 因为长度按实际序列化结果度量（含 JSON 转义与 UTF-16 码元计数），
+    // 而两侧常量分属不同模块、不能共享
+    static constexpr int MaxDistributionContentLength = 15000;
+
+    // 按长度预算把条目切成多条可分发的分片。每条分片携带**同一个** SenderKey
+    // （同 keyId/publicSigningKey/chainKey），只覆盖其中一部分设备；接收端只在
+    // 自己所属的那条分片里找条目即可解出 chainKey，故分片**无需重组**，且同一
+    // keyId 被安装多次是幂等的。返回空表示无法编码（参数非法或固定开销即越界）。
+    // 单条条目自身超预算时仍单独成片——宁可让整次分发失败（报错可见），
+    // 也不能静默少发设备，后者会让发送方误以为分发成功而用他人无解的 key 加密
+    static QList<QString> encodeDistributionChunks(qint64 groupId,
+                                                   qint64 senderUserId,
+                                                   const QString &senderDeviceId,
+                                                   const SenderKey &key,
+                                                   const QList<DistributionEntry> &entries,
+                                                   int maxContentLength = MaxDistributionContentLength);
+
     static bool decodeDistribution(const QString &content,
                                    qint64 &groupId,
                                    qint64 &senderUserId,

@@ -5,8 +5,10 @@
 #include <QJsonObject>
 #include <QDateTime>
 #include <QTimeZone>
+#include <QUuid>
 
 #include "NetworkManager.h"
+#include "LocalStore.h"
 #include "FileCrypto.h"
 #include "FileProtocol.h"
 
@@ -627,7 +629,13 @@ private slots:
         nm.enqueueMessagePage(job);
 
         QCOMPARE(syncedSpy.count(), 0);
-        QTRY_COMPARE(syncedSpy.count(), 1);
+        // 显式放宽预算：QTRY_COMPARE 默认 5000 ms，而本用例刻意用 300 条 × 2 KB
+        // 的"大页"来逼出跨时间片续做（分片预算 kMessagePageSliceNs 是编译期常量、
+        // 无注入点，只能靠规模把它撑到多片）。Debug 构建下泵稳定需要约 14.7 s，
+        // 默认预算会在任何逻辑断言求值之前先超时——那是预算问题而非正确性缺陷，
+        // 故不得据此判定本用例失败。60 s 留约 4 倍余量，同时仍能抓住真回归
+        //（泵若卡死则 60 s 内恒不 emit）
+        QTRY_COMPARE_WITH_TIMEOUT(syncedSpy.count(), 1, 60000);
         const QList<QVariant> args = syncedSpy.at(0);
         QCOMPARE(args.at(0).toLongLong(), qint64(77));
         QCOMPARE(args.at(2).toBool(), true);
@@ -787,6 +795,297 @@ private slots:
         QVERIFY(nm.m_editFetchInFlight);
         QVERIFY(nm.m_pendingFetchKeysRequestId != 0);
         QVERIFY(nm.m_pendingFetchKeysRequestId != 777);
+    }
+
+    // P2 欠账修复：Sender-Key 分发在途时该群必须 fail-closed。原实现"先落盘后分发"
+    // 会把未分发的新 key 立刻投入使用，分发一旦被永久拒绝（超大群超长等），
+    // 本端就产出一批谁也解不开的群消息；反过来若继续用旧 key，轮换期内新成员
+    // 读不到、被移除成员仍能读。故在途期间任何既有密钥都不得使用
+    void groupSenderKeyBlockedWhileDistributionPending()
+    {
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_localDeviceId = "dev0";
+        // 先放一把"可用"的旧 key，证明在途分发连它也不能用
+        nm.m_groupSenderKeys.insert(5,
+            XYChat::Security::GroupE2eeCrypto::generateSenderKey());
+
+        XYChat::Security::GroupE2eeCrypto::SenderKey out;
+        QVERIFY(nm.ensureGroupSenderKey(5, out));
+        QVERIFY(out.valid);
+
+        NetworkManager::PendingSenderKeyDistribution pending;
+        pending.key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        pending.chunkRequestIds.insert("chunk-a", 9001);
+        nm.m_pendingSenderKeyDist.insert(5, pending);
+
+        out = XYChat::Security::GroupE2eeCrypto::SenderKey{};
+        QVERIFY(!nm.ensureGroupSenderKey(5, out));
+        QVERIFY(!out.valid);
+        // 不得用旧 key 顶替：密钥整体不可用（调用方据此把消息留在 outbox）
+        QVERIFY(nm.encryptGroupMessage(5, "hello").isEmpty());
+    }
+
+    // P2 欠账修复：新 key 必须等到**全部**分片 ACK 才启用。部分成功若照样启用，
+    // 未收到分片的成员解不开消息，等于退回被修复的缺陷
+    void groupSenderKeyActivatedOnlyAfterAllChunksAcked()
+    {
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_localDeviceId = "dev0";
+
+        const auto newKey = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        NetworkManager::PendingSenderKeyDistribution pending;
+        pending.key = newKey;
+        pending.chunkRequestIds.insert("chunk-a", 9001);
+        pending.chunkRequestIds.insert("chunk-b", 9002);
+        nm.m_pendingSenderKeyDist.insert(5, pending);
+        nm.m_pendingDistChunkConv.insert("chunk-a", 5);
+        nm.m_pendingDistChunkConv.insert("chunk-b", 5);
+        nm.m_pendingDistRequestConv.insert(9001, 5);
+        nm.m_pendingDistRequestConv.insert(9002, 5);
+        nm.m_pendingSendByRequestId.insert(9001, "chunk-a");
+        nm.m_pendingSendByRequestId.insert(9002, "chunk-b");
+
+        const auto ack = [](quint64 requestId) {
+            Packet p;
+            p.messageType = MessageType::SendMessageResponse;
+            p.requestId = requestId;
+            p.payload = payloadBytes(QJsonObject{{"code", static_cast<int>(ErrorCode::Ok)}});
+            return p;
+        };
+
+        // 第一片确认：仍不可用，且不得落盘/进内存缓存
+        nm.handleSendMessageResponse(ack(9001));
+        QVERIFY(nm.m_pendingSenderKeyDist.contains(5));
+        QVERIFY(!nm.m_groupSenderKeys.contains(5));
+        XYChat::Security::GroupE2eeCrypto::SenderKey out;
+        QVERIFY(!nm.ensureGroupSenderKey(5, out));
+
+        // 最后一片确认：新 key 才生效
+        nm.handleSendMessageResponse(ack(9002));
+        QVERIFY(!nm.m_pendingSenderKeyDist.contains(5));
+        QVERIFY(nm.m_groupSenderKeys.contains(5));
+        QCOMPARE(nm.m_groupSenderKeys.value(5).keyId, newKey.keyId);
+        QVERIFY(nm.ensureGroupSenderKey(5, out));
+        QCOMPARE(out.keyId, newKey.keyId);
+        QVERIFY(!nm.encryptGroupMessage(5, "hello").isEmpty());
+    }
+
+    // P2 欠账修复：任一被拒的分片作废整次分发（不是把该片丢掉、其余照用），
+    // 并清退其余分片的在途登记，使晚到的 ACK 不会被当成普通消息回显
+    void groupSenderKeyDiscardedWhenChunkRejected()
+    {
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_localDeviceId = "dev0";
+
+        NetworkManager::PendingSenderKeyDistribution pending;
+        pending.key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        pending.chunkRequestIds.insert("chunk-a", 9001);
+        pending.chunkRequestIds.insert("chunk-b", 9002);
+        nm.m_pendingSenderKeyDist.insert(5, pending);
+        nm.m_pendingDistChunkConv.insert("chunk-a", 5);
+        nm.m_pendingDistChunkConv.insert("chunk-b", 5);
+        nm.m_pendingDistRequestConv.insert(9001, 5);
+        nm.m_pendingDistRequestConv.insert(9002, 5);
+        nm.m_pendingSendByRequestId.insert(9001, "chunk-a");
+        nm.m_pendingSendByRequestId.insert(9002, "chunk-b");
+
+        QSignalSpy sentSpy(&nm, &NetworkManager::messageSent);
+
+        // chunk-b 被服务端拒（例如正文超长）
+        Packet rejected;
+        rejected.messageType = MessageType::SendMessageResponse;
+        rejected.requestId = 9002;
+        rejected.payload = payloadBytes(QJsonObject{
+            {"code", static_cast<int>(ErrorCode::InvalidRequest)},
+            {"message", "Message content too long"}});
+        nm.handleSendMessageResponse(rejected);
+
+        QVERIFY(!nm.m_pendingSenderKeyDist.contains(5));
+        QVERIFY(!nm.m_groupSenderKeys.contains(5));
+        QVERIFY(nm.m_pendingDistRequestConv.isEmpty());
+        // 已 ACK 的 chunk-a 的登记也必须清退，否则它的复核 ACK 会走进
+        // "普通消息"分支并凭空 emit 一条 messageSent
+        QVERIFY(!nm.m_pendingSendByRequestId.contains(9001));
+        QVERIFY(!nm.m_pendingDistChunkConv.contains("chunk-a"));
+        // 退避：避免立刻重拉空耗 fetch 预算
+        QVERIFY(nm.m_groupDistBackoffUntil.value(5, 0)
+                > QDateTime::currentSecsSinceEpoch());
+
+        Packet lateAck;
+        lateAck.messageType = MessageType::SendMessageResponse;
+        lateAck.requestId = 9001;
+        lateAck.payload = payloadBytes(QJsonObject{{"code", static_cast<int>(ErrorCode::Ok)}});
+        nm.handleSendMessageResponse(lateAck);
+        QCOMPARE(sentSpy.count(), 0);
+    }
+
+    // P2 欠账修复：分片漏答（丢包）必须由在途超时清扫清退。不清理的话分发永久
+    // 挂起，而挂起期间该群一律发不出消息——一次丢包就把这个群卡到下次重连
+    void groupSenderKeyDistributionTimeoutDiscardsPending()
+    {
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_localDeviceId = "dev0";
+
+        NetworkManager::PendingSenderKeyDistribution pending;
+        pending.key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        pending.chunkRequestIds.insert("chunk-a", 9001);
+        nm.m_pendingSenderKeyDist.insert(5, pending);
+        nm.m_pendingDistChunkConv.insert("chunk-a", 5);
+        nm.m_pendingDistRequestConv.insert(9001, 5);
+        nm.m_pendingSendByRequestId.insert(9001, "chunk-a");
+        nm.m_pendingDeadlines.insert(9001, QDateTime::currentMSecsSinceEpoch() - 1);
+
+        nm.sweepInFlightRequests();
+
+        QVERIFY(nm.m_pendingSenderKeyDist.isEmpty());
+        QVERIFY(nm.m_pendingDistRequestConv.isEmpty());
+        QVERIFY(!nm.m_pendingSendByRequestId.contains(9001));
+        XYChat::Security::GroupE2eeCrypto::SenderKey out;
+        QVERIFY(!nm.ensureGroupSenderKey(5, out));
+    }
+
+    // P2 欠账修复：分发在途或刚失败处于退避期时，flushOutbox 不得为本群再发起
+    // fetch_group_keys（否则一次分发失败会被立刻重拉，空耗限流预算并放大预密钥消耗）
+    void flushOutboxSuppressesGroupFetchWhilePendingOrBackoff()
+    {
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_localDeviceId = "dev0";
+        nm.m_e2eeReady = true;
+        nm.setState(NetworkManager::ConnectionState::Authenticated);
+
+        NetworkManager::OutboxItem item;
+        item.clientMessageId = "m1";
+        item.conversationId = 5;
+        item.content = "hello";
+        nm.m_outbox.append(item);
+
+        // 正例对照：既无在途分发也无退避 → 必须发起拉取。缺了它，下面的"零"
+        // 可能只是恰好没走到拉取分支，用例就抓不住回归
+        nm.flushOutbox();
+        QVERIFY(nm.m_pendingFetchGroupKeysRequestId != 0);
+
+        // 在途分发 → 不再拉取（分发完成后由 handleSendMessageResponse 再次 flush）
+        nm.m_pendingFetchGroupKeysRequestId = 0;
+        NetworkManager::PendingSenderKeyDistribution pending;
+        pending.key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        pending.chunkRequestIds.insert("chunk-a", 9001);
+        nm.m_pendingSenderKeyDist.insert(5, pending);
+        nm.flushOutbox();
+        QCOMPARE(nm.m_pendingFetchGroupKeysRequestId, quint64(0));
+
+        // 退避期内 → 同样不拉取（到期由重试定时器兜底）
+        nm.m_pendingSenderKeyDist.clear();
+        nm.m_groupDistBackoffUntil.insert(5, QDateTime::currentSecsSinceEpoch() + 30);
+        nm.flushOutbox();
+        QCOMPARE(nm.m_pendingFetchGroupKeysRequestId, quint64(0));
+    }
+
+    // P2 欠账修复（续）：分发被切成多条分片后，同一 keyId 的分发消息会到达多次
+    //（历史同步亦可能重投）。而 decodeDistribution 不回传 iteration（恒 0），
+    // 无条件 saveSenderKey 会把接收端已推进的 ratchet 打回 0——轻则重放时从零
+    // 重新 ratchet，重则迭代数超过 MaxRatchetSteps(2000) 后该发送方后续消息永久
+    // 不可解。本用例锁住"链密钥一致即幂等跳过、链密钥不一致仍照旧覆盖"的语义
+    void repeatedDistributionInstallKeepsLocalRatchet()
+    {
+        namespace Sec = XYChat::Security;
+        using Sec::E2eeCrypto;
+        using Sec::GroupE2eeCrypto;
+        const QString user =
+            "dist_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_username = user;
+        nm.m_localDeviceId = "dev0";
+        nm.m_identityKey = E2eeCrypto::generateX25519KeyPair();
+        QVERIFY(nm.m_identityKey.valid);
+        QVERIFY(nm.m_localStore.open(user, "dev0"));
+
+        // 构造"仅本机设备"的分发消息：chainKey 以本机身份密钥自加密
+        //（prekeyId = SelfCopyPrekeyId，接收端无需预密钥即可解出）
+        const auto makeDistribution = [&nm](const QByteArray &chainKey, const QString &keyId,
+                                            const QByteArray &publicSigningKey) {
+            const auto eph = XYChat::Security::E2eeCrypto::generateX25519KeyPair();
+            const QByteArray dh = XYChat::Security::E2eeCrypto::ecdh(
+                eph.privateKey, nm.m_identityKey.publicKey);
+            const QByteArray shared = dh + dh;
+            const QByteArray messageKey =
+                XYChat::Security::E2eeCrypto::deriveMessageKey(shared);
+            const auto gcm =
+                XYChat::Security::E2eeCrypto::aesGcmEncrypt(messageKey, chainKey.toBase64());
+
+            GroupE2eeCrypto::DistributionEntry entry;
+            entry.userId = nm.m_userId;
+            entry.deviceId = nm.m_localDeviceId;
+            entry.envelope.deviceId = nm.m_localDeviceId;
+            entry.envelope.prekeyId = XYChat::Security::E2eeCrypto::SelfCopyPrekeyId;
+            entry.envelope.ephemeralPublicKey = eph.publicKey;
+            entry.envelope.iv = gcm.iv;
+            entry.envelope.ciphertext = gcm.ciphertext;
+
+            GroupE2eeCrypto::SenderKey key;
+            key.keyId = keyId;
+            key.publicSigningKey = publicSigningKey;
+
+            QJsonObject msg;
+            msg["conversationId"] = qint64(9);
+            msg["content"] = QString::fromUtf8(QJsonDocument(GroupE2eeCrypto::encodeDistribution(
+                9, nm.m_userId, nm.m_localDeviceId, key, {entry}))
+                .toJson(QJsonDocument::Compact));
+            return msg;
+        };
+
+        const QByteArray chainKeyA = E2eeCrypto::generateRandomBytes(32);
+        QCOMPARE(chainKeyA.size(), 32);
+        const auto signing = GroupE2eeCrypto::generateSenderKey();
+        const QString keyId = signing.keyId;
+        const QByteArray signingPub = signing.publicSigningKey;
+
+        // 首次安装
+        QVERIFY(nm.processGroupSenderKeyDistribution(
+            makeDistribution(chainKeyA, keyId, signingPub)));
+
+        QByteArray stored;
+        int iteration = -1;
+        const auto load = [&nm, &keyId, &stored, &iteration]() {
+            QByteArray publicKey;
+            QByteArray privateKey;
+            return nm.m_localStore.loadSenderKey(9, 7, "dev0", keyId, stored, publicKey,
+                                                 privateKey, iteration);
+        };
+        QVERIFY(load());
+        QCOMPARE(stored, chainKeyA);
+        QCOMPARE(iteration, 0);
+
+        // 对照：同 keyId 但链密钥不同，而本地这把 key 还没被用过（iteration == 0）
+        // → 仍按"后到者覆盖"写入。证明上面的保护只针对**已用过**的 key，
+        // 不是"同 keyId 一律跳过"
+        const QByteArray chainKeyB = E2eeCrypto::generateRandomBytes(32);
+        QVERIFY(nm.processGroupSenderKeyDistribution(
+            makeDistribution(chainKeyB, keyId, signingPub)));
+        QVERIFY(load());
+        QCOMPARE(stored, chainKeyB);
+        QCOMPARE(iteration, 0);
+
+        // 模拟接收端已用这把 key 推进过 ratchet
+        const QByteArray advanced = GroupE2eeCrypto::ratchetChainKey(chainKeyB);
+        QVERIFY(nm.m_localStore.saveSenderKey(9, 7, "dev0", keyId, advanced, signingPub,
+                                              QByteArray(), 5));
+
+        // 同一分片重投（含首片 chainKeyA）：本 key 已用过 → 跳过安装，
+        // 已推进的 ratchet 与链密钥都不得被打回
+        QVERIFY(nm.processGroupSenderKeyDistribution(
+            makeDistribution(chainKeyA, keyId, signingPub)));
+        QVERIFY(load());
+        QCOMPARE(iteration, 5);
+        QCOMPARE(stored, advanced);
+
+        nm.m_localStore.closeAndDestroy();
     }
 };
 

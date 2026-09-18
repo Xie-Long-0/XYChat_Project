@@ -669,7 +669,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 
 ### Sender-Key 分发（contentType=sender_key_distribution）
 
-发送方首次在某群发言前，先拉取全群成员密钥包，将 chain key（base64）用 M6 pairwise envelope 逐成员逐设备加密，以一条群消息分发（同样占用 `clientMessageId` 幂等键，经群 fan-out 投递）：
+发送方首次在某群发言前，先拉取全群成员密钥包，将 chain key（base64）用 M6 pairwise envelope 逐成员逐设备加密，以**一条或多条**群消息分片分发（同样占用 `clientMessageId` 幂等键，经群 fan-out 投递）：
 
 ```json
 {
@@ -687,6 +687,8 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```
 
 接收方解密出 chain key 后写入本地 `LocalStore.sender_keys` 表（加密落库，登出保留）；分发消息只处理、不展示、不作为普通消息落库。服务端 fail-closed：`decodeDistribution` 解析失败、条目为空或 `groupId` 与会话不一致时拒绝入库（`E2eeInvalidEnvelope 3008`）。
+
+**分片与启用时机**（2026-09-17 修复，销 ROADMAP §3 两条 P2）：单条正文受 `MaxGroupMessageLength`(16384) 约束，成员设备数约 >60 时装配不下，故按 15000 字符预算切成多条——每条分片都是**完整合法的分发消息**（同 `keyId`/`publicSigningKey`，`devices` 只含其中一部分设备），接收端只在自己所属的那条里找条目即可解出 chain key，因此**分片无需重组**、同一 `keyId` 重复安装是幂等的。发送方只有在**全部分片都被服务端确认**后才启用新 key（此前既不落盘也不进内存缓存，且该群一律不发消息，故不存在“本端用他人拿不到的 key 加密”或“轮换期继续用旧 key 加密”的窗口）；任一分片被拒/超时/连接中断即整次分发作废并退避重试。接收端对本地 `iteration > 0`（已使用过）的 `keyId` 不再接受分发写入，以免历史同步重投把已推进的 ratchet 打回 0。
 
 ### 群消息 envelope（contentType=e2ee_group）
 

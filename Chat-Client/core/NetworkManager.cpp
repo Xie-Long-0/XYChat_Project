@@ -193,7 +193,9 @@ void NetworkManager::onDisconnected()
     // M7b: 群 E2EE 引导状态与内存缓存重置（Sender Key 保留在 LocalStore）
     m_pendingFetchGroupKeysRequestId = 0;
     m_fetchGroupKeysTargetConvId = 0;
-    m_pendingGroupDistributions.clear();
+    // P2 修复：在途分发持有的新 Sender Key 属密钥材料，不得跨会话驻留
+    //（登出与断线两条路径都必须清，同 M9 编辑泵的教训）
+    discardPendingGroupSenderKeys();
     // M8.2: 在途文件消息携带清单（含 32 字节文件密钥），不得跨会话驻留
     //（登出与断线两条路径都必须清，同 M9 编辑泵的教训）
     m_pendingFileSends.clear();
@@ -771,7 +773,9 @@ void NetworkManager::resetAuthState()
     m_decryptCacheLoaded = false;
     m_pendingFetchGroupKeysRequestId = 0;
     m_fetchGroupKeysTargetConvId = 0;
-    m_pendingGroupDistributions.clear();
+    // P2 修复：在途分发持有的新 Sender Key 属密钥材料，不得跨会话驻留
+    //（登出与断线两条路径都必须清，同 M9 编辑泵的教训）
+    discardPendingGroupSenderKeys();
     // M8.2: 在途文件消息携带清单（含 32 字节文件密钥），不得跨会话驻留
     //（登出与断线两条路径都必须清，同 M9 编辑泵的教训）
     m_pendingFileSends.clear();
@@ -1070,6 +1074,8 @@ void NetworkManager::flushOutbox()
         inFlight.insert(it.value());
     }
 
+    const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
+
     // M7b: 群消息使用 Sender Key E2EE
     for (const OutboxItem &item : std::as_const(m_outbox)) {
         if (item.conversationId <= 0 || inFlight.contains(item.clientMessageId)) {
@@ -1102,6 +1108,12 @@ void NetworkManager::flushOutbox()
             groupPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
             m_pendingSendByRequestId.insert(groupPacket.requestId, item.clientMessageId);
             sendPacket(groupPacket);
+        } else if (m_pendingSenderKeyDist.contains(item.conversationId)
+                   || m_groupDistBackoffUntil.value(item.conversationId, 0) > nowSecs) {
+            // P2 修复：分发在途或刚失败处于退避期——不重复拉取（分发完成后会再次
+            // flush，退避到期另有重试定时器兜底）。此处 continue 而非 return：
+            // 其余会话不该被一个卡住的群连累
+            continue;
         } else if (m_pendingFetchGroupKeysRequestId == 0) {
             // 本群尚无 Sender Key：先拉取成员密钥包，响应后继续 flush
             sendFetchGroupKeysRequest(item.conversationId);
@@ -1112,7 +1124,6 @@ void NetworkManager::flushOutbox()
     // 按目标用户汇总待发消息，逐用户拉取密钥包（每次 FetchKeys 的预密钥
     // 仅供一条消息使用，后续消息在响应回调中继续触发 flush）；
     // 处于退避期的目标（对方尚未注册密钥等）暂不拉取
-    const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
     QSet<qint64> targets;
     for (const OutboxItem &item : std::as_const(m_outbox)) {
         if (item.conversationId > 0) {
@@ -1741,6 +1752,14 @@ bool NetworkManager::ensureGroupSenderKey(qint64 conversationId,
         return false;
     }
 
+    // P2 修复：本群有新 Sender-Key 分发在途时一律 fail-closed，任何既有密钥都不得
+    // 用于加密——用尚未分发的新 key 加密会让所有其他成员解不开（他们没这把 key），
+    // 而轮换期继续用旧 key 加密则让新成员解不开、被移除成员仍可解。分发全部确认
+    // （commitPendingGroupSenderKey）或失败丢弃后才恢复可用
+    if (m_pendingSenderKeyDist.contains(conversationId)) {
+        return false;
+    }
+
     auto it = m_groupSenderKeys.find(conversationId);
     if (it != m_groupSenderKeys.end() && it->valid) {
         key = it.value();
@@ -1830,46 +1849,48 @@ void NetworkManager::handleFetchGroupKeysResponse(const Packet &packet)
     // 诊断：服务端返回的成员密钥包数量（少于群成员数说明有人被 fetch_group_keys 跳过）
     qInfo() << "[NetMgr] FetchGroupKeys for conv" << convId
             << "returned member bundles:" << bundlesByUser.size();
-    const QString distribution = buildGroupSenderKeyDistribution(convId, bundlesByUser);
-    if (!distribution.isEmpty()) {
-        const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        QJsonObject json;
-        json["type"] = "send_message";
-        json["conversationId"] = convId;
-        json["content"] = distribution;
-        json["contentType"] = "sender_key_distribution";
-        json["clientMessageId"] = clientMessageId;
-        addReplayProtection(json);
 
-        Packet distPacket;
-        distPacket.messageType = MessageType::SendMessageRequest;
-        distPacket.requestId = nextRequestId();
-        distPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-        m_pendingSendByRequestId.insert(distPacket.requestId, clientMessageId);
-        m_pendingGroupDistributions.insert(clientMessageId);
-        sendPacket(distPacket);
+    GroupE2eeCrypto::SenderKey newKey;
+    QList<QString> chunks;
+    if (buildGroupSenderKeyDistribution(convId, bundlesByUser, newKey, chunks)) {
+        beginGroupSenderKeyDistribution(convId, newKey, chunks);
+        // 密钥材料的所有权已转移给在途分发登记（QByteArray 的写时分离保证
+        // wipe 本副本不会影响登记中的那一份），本副本用完即清
+        SecureMemory::wipe(newKey.chainKey);
+        SecureMemory::wipe(newKey.privateSigningKey);
     } else {
-        qWarning() << "[NetMgr] Failed to build group sender key distribution for" << convId;
+        // 构建失败（无人可分发/编码越界）：本群不产生新 key，置退避避免立刻重拉
+        failGroupSenderKeyDistribution(convId, "build_failed");
     }
 
     // P1-3: 推进 healing 队列（逐群轮换，单发槽位约束下每次一个）
     drainHealQueue();
 }
 
-QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
-                                                        const QJsonObject &bundlesByUser)
+// P2 修复：生成本群的新 Sender Key 并切成可分发的分片，但**不落盘也不激活**。
+// 原实现（先落盘后分发）在生成时即 saveSenderKey + 写入 m_groupSenderKeys，
+// 于是分发消息一旦被服务端永久拒绝（例如超大群超 16384 上限），本端已经用
+// 他人拿不到的新 keyId 加密，产出一批谁也解不开的群消息。现改为把 key 交给
+// beginGroupSenderKeyDistribution 登记为“待提交”，全部分片 ACK 后才启用。
+bool NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
+                                                     const QJsonObject &bundlesByUser,
+                                                     GroupE2eeCrypto::SenderKey &key,
+                                                     QList<QString> &chunks)
 {
-    if (conversationId <= 0 || bundlesByUser.isEmpty()) {
-        return {};
+    key = GroupE2eeCrypto::SenderKey{};
+    chunks.clear();
+    if (conversationId <= 0 || bundlesByUser.isEmpty() || m_userId <= 0
+        || m_localDeviceId.isEmpty()) {
+        return false;
     }
 
-    GroupE2eeCrypto::SenderKey key = GroupE2eeCrypto::generateSenderKey();
-    if (!key.valid) {
-        return {};
+    GroupE2eeCrypto::SenderKey generated = GroupE2eeCrypto::generateSenderKey();
+    if (!generated.valid) {
+        return false;
     }
 
     QList<GroupE2eeCrypto::DistributionEntry> entries;
-    const QString chainKeyB64 = QString::fromLatin1(key.chainKey.toBase64());
+    const QString chainKeyB64 = QString::fromLatin1(generated.chainKey.toBase64());
     int coveredUsers = 0;
     QList<qint64> skippedUsers;
 
@@ -1911,10 +1932,105 @@ QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
             << "coveredUsers" << coveredUsers << "skippedUsers" << skippedUsers;
 
     if (entries.isEmpty()) {
-        SecureMemory::wipe(key.chainKey);
-        SecureMemory::wipe(key.privateSigningKey);
-        return {};
+        SecureMemory::wipe(generated.chainKey);
+        SecureMemory::wipe(generated.privateSigningKey);
+        return false;
     }
+
+    // P2 修复：超大群的分发正文会超服务端 MaxGroupMessageLength(16384) 而被整条拒绝，
+    // 故按长度预算切成多条只覆盖部分设备的分片；接收端只在自己的那条里找条目，
+    // 无需重组，同 keyId 重复安装亦幂等
+    chunks = GroupE2eeCrypto::encodeDistributionChunks(conversationId, m_userId,
+                                                      m_localDeviceId, generated, entries);
+    if (chunks.isEmpty()) {
+        SecureMemory::wipe(generated.chainKey);
+        SecureMemory::wipe(generated.privateSigningKey);
+        return false;
+    }
+
+    int maxChunkLength = 0;
+    for (const QString &chunk : std::as_const(chunks)) {
+        maxChunkLength = qMax(maxChunkLength, static_cast<int>(chunk.size()));
+    }
+    qInfo() << "[NetMgr] Group sender key distribution encoded for conv" << conversationId
+            << "devices" << entries.size() << "chunks" << chunks.size()
+            << "maxChunkLength" << maxChunkLength;
+
+    key = generated;
+    return true;
+}
+
+// P2 修复：登记一次待提交的分发并逐片发出。同一群已有在途分发时，新一次轮换
+// 直接取代它（两次拉取之间成员可能又变过，以最新的成员集合为准）
+void NetworkManager::beginGroupSenderKeyDistribution(qint64 conversationId,
+                                                     const GroupE2eeCrypto::SenderKey &key,
+                                                     const QList<QString> &chunks)
+{
+    if (conversationId <= 0 || !key.valid || chunks.isEmpty()) {
+        return;
+    }
+    if (m_pendingSenderKeyDist.contains(conversationId)) {
+        failGroupSenderKeyDistribution(conversationId, "superseded_by_new_rotation");
+    }
+    m_groupDistBackoffUntil.remove(conversationId);
+
+    PendingSenderKeyDistribution pending;
+    pending.key = key;
+
+    // 先把全部分片登记完再统一发出：sendPacket 可能在测试替身下同步触发响应，
+    // 若边登记边发，首片的 ACK 会先于其余分片的登记到达，令 pending 被误判为完成
+    QList<Packet> packets;
+    packets.reserve(chunks.size());
+    for (const QString &chunk : chunks) {
+        const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QJsonObject json;
+        json["type"] = "send_message";
+        json["conversationId"] = conversationId;
+        json["content"] = chunk;
+        json["contentType"] = "sender_key_distribution";
+        json["clientMessageId"] = clientMessageId;
+        addReplayProtection(json);
+
+        Packet distPacket;
+        distPacket.messageType = MessageType::SendMessageRequest;
+        distPacket.requestId = nextRequestId();
+        distPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+
+        pending.chunkRequestIds.insert(clientMessageId, distPacket.requestId);
+        m_pendingDistChunkConv.insert(clientMessageId, conversationId);
+        m_pendingDistRequestConv.insert(distPacket.requestId, conversationId);
+        m_pendingSendByRequestId.insert(distPacket.requestId, clientMessageId);
+        // 与编辑/删除同一套超时口径：漏答时由 sweepInFlightRequests 清退。
+        // 不登记的话，一次丢包就会让该群的分发永久挂起，而挂起期间该群发不出消息
+        trackInFlightRequest(distPacket.requestId);
+        packets.append(distPacket);
+    }
+
+    m_pendingSenderKeyDist.insert(conversationId, pending);
+    for (const Packet &distPacket : std::as_const(packets)) {
+        sendPacket(distPacket);
+    }
+
+    qInfo() << "[NetMgr] Sender key distribution dispatched for conv" << conversationId
+            << "chunks" << chunks.size() << "keyId" << key.keyId;
+}
+
+// P2 修复：全部分片确认 → 新 key 自此才落盘并进入内存缓存（可被 encryptGroupMessage 使用）
+void NetworkManager::commitPendingGroupSenderKey(qint64 conversationId)
+{
+    auto it = m_pendingSenderKeyDist.find(conversationId);
+    if (it == m_pendingSenderKeyDist.end()) {
+        return;
+    }
+    const GroupE2eeCrypto::SenderKey key = it.value().key;
+    // 登记表清空发生在落盘之前：commit 路径不 wipe 密钥材料（所有权转正）
+    for (auto c = it.value().chunkRequestIds.constBegin();
+         c != it.value().chunkRequestIds.constEnd(); ++c) {
+        m_pendingDistChunkConv.remove(c.key());
+        m_pendingDistRequestConv.remove(c.value());
+    }
+    m_pendingSenderKeyDist.erase(it);
+    m_groupDistBackoffUntil.remove(conversationId);
 
     // 保存发送方 Sender Key（chainKey 与私钥经 LocalStore 存储密钥加密）
     if (m_localStore.isOpen()) {
@@ -1924,10 +2040,62 @@ QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
                                    key.iteration);
     }
     m_groupSenderKeys.insert(conversationId, key);
+    qInfo() << "[NetMgr] Group sender key activated for conv" << conversationId
+            << "keyId" << key.keyId;
+}
 
-    const QJsonObject distJson = GroupE2eeCrypto::encodeDistribution(
-        conversationId, m_userId, m_localDeviceId, key, entries);
-    return QString::fromUtf8(QJsonDocument(distJson).toJson(QJsonDocument::Compact));
+// P2 修复：任一分片失败或超时 → 丢弃整次分发。已 ACK 的分片不作数：只有全部分片
+// 都到位才能保证所有成员都拿到 chainKey，部分成功若照样启用就退回了“他人不可解”。
+// 同时清退其余分片的在途登记，使晚到的 ACK 落到 handleSendMessageResponse 的
+// “未知 clientMessageId”早退分支，不会被当成普通消息回显
+void NetworkManager::failGroupSenderKeyDistribution(qint64 conversationId,
+                                                    const QString &reason)
+{
+    auto it = m_pendingSenderKeyDist.find(conversationId);
+    if (it != m_pendingSenderKeyDist.end()) {
+        for (auto c = it.value().chunkRequestIds.constBegin();
+             c != it.value().chunkRequestIds.constEnd(); ++c) {
+            m_pendingSendByRequestId.remove(c.value());
+            m_pendingDeadlines.remove(c.value());
+            m_pendingDistChunkConv.remove(c.key());
+            m_pendingDistRequestConv.remove(c.value());
+        }
+        SecureMemory::wipe(it.value().key.chainKey);
+        SecureMemory::wipe(it.value().key.privateSigningKey);
+        m_pendingSenderKeyDist.erase(it);
+    }
+
+    // 退避：分发失败往往是确定性的（超大群/成员不可解），立刻重拉只会空耗
+    // fetch_group_keys 预算并放大预密钥消耗；退避期内 flushOutbox 不再发起拉取
+    m_groupDistBackoffUntil.insert(conversationId,
+                                   QDateTime::currentSecsSinceEpoch() + GroupDistRetryBackoffSecs);
+    qWarning() << "[NetMgr] Group sender key distribution failed for conv" << conversationId
+               << "reason" << reason;
+
+    // 密钥仍不可用的群不能就此停摆：退避结束后重试一次。只调度一个定时器
+    //（同一时刻最多一次重试），届时退避已过，flushOutbox 会重新拉取并分发
+    if (!m_groupDistRetryScheduled) {
+        m_groupDistRetryScheduled = true;
+        QTimer::singleShot((GroupDistRetryBackoffSecs + 1) * 1000, this, [this]() {
+            m_groupDistRetryScheduled = false;
+            flushOutbox();
+        });
+    }
+}
+
+// P2 修复：断线/登出丢弃全部待提交密钥。分片请求的在途登记由调用方随
+// m_pendingSendByRequestId / m_pendingDeadlines 的整体清空一并作废
+void NetworkManager::discardPendingGroupSenderKeys()
+{
+    for (auto it = m_pendingSenderKeyDist.begin(); it != m_pendingSenderKeyDist.end(); ++it) {
+        SecureMemory::wipe(it.value().key.chainKey);
+        SecureMemory::wipe(it.value().key.privateSigningKey);
+    }
+    m_pendingSenderKeyDist.clear();
+    m_pendingDistChunkConv.clear();
+    m_pendingDistRequestConv.clear();
+    m_groupDistBackoffUntil.clear();
+    m_groupDistRetryScheduled = false;
 }
 
 // 解密单个 pairwise envelope 条目（用于提取 group Sender Key 的 chainKey）
@@ -2029,6 +2197,29 @@ bool NetworkManager::processGroupSenderKeyDistribution(const QJsonObject &msg)
     }
 
     if (m_localStore.isOpen()) {
+        // P2 修复：分发被切成多条分片（同一 keyId），历史同步还可能重投，故本函数
+        // 会对同一 keyId 被调用多次。decodeDistribution 不回传 iteration（恒 0），
+        // 而分发携带的必然是**初始** chainKey，因此对“已用过的 key”无条件覆盖会把
+        // 接收端已推进的 ratchet 打回 0：轻则重放时从零重新 ratchet，重则迭代数超过
+        // MaxRatchetSteps(2000) 后该发送方的后续消息永久不可解。
+        // 判定依据只能是本地 iteration：ratchet 推进后本地 chainKey 已不等于分发里
+        // 的那一份，按 chainKey 比较是抓不住的。轮换必然产生新 keyId
+        //（generateSenderKey），故“已用过的 keyId 不再接受分发”不会挡住任何合法
+        // 轮换；未用过的 key（iteration == 0）照旧写入，使重复安装保持幂等
+        QByteArray existingChainKey;
+        QByteArray existingPublicKey;
+        QByteArray existingPrivateKey;
+        int existingIteration = 0;
+        if (m_localStore.loadSenderKey(convId, senderUserId, senderDeviceId, key.keyId,
+                                       existingChainKey, existingPublicKey,
+                                       existingPrivateKey, existingIteration)
+            && existingIteration > 0) {
+            qInfo() << "[NetMgr] Group sender key already in use for group" << convId
+                    << "keyId" << key.keyId << "iteration" << existingIteration
+                    << "- keeping local ratchet state";
+            return true;
+        }
+
         m_localStore.saveSenderKey(convId, senderUserId, senderDeviceId, key.keyId,
                                    chainKey, key.publicSigningKey,
                                    QByteArray(), key.iteration);
@@ -2165,8 +2356,10 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
 
 // P1-3: 触发指定群的 Sender-Key 轮换与重分发。
 // 复用 fetch_group_keys → buildGroupSenderKeyDistribution（内部 generateSenderKey 生成新 keyId）
-// → 以 sender_key_distribution 群消息分发；pairwise 条目仅现任成员可解，
+// → 以（可能多条）sender_key_distribution 群消息分发；pairwise 条目仅现任成员可解，
 // 从而新成员获得当前密钥、被移除成员因密钥轮换失去后续消息的解密能力（后向安全）。
+// P2 修复：新 key 在分片全部 ACK 前不启用，且分发在途期间本群不发消息，
+// 因此“轮换窗口”内既不会用旧 key（被移除成员仍可解）也不会用未分发的新 key
 void NetworkManager::healGroupSenderKey(qint64 conversationId)
 {
     if (conversationId <= 0) {
@@ -2424,26 +2617,48 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
     if (it == m_pendingSendByRequestId.constEnd()) return;
     const QString clientMessageId = it.value();
     m_pendingSendByRequestId.erase(it);
+    // 本请求已得到答复，撤销超时登记（群分发分片也在此登记，
+    // 见 beginGroupSenderKeyDistribution）
+    forgetInFlightRequest(packet.requestId);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt();
+
+    // P2 修复：群 Sender-Key 分发分片的响应。分发消息不展示、不落库，只在
+    // **全部**分片确认后才启用新 key（部分成功若照样启用就退回“他人不可解”）；
+    // 任一分片被拒/失败则整次分发作废，密钥材料当场 wipe
+    const auto distConv = m_pendingDistChunkConv.constFind(clientMessageId);
+    if (distConv != m_pendingDistChunkConv.constEnd()) {
+        const qint64 distConvId = distConv.value();
+        if (code == static_cast<int>(ErrorCode::Ok)) {
+            auto pending = m_pendingSenderKeyDist.find(distConvId);
+            if (pending != m_pendingSenderKeyDist.end()) {
+                pending.value().chunkRequestIds.remove(clientMessageId);
+                m_pendingDistChunkConv.remove(clientMessageId);
+                m_pendingDistRequestConv.remove(packet.requestId);
+                if (pending.value().chunkRequestIds.isEmpty()) {
+                    commitPendingGroupSenderKey(distConvId);
+                }
+            } else {
+                // 分发已被新一轮轮换取代或已丢弃：只清残留登记
+                m_pendingDistChunkConv.remove(clientMessageId);
+                m_pendingDistRequestConv.remove(packet.requestId);
+            }
+        } else {
+            failGroupSenderKeyDistribution(
+                distConvId,
+                QString("chunk_rejected:%1").arg(response.value("message").toString()));
+        }
+        // 无论成功失败都再刷一次 outbox：成功后该群密钥可用，失败后其余
+        // 会话不该被卡住（该群自身由退避挡住）
+        flushOutbox();
+        return;
+    }
+
     if (code == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
         // 确认后从 outbox 移除（以服务端回传的幂等键为准）
         const QString ackedId = data.value("clientMessageId").toString(clientMessageId);
-
-        // M7b: 群聊 Sender Key 分发消息 ACK：不展示、不落库，触发后续群消息发送
-        if (m_pendingGroupDistributions.remove(ackedId)) {
-            for (int i = m_outbox.size() - 1; i >= 0; --i) {
-                if (m_outbox.at(i).clientMessageId == ackedId) {
-                    m_localStore.removeOutboxItem(ackedId);
-                    m_outbox.removeAt(i);
-                    break;
-                }
-            }
-            flushOutbox();
-            return;
-        }
 
         QString sentContent;
         for (int i = 0; i < m_outbox.size(); ++i) {
@@ -2777,6 +2992,13 @@ void NetworkManager::sweepInFlightRequests()
         // 清掉后该会话下次激活会重新请求（视图保留 lastMessageId），
         // 因此不需要额外通知
         m_pendingSyncRequests.remove(requestId);
+        // P2 修复：群 Sender-Key 分发分片漏答——分发挂起期间该群一律发不出消息
+        //（ensureGroupSenderKey 对分发在途的群 fail-closed），必须清退并整次作废，
+        // 否则一次丢包就把这个群卡死到下次重连
+        if (m_pendingDistRequestConv.contains(requestId)) {
+            failGroupSenderKeyDistribution(m_pendingDistRequestConv.value(requestId),
+                                           "chunk_timeout");
+        }
     }
 
     // 私聊编辑的 fetch_keys 槽位：漏答时 m_editFetchInFlight 恒真会让队列里

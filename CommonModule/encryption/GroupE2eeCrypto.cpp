@@ -387,24 +387,29 @@ QByteArray GroupE2eeCrypto::decryptMessage(QByteArray &chainKey,
     return plaintext;
 }
 
-QJsonObject GroupE2eeCrypto::encodeDistribution(qint64 groupId,
-                                                qint64 senderUserId,
-                                                const QString &senderDeviceId,
-                                                const SenderKey &key,
-                                                const QList<DistributionEntry> &entries)
+namespace
 {
-    QJsonArray devices;
-    for (const DistributionEntry &entry : entries) {
-        QJsonObject obj;
-        obj["userId"] = entry.userId;
-        obj["deviceId"] = entry.deviceId;
-        obj["prekeyId"] = entry.envelope.prekeyId;
-        obj["eph"] = toBase64(entry.envelope.ephemeralPublicKey);
-        obj["iv"] = toBase64(entry.envelope.iv);
-        obj["ct"] = toBase64(entry.envelope.ciphertext);
-        devices.append(obj);
-    }
+// 单个设备条目的 JSON 形态
+QJsonObject distributionDeviceObject(const GroupE2eeCrypto::DistributionEntry &entry)
+{
+    QJsonObject obj;
+    obj["userId"] = entry.userId;
+    obj["deviceId"] = entry.deviceId;
+    obj["prekeyId"] = entry.envelope.prekeyId;
+    obj["eph"] = toBase64(entry.envelope.ephemeralPublicKey);
+    obj["iv"] = toBase64(entry.envelope.iv);
+    obj["ct"] = toBase64(entry.envelope.ciphertext);
+    return obj;
+}
 
+// 组装分发的根对象。抽出来供"整包编码"与"分片编码"共用，保证两者的字段布局
+// 不会各自漂移（分片除了 devices 数组之外必须与整包逐字相同，接收端才能把它
+// 当同一条分发处理）
+QJsonObject encodeDistributionRoot(qint64 groupId, qint64 senderUserId,
+                                   const QString &senderDeviceId,
+                                   const GroupE2eeCrypto::SenderKey &key,
+                                   const QJsonArray &devices)
+{
     QJsonObject root;
     root["v"] = DistributionVersion;
     root["type"] = "sender_key_distribution";
@@ -415,6 +420,74 @@ QJsonObject GroupE2eeCrypto::encodeDistribution(qint64 groupId,
     root["publicSigningKey"] = toBase64(key.publicSigningKey);
     root["devices"] = devices;
     return root;
+}
+} // namespace
+
+QJsonObject GroupE2eeCrypto::encodeDistribution(qint64 groupId,
+                                                qint64 senderUserId,
+                                                const QString &senderDeviceId,
+                                                const SenderKey &key,
+                                                const QList<DistributionEntry> &entries)
+{
+    QJsonArray devices;
+    for (const DistributionEntry &entry : entries) {
+        devices.append(distributionDeviceObject(entry));
+    }
+    return encodeDistributionRoot(groupId, senderUserId, senderDeviceId, key, devices);
+}
+
+QList<QString> GroupE2eeCrypto::encodeDistributionChunks(qint64 groupId,
+                                                         qint64 senderUserId,
+                                                         const QString &senderDeviceId,
+                                                         const SenderKey &key,
+                                                         const QList<DistributionEntry> &entries,
+                                                         int maxContentLength)
+{
+    QList<QString> chunks;
+    if (groupId <= 0 || senderUserId <= 0 || senderDeviceId.isEmpty()
+        || entries.isEmpty() || maxContentLength <= 0) {
+        return chunks;
+    }
+
+    // 固定开销：与条目数无关的字段，外加空数组的 "[]"（2 个字符）。
+    // Compact 输出无空白，故追加条目后的总长 = overhead + Σ(条目长度) + (条目数 - 1)
+    const int overhead = QJsonDocument(encodeDistributionRoot(
+        groupId, senderUserId, senderDeviceId, key, QJsonArray()))
+        .toJson(QJsonDocument::Compact).size();
+    if (overhead >= maxContentLength) {
+        // 固定开销自身越界（keyId/deviceId 异常长）：无从切分
+        return chunks;
+    }
+
+    QJsonArray current;
+    int bodyLen = 0; // Σ(条目长度) + (条目数 - 1) 个逗号
+    const auto flushChunk = [&]() {
+        if (current.isEmpty()) {
+            return;
+        }
+        chunks.append(QString::fromUtf8(QJsonDocument(encodeDistributionRoot(
+            groupId, senderUserId, senderDeviceId, key, current))
+            .toJson(QJsonDocument::Compact)));
+        current = QJsonArray();
+        bodyLen = 0;
+    };
+
+    for (const DistributionEntry &entry : entries) {
+        const QJsonObject obj = distributionDeviceObject(entry);
+        const int objLen = QJsonDocument(obj).toJson(QJsonDocument::Compact).size();
+        const int cost = objLen + (current.isEmpty() ? 0 : 1);
+        if (!current.isEmpty() && overhead + bodyLen + cost > maxContentLength) {
+            flushChunk();
+        }
+        if (current.isEmpty()) {
+            bodyLen = objLen;
+        } else {
+            bodyLen += 1 + objLen;
+        }
+        current.append(obj);
+    }
+    flushChunk();
+    return chunks;
 }
 
 bool GroupE2eeCrypto::decodeDistribution(const QString &content,

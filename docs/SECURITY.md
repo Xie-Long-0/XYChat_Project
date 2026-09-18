@@ -41,7 +41,8 @@
 - **服务端 fail-closed**：`e2ee_group` 与 `sender_key_distribution` 正文入库/fan-out 前强制 decode 校验（含 `senderDeviceId` 非空、条目非空、`groupId` 与会话一致），非法返回 `E2eeInvalidEnvelope (3008)`，无静默放行路径；群系统消息（`contentType=system`）仅含元数据不含用户正文，不加密。
 - **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。跳序消息密钥缓存写入 `sender_key_skipped` 表（整体密文 blob，与 `sender_keys` 同主键维度），同样属 E2EE 密钥材料：登出保留、退群清理。“最新密钥”按 `rowid DESC` 选取（`INSERT OR REPLACE` 每次写入取得更大 rowid）；旧实现按秒级 `updated_at` 排序并以随机 hex `key_id` 作并列破口，同秒写入两把密钥（轮换场景）时选中哪把完全随机，可能用陈旧密钥加密而接收方无法解密（2026-09-09 修复）。
 - **成员变更 healing（2026-09-02 P1 修复）**：`member_added/removed/left` 群变更通知（及离线期间的 `sync_events` 补偿）触发本端 sender key 轮换（`generateSenderKey` 生成新 `keyId`）并向现任成员重分发；新成员因此获得当前密钥、被移除成员因密钥轮换失去后续消息的解密能力（后向安全）。轮换去重（同群在途/已排队不重复触发）、单发槽位队列化、瞬时失败（限流/超时）延迟重试；退群时清除本端该群 sender key（内存 wipe + `removeSenderKeysForGroup`）。
-- **遗留限制**：大群（成员设备数约 >60）单条 `sender_key_distribution` 可能超 16384 字符上限致分发失败；轮换采用“先落盘后分发”，分发永久失败时存在群解密不可用窗口；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。上述均登记为 ROADMAP 欠账（P2/P3）。
+- **分发分片与 ACK 后启用（2026-09-17 修复）**：单条分发正文受服务端 `MaxGroupMessageLength`(16384) 约束，成员设备数约 >60 时装配不下而被整条拒绝。现按 15000 字符预算切成多条分片，每条都是完整合法的分发消息（同 `keyId`/`publicSigningKey`，`devices` 只覆盖一部分设备），接收端只在自己的那条里找条目，故**无需重组**、同 `keyId` 重复安装幂等。新 key 只有在**全部分片被服务端确认**后才落盘并启用（此前该群一律不发消息，`ensureGroupSenderKey` fail-closed）：这同时封住了两个窗口——用尚未分发的新 key 加密（其余成员无解）与轮换期继续用旧 key 加密（新成员无解、被移除成员仍可解）。任一分片被拒/超时/断线即整次分发作废并 wipe 密钥材料，退避 30s 后重试。接收端对本地 `iteration > 0`（已使用）的 `keyId` 拒绝再被分发覆盖，避免历史同步重投把已推进的 ratchet 打回 0。
+- **遗留限制**：分发覆盖不到的成员（未注册 E2EE 或预密钥耗尽，`fetch_group_keys` 会跳过）仍会解不开本端后续群消息，发送方仅能经日志感知，无用户可见反馈；分片使一次轮换的分发消息数由 1 变为 N（N 为大群设备条目数除以每片容量），fan-out 与 `fetch_group_keys` 消耗相应放大；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。上述登记为 ROADMAP 欠账（P3）。
 
 ### 消息编辑与删除安全（M9）
 

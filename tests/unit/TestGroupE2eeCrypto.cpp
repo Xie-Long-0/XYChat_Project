@@ -8,6 +8,7 @@
  */
 #include <QtTest>
 #include <QJsonDocument>
+#include <QSet>
 
 #include <climits>
 
@@ -185,6 +186,136 @@ private slots:
         QCOMPARE(decodedEntries.size(), 1);
         QCOMPARE(decodedEntries.at(0).userId, 42LL);
         QCOMPARE(decodedEntries.at(0).deviceId, QString("deviceA"));
+    }
+
+    // 分发分片：超大群（设备条目多到单条分发正文超服务端 MaxGroupMessageLength）
+    // 必须切成多条，且不丢条目、不重复、逐片都能被接收端独立解码
+    void distributionChunksSplitWithinLimitWithoutLosingEntries()
+    {
+        const auto key = GroupE2eeCrypto::generateSenderKey();
+        QList<GroupE2eeCrypto::DistributionEntry> entries;
+        for (int i = 0; i < 30; ++i) {
+            GroupE2eeCrypto::DistributionEntry entry;
+            entry.userId = 100 + i;
+            // 设备 ID 用真实形态（32 个十六进制字符）
+            entry.deviceId = QString::number(i, 16).rightJustified(32, QLatin1Char('a'));
+            entry.envelope.deviceId = entry.deviceId;
+            entry.envelope.prekeyId = 1000 + i;
+            entry.envelope.ephemeralPublicKey = QByteArray(32, static_cast<char>('A' + i % 26));
+            entry.envelope.iv = QByteArray(12, 'I');
+            entry.envelope.ciphertext = QByteArray(64, 'C');
+            entries.append(entry);
+        }
+
+        const int budget = 2000;
+        const QList<QString> chunks = GroupE2eeCrypto::encodeDistributionChunks(
+            100, 1, "localDevice", key, entries, budget);
+
+        // 单条整包必然超预算（30 条 ≈ 6 KB，预算 2000），故必须切多片；
+        // 且不能切碎成 30 片（每片应容纳多条）
+        const QString whole = QString::fromUtf8(QJsonDocument(
+            GroupE2eeCrypto::encodeDistribution(100, 1, "localDevice", key, entries))
+            .toJson(QJsonDocument::Compact));
+        QVERIFY(whole.size() > budget);
+        QVERIFY(chunks.size() > 1);
+        QVERIFY(chunks.size() < entries.size());
+
+        QSet<QString> covered;
+        for (const QString &chunk : chunks) {
+            // 每片都必须能在服务端上限内（预算即按 MaxGroupMessageLength 留余量得出）
+            QVERIFY2(chunk.size() <= budget,
+                     qPrintable(QString("chunk length %1 exceeds %2").arg(chunk.size()).arg(budget)));
+
+            qint64 groupId = 0;
+            qint64 senderUserId = 0;
+            QString senderDeviceId;
+            GroupE2eeCrypto::SenderKey decodedKey;
+            QList<GroupE2eeCrypto::DistributionEntry> decodedEntries;
+            QVERIFY(GroupE2eeCrypto::decodeDistribution(chunk, groupId, senderUserId,
+                                                        senderDeviceId, decodedKey,
+                                                        decodedEntries));
+            // 所有分片携带同一把 key：接收端逐片安装同一 keyId 是幂等的
+            QCOMPARE(groupId, 100LL);
+            QCOMPARE(senderUserId, 1LL);
+            QCOMPARE(senderDeviceId, QString("localDevice"));
+            QCOMPARE(decodedKey.keyId, key.keyId);
+            QCOMPARE(decodedKey.publicSigningKey, key.publicSigningKey);
+            QVERIFY(!decodedEntries.isEmpty());
+
+            for (const auto &entry : decodedEntries) {
+                const QString id = QString("%1/%2").arg(entry.userId).arg(entry.deviceId);
+                QVERIFY2(!covered.contains(id), qPrintable("duplicated entry " + id));
+                covered.insert(id);
+            }
+        }
+        // 条目一个不少
+        QCOMPARE(covered.size(), entries.size());
+    }
+
+    // 分发分片：条目少时不得切碎（保持单条，与改动前的编码结果逐字一致）
+    void distributionChunksKeepSingleChunkWhenFits()
+    {
+        const auto key = GroupE2eeCrypto::generateSenderKey();
+        GroupE2eeCrypto::DistributionEntry entry;
+        entry.userId = 42;
+        entry.deviceId = "deviceA";
+        entry.envelope.deviceId = entry.deviceId;
+        entry.envelope.prekeyId = 7;
+        entry.envelope.ephemeralPublicKey = QByteArray(32, 'E');
+        entry.envelope.iv = QByteArray(12, 'I');
+        entry.envelope.ciphertext = QByteArray(16, 'C');
+
+        const QList<QString> chunks = GroupE2eeCrypto::encodeDistributionChunks(
+            100, 1, "localDevice", key, {entry});
+        QCOMPARE(chunks.size(), 1);
+
+        // 与整包编码逐字相同：分片只是"按预算切条目集合"，字段布局不得有任何差异
+        const QString whole = QString::fromUtf8(QJsonDocument(
+            GroupE2eeCrypto::encodeDistribution(100, 1, "localDevice", key, {entry}))
+            .toJson(QJsonDocument::Compact));
+        QCOMPARE(chunks.at(0), whole);
+    }
+
+    // 分发分片：单条条目自身超预算时仍要单独成片。宁可让整次分发被服务端拒掉
+    //（调用方随后丢弃整把 key，不会用他人拿不到的 key 加密），也不能静默少发设备
+    void distributionChunksEmitOversizedSingleEntry()
+    {
+        const auto key = GroupE2eeCrypto::generateSenderKey();
+        GroupE2eeCrypto::DistributionEntry entry;
+        entry.userId = 42;
+        entry.deviceId = QString(4000, QLatin1Char('d'));
+        entry.envelope.deviceId = entry.deviceId;
+        entry.envelope.prekeyId = 7;
+        entry.envelope.ephemeralPublicKey = QByteArray(32, 'E');
+        entry.envelope.iv = QByteArray(12, 'I');
+        entry.envelope.ciphertext = QByteArray(16, 'C');
+
+        const QList<QString> chunks = GroupE2eeCrypto::encodeDistributionChunks(
+            100, 1, "localDevice", key, {entry}, 2000);
+        QCOMPARE(chunks.size(), 1);
+        QVERIFY(chunks.at(0).size() > 2000);
+    }
+
+    // 分发分片：参数非法或固定开销即越界时返回空（调用方据此放弃整次轮换）
+    void distributionChunksRejectInvalidInput()
+    {
+        const auto key = GroupE2eeCrypto::generateSenderKey();
+        GroupE2eeCrypto::DistributionEntry entry;
+        entry.userId = 42;
+        entry.deviceId = "deviceA";
+        entry.envelope.deviceId = entry.deviceId;
+        entry.envelope.prekeyId = 7;
+        entry.envelope.ephemeralPublicKey = QByteArray(32, 'E');
+        entry.envelope.iv = QByteArray(12, 'I');
+        entry.envelope.ciphertext = QByteArray(16, 'C');
+
+        const QList<GroupE2eeCrypto::DistributionEntry> one{entry};
+        QVERIFY(GroupE2eeCrypto::encodeDistributionChunks(0, 1, "d", key, one).isEmpty());
+        QVERIFY(GroupE2eeCrypto::encodeDistributionChunks(100, 0, "d", key, one).isEmpty());
+        QVERIFY(GroupE2eeCrypto::encodeDistributionChunks(100, 1, "", key, one).isEmpty());
+        QVERIFY(GroupE2eeCrypto::encodeDistributionChunks(100, 1, "d", key, {}).isEmpty());
+        // 预算小到装不下固定字段：无从切分
+        QVERIFY(GroupE2eeCrypto::encodeDistributionChunks(100, 1, "d", key, one, 8).isEmpty());
     }
 
     void groupMessageEncodeDecodeRoundTrip()

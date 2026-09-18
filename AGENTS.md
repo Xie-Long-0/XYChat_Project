@@ -42,6 +42,8 @@ ctest --test-dir out/build/debug --output-on-failure
 - **验证"上限/封顶"类断言时，破坏方式要选对**（2026-09-17）：要证伪 `min(a, b)` 的封顶断言，应把 `min` 改成 `max`；若改成只保留 `a`（`datetime('now', ?)`）反而**不会**被现有断言抓到，因为此时结果仍可能落在上限之内。同类"看起来等价"的破坏要挑真正消除该不变量的那种。
 - **负向对照必须复刻"修复前的完整状态"，不能只回退单个 hunk**（2026-09-17 教训）：把数据面的默认绑定地址从回环改回 `Any`、却保留新加的 fail-closed 守卫时，服务在 `initTestCase` 就起不来（`Any` 非回环 → 被守卫拒），失败点跑到与该用例无关的位置，差点把"用例没抓到回归"当成结论。**要证明用例有效，就得把行为整块还原到修复前的样子**。同理，一个用例里有多条断言时，破坏点最好分开跑，否则前面的断言会挡住后面的，归属就说不清。
 - **`QVERIFY`/`QCOMPARE` 不能写在有返回值的 lambda 里**：这些宏的失败路径是裸 `return;`，在返回值非 `void` 的 lambda 中直接编译错误。需要带断言的辅助逻辑就抽成返回 `void` 的成员函数，或用 out 参数回传结果、把断言留在用例体内。
+- **同一文件的多次编辑不要并发下发**（2026-09-17 教训）：一批并行 `Edit` 打在同一文件上时，各自按同一份旧快照改写整个文件，**后写者覆盖先写者**——本次 5 处注入式破坏里有 2 处"返回成功但实际未落盘"，直到复跑负向对照时目标用例依旧通过才暴露。改同一文件请串行；核对破坏是否真的生效，不能信编辑结果，要 `Grep` 标记或看行为。
+- **"判定是否同一把密钥"不能用密钥材料本身比对**（2026-09-17 教训）：group sender key 的 `chainKey` 会随 ratchet 前进，故"本地 chainKey 是否等于分发里那份"在密钥被用过之后**恒为假**，据此写的防重放保护静默失效（本次由新用例先失败才抓出）。这类"某物是否已用过/已推进"的判断要读**状态量**（如本地 `iteration`），不要拿会随时间变化的值去比。
 - 单测均纳入 CTest（当前 12 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`/`TestThumbnailMaker`。`TestFileHttpService` 与 `TestFileTransfer` 为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）；`TestFileTransfer` 另含 M8.3b/c 的 `DecryptingIODevice`（播放器解密设备：顺序读取/seek 跨分片/未下载 open 失败）与 `toLocalPath`/`decryptedFileBytes` 用例；`TestThumbnailMaker` 只依赖 QtGui 图像编解码，无需平台多媒体后端（JPEG 编码器缺失时相关断言会 QSKIP）。Chat-Client 自 M8.3b 起链接 `Qt6::Multimedia`（音视频元数据提取与播放依赖平台解码后端，CI/无头环境提取失败留空、播放报错，均不崩溃）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
 
 ## 代码风格约定
