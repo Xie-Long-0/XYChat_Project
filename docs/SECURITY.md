@@ -91,6 +91,8 @@
 - **内联缩略图（M8.3a，2026-09-11）**：图片消息的清单携带原图尺寸与最长边 ≤160px 的 JPEG 缩略图。缩略图是**明文**字节（清单整体已经既有 E2EE 加密，再单独加一层无安全收益），也正因此它**不含任何密钥**，可以经 `sanitizeForUi` 交给 QML 以 base64 渲染（`data:image/jpeg;base64,`），使接收方在下载原图之前就能预览；文件密钥与 nonce 仍只留在 C++ 侧。提取只用 QtGui（`QImageReader`/`QImage`）而不依赖平台多媒体后端；`setAutoTransform` 校正 EXIF 方向（否则手机竖拍照片会得到横向缩略图）。体积硬约束：压不进 `MaxThumbnailBytes`（4096）就**不内联**（UI 回退到文件图标），绝不放宽上限，因为清单超长会使整条文件消息被服务端拒收。元数据提取失败（非图片/损坏/编码器缺失）一律留空字段，**绝不阻断文件发送**。
 - **音视频元数据与应用内播放（M8.3b/c，2026-09-11）**：音视频时长/分辨率/视频封面由 `MediaMetadataExtractor`（QtMultimedia `QMediaPlayer` + `QVideoSink`）异步提取，同样只在清单内随 E2EE 分发、服务端不可见，提取失败/超时留空绝不阻断发送。应用内大图查看器（`FileImageProvider`，`image://xyfile/<id>`）与音视频播放器（`MediaPlaybackManager` + `DecryptingIODevice`）均从密文缓存逐片解密后在内存中解码/播放，**明文不落盘**（与“磁盘上不存在可读明文”口径一致，看原图/播放不再必须“另存为”）；`DecryptingIODevice` 作为只读 `QIODevice` 喂给 `QMediaPlayer::setSourceDevice`，支持 seek（拖动进度条时按 plainPos 定位分片重新解密）；内存解码上限 64 MiB，超限回退“另存为”。渲染线程与密钥的跨线程访问经 `manifestFor` 加锁拷贝清单、IO 与 GCM 认证在锁外。历史图片消息（清单 thumb 为空）下载后由 `localThumbnailForMessage` 本地生成缩略图缓存到 `<cacheRoot>/thumbs/`（JPEG 明文，不含密钥，与密文缓存分目录）。**已知限制**：视频播放无动态画面（QML VideoOutput 无法绑定 C++ QVideoSink，只输出音频轨 + 静态封面）。
 
+- **自动化覆盖（2026-09-20 补）**：`TestFileControlPlane` 以进程内真实回环 + 真实 `RequestHandler` 逐条验证上述各条规则——入参形态校验先于限流与配额、并发配额（8）与限流窗口（20/60s、60/60s）是两道独立闸门、完成与取消的幂等、`finalize` 的"未齐备 3016 附已收索引"与"数据故障 3015 并回收"分类、以及"文件不存在"与"不是你的文件"必须回同一错误码（枚举预言机合并）；并断言 create/complete/download_ticket 三个响应均不含 `blobKey`。此前这五个处理器只有人工复核。
+
 ### 数据面与客户端缓存安全（M8.2，2026-09-11）
 
 - **数据面 TLS 与主通道同口径**：HTTP(S) 服务由 `QSslServer` 承载，复用主通道同一份 `QSslConfiguration`（开发自签 CA + `TlsV1_2OrLater` + `VerifyPeer`）；TLS 不可用且未显式允许明文则拒启。客户端 `QNetworkAccessManager` 复用同一份 CA 配置，**不连 `sslErrors` 去 `ignoreSslErrors()`**，也不在此处放宽校验；重定向策略为 `NoLessSafeRedirectPolicy`。
@@ -130,6 +132,7 @@
 - 开发环境：服务端首次启动自动生成自签名 CA + 服务端证书（RSA 2048，SHA-256 签名，SAN: localhost/127.0.0.1）。
 - 生产环境：替换 `certs/` 目录下的证书文件为正式 CA 签发的证书即可。
 - 证书生成使用 OpenSSL X509 API，文件 I/O 通过内存 BIO + Qt QFile 避免 Windows applink 问题。
+- **自动化覆盖（2026-09-20 补）**：`TestTlsIntegration` 用真实证书起进程内真实 `Server` + 真实 `QSslSocket` 客户端（CA 注入与验证口径与生产客户端逐项一致），锁住两条 fail-closed 断言——未启用 TLS 时 `Server::start` 必须拒绝启动、客户端拿不到 CA 时握手必须失败；并跑通跨两个连接、两个用户的注册/登录/检索全链路（帧编解码 → 重放保护 → 会话鉴权 → DB），同时断言登录响应下发的 `fileTransferBaseUrl` 就是服务端实际监听的数据面地址。此前该层只有人工联调。
 
 ### 重放保护
 

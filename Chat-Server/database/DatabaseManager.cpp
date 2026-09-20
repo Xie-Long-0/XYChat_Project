@@ -10,7 +10,20 @@
 #include <QDir>
 #include <QSet>
 
-static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/XYChat-Server/data/db";
+namespace {
+// 测试接缝：进程内集成测试用 XYCHAT_SERVER_DATA_DIR 把数据目录（含 DB）重定向到
+// 临时目录，否则 handler/Server 会写开发者的真实库（连接名按 this 指针生成，
+// 无法从外部注入 :memory: 连接）。生产不设该变量即走默认路径
+QString databasePath()
+{
+    const QString overrideDir = qEnvironmentVariable("XYCHAT_SERVER_DATA_DIR");
+    if (!overrideDir.isEmpty()) {
+        return overrideDir + "/db";
+    }
+    return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+        + "/XYChat-Server/data/db";
+}
+} // namespace
 
 DatabaseManager::DatabaseManager(const QString &connectionName)
     : m_connectionName(connectionName)
@@ -36,13 +49,13 @@ bool DatabaseManager::openDatabase()
         return true;
     }
 
-    if (auto dir = QDir(DatabasePath); !dir.exists())
+    if (auto dir = QDir(databasePath()); !dir.exists())
     {
         dir.mkpath(".");
     }
 
     QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", m_connectionName);
-    db.setDatabaseName(DatabasePath + "/chatapp.db");
+    db.setDatabaseName(databasePath() + "/chatapp.db");
     // M6: 多 handler 线程并发写时避免 SQLITE_BUSY 立即失败
     db.setConnectOptions("QSQLITE_BUSY_TIMEOUT=5000");
 

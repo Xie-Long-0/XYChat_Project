@@ -29,9 +29,9 @@ void Server::setStorageRoot(const QString &rootPath)
 
 void Server::setFileHttpEndpoint(quint16 port, const QString &advertisedHost)
 {
-    if (port != 0) {
-        m_fileHttpPort = port;
-    }
+    // 端口 0 = 由 OS 分配（进程内集成测试用，免得与在跑的开发服务抢 12346）；
+    // CLI 侧已把 0 判为非法，故命令行不会引入这个取值
+    m_fileHttpPort = port;
     if (!advertisedHost.isEmpty()) {
         m_fileHttpHost = advertisedHost;
     }

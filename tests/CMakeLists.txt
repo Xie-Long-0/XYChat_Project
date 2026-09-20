@@ -296,6 +296,86 @@ add_test(NAME TestThumbnailMaker COMMAND TestThumbnailMaker)
 
 xychat_copy_runtime_dlls(TestThumbnailMaker)
 
+# ── TestFileControlPlane (M8 文件控制面 handler 级测试) ──
+# 进程内起真实回环连接 + 真实 RequestHandler（明文分支），客户端手工发包覆盖五个
+# 文件处理器：入参校验顺序、限流窗口、幂等、finalize 结果分类、枚举预言机合并
+add_executable(TestFileControlPlane
+    unit/TestFileControlPlane.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/RequestHandler.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/RequestHandler.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/Server.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/Server.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/NonceCache.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/NonceCache.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/IObjectStorage.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/database/DatabaseManager.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/database/DatabaseManager.h
+)
+
+target_include_directories(TestFileControlPlane PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Server
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core
+    ${CMAKE_SOURCE_DIR}/Chat-Server/http
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage
+    ${CMAKE_SOURCE_DIR}/Chat-Server/database
+)
+
+target_link_libraries(TestFileControlPlane PRIVATE
+    Qt6::Test
+    Qt6::Network
+    Qt6::Sql
+    Qt6::HttpServer
+    XYChatCommon
+)
+
+add_test(NAME TestFileControlPlane COMMAND TestFileControlPlane)
+
+xychat_copy_runtime_dlls(TestFileControlPlane)
+
+# ── TestTlsIntegration (M5/M8 主通道端到端 TLS 集成测试) ──
+# 真实证书 + 真实 Server + 真实 QSslSocket 客户端：握手、fail-closed（无证书拒启/
+# 无 CA 拒连）、帧编解码与认证全链路。端口用 0 交 OS 分配，避免抢开发服务的端口
+add_executable(TestTlsIntegration
+    unit/TestTlsIntegration.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/RequestHandler.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/RequestHandler.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/Server.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/Server.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/NonceCache.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/NonceCache.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/http/FileHttpService.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/LocalFileStorage.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage/IObjectStorage.h
+    ${CMAKE_SOURCE_DIR}/Chat-Server/database/DatabaseManager.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/database/DatabaseManager.h
+)
+
+target_include_directories(TestTlsIntegration PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Server
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core
+    ${CMAKE_SOURCE_DIR}/Chat-Server/http
+    ${CMAKE_SOURCE_DIR}/Chat-Server/storage
+    ${CMAKE_SOURCE_DIR}/Chat-Server/database
+)
+
+target_link_libraries(TestTlsIntegration PRIVATE
+    Qt6::Test
+    Qt6::Network
+    Qt6::Sql
+    Qt6::HttpServer
+    XYChatCommon
+)
+
+add_test(NAME TestTlsIntegration COMMAND TestTlsIntegration)
+
+xychat_copy_runtime_dlls(TestTlsIntegration)
+
 # ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
 add_executable(TestGroupRepro
     "e2e/TestGroupRepro.cpp"

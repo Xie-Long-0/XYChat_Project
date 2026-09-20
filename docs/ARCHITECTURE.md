@@ -25,7 +25,7 @@ TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）、`StructuredLogger`（M11 前置：单行 JSON 结构化日志，统一字段 + 复用 LogSanitizer 脱敏）。
 - 客户端还包含 `core/FileTransferManager`（M8.2：文件上传下载引擎，不持有 socket，经信号/回调与控制面协作）、`core/ThumbnailMaker`（M8.3a：图片尺寸与内联缩略图，纯 QtGui；M8.3b 抽出 `encodeThumbnail` 供视频封面复用）、`core/FileImageProvider`（M8.3c：应用内大图查看器图像源 `image://xyfile/<id>`）、`core/MediaMetadataExtractor`（M8.3b：音视频时长/分辨率/封面异步提取，QtMultimedia）、`core/DecryptingIODevice` 与 `core/MediaPlaybackManager`（M8.3b：密文缓存流式逐片解密播放，明文不落盘）。
 - `docs`：路线图、协议、安全和架构说明。
-- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层、V7-V10 迁移与 M8 文件元数据/票据/访问控制/回收）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b）、NetworkManager（2026-09-10：客户端链路层回归，friend 注入）、**FileProtocol 与 ObjectStorage（M8.1）、FileHttpService 与 FileTransfer（M8.2 集成测试，起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite）、ThumbnailMaker（M8.3a）**，共 12 套均纳入 CTest）；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
+- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层、V7-V10 迁移与 M8 文件元数据/票据/访问控制/回收）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b）、NetworkManager（2026-09-10：客户端链路层回归，friend 注入）、**FileProtocol 与 ObjectStorage（M8.1）、FileHttpService 与 FileTransfer（M8.2 集成测试，起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite）、ThumbnailMaker（M8.3a）、FileControlPlane 与 TlsIntegration（2026-09-20：服务端侧集成测试——前者进程内起真实回环 + 真实 `RequestHandler` 覆盖文件控制面五处理器，后者用真实证书起真实 `Server` 覆盖主通道 TLS fail-closed 与跨连接认证全链路）**，共 14 套均纳入 CTest）；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
 
 ## 服务端运行模型
 
