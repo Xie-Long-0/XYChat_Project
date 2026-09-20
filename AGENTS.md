@@ -10,6 +10,8 @@ XYChat 是"类 Telegram"安全即时通信系统，Qt 6.8.3 / C++20 / CMake + Ni
 
 MSVC 与 Windows SDK 由 `Build.ps1` 经 vswhere + `Launch-VsDevShell.ps1` 动态定位，**不要**在 `CMakeUserPresets.json` 硬编码版本号。裸开 `cmake --build` 前必须先载入 VS 环境，否则报 `fatal error C1083: 无法打开包含文件 type_traits`。
 
+**必须用 PowerShell 7（`pwsh`）执行 `Build.ps1`，不要用 `powershell`（Windows PowerShell 5.1）**：`Build.ps1` 是 UTF-8 无 BOM 且含中文，5.1 会按 ANSI 解析并抛一堆"意外的标记"语法错；同时 5.1 默认执行策略禁止运行脚本（`PSSecurityException`/`UnauthorizedAccess`）。这两种失败都会让 VS 环境**根本没载入**，但报错位置却落在 cmake 阶段——症状是 configure 时 `LINK : fatal error LNK1104: 无法打开文件"kernel32.lib"`（真实原因与 kernel32.lib 无关，是 `LIB`/`INCLUDE` 未设置）。非交互调用写作 `pwsh -NoProfile -File ./Build.ps1 -EnvOnly` 或 `pwsh -NoProfile -Command ". ./Build.ps1 -EnvOnly; cmake --preset Qt-Debug"`。
+
 ```powershell
 # 载入工具链环境后增量构建 Debug（输出目录 out/build/debug）
 . ./Build.ps1 -EnvOnly
@@ -44,6 +46,7 @@ ctest --test-dir out/build/debug --output-on-failure
 - **`QVERIFY`/`QCOMPARE` 不能写在有返回值的 lambda 里**：这些宏的失败路径是裸 `return;`，在返回值非 `void` 的 lambda 中直接编译错误。需要带断言的辅助逻辑就抽成返回 `void` 的成员函数，或用 out 参数回传结果、把断言留在用例体内。
 - **同一文件的多次编辑不要并发下发**（2026-09-17 教训）：一批并行 `Edit` 打在同一文件上时，各自按同一份旧快照改写整个文件，**后写者覆盖先写者**——本次 5 处注入式破坏里有 2 处"返回成功但实际未落盘"，直到复跑负向对照时目标用例依旧通过才暴露。改同一文件请串行；核对破坏是否真的生效，不能信编辑结果，要 `Grep` 标记或看行为。
 - **"判定是否同一把密钥"不能用密钥材料本身比对**（2026-09-17 教训）：group sender key 的 `chainKey` 会随 ratchet 前进，故"本地 chainKey 是否等于分发里那份"在密钥被用过之后**恒为假**，据此写的防重放保护静默失效（本次由新用例先失败才抓出）。这类"某物是否已用过/已推进"的判断要读**状态量**（如本地 `iteration`），不要拿会随时间变化的值去比。
+- **运行期内存类怪象先查构建树是否混编**（2026-09-20 教训）：一行自查 `find out/build/debug -name '*.obj' ! -newer <你改过的头文件> | wc -l`，非 0 即存在"按旧头文件编译"的目标文件。混编的典型后果是**同一类型在不同 TU 里 sizeof/成员偏移不一致**——本次 `main.cpp.obj`（13:10）早于 `NetworkManager.h`（17:46），而 `main()` 里 `NetworkManager` 与 `AppSettings` 都是**栈对象**，旧 `sizeof(NetworkManager)` 使二者内存重叠，于是对 AppSettings 的写入落进 NetworkManager 尾部成员，表现为 `Q_ASSERT "numBuckets > 0"`（Debug 断言）与登出时 `QHash<qint64,qint64>::clear` 访问违例。定位手法：cdb 挂起复现 → MiniDumpWriteDump 落 dump → 离线 `dt Chat_Client!NetworkManager` 拿成员偏移、`dq` 读对象内存、`ln <可疑地址>` 查最近符号（本次垃圾值落在 `AppSettings::vftable` 前 1 字节，直接指认重叠对象）。处置：`ninja -C out/build/debug -t clean` 后全量重建，**并重跑 `ctest`**——混编二进制上的"全绿"不作数。
 - 单测均纳入 CTest（当前 12 套）：`TestPacketCodec`/`TestEncryptionManager`/`TestDatabaseManager`/`TestSecurity`/`TestLocalStore`/`TestGroupE2eeCrypto`/`TestNetworkManager`/`TestFileProtocol`/`TestObjectStorage`/`TestFileHttpService`/`TestFileTransfer`/`TestThumbnailMaker`。`TestFileHttpService` 与 `TestFileTransfer` 为 M8.2 集成测试（起真实 HTTP 回环 + 真实对象存储 + 内存 SQLite，端口用 0 交由 OS 分配以避免冲突）；`TestFileTransfer` 另含 M8.3b/c 的 `DecryptingIODevice`（播放器解密设备：顺序读取/seek 跨分片/未下载 open 失败）与 `toLocalPath`/`decryptedFileBytes` 用例；`TestThumbnailMaker` 只依赖 QtGui 图像编解码，无需平台多媒体后端（JPEG 编码器缺失时相关断言会 QSKIP）。Chat-Client 自 M8.3b 起链接 `Qt6::Multimedia`（音视频元数据提取与播放依赖平台解码后端，CI/无头环境提取失败留空、播放报错，均不崩溃）。`tests/e2e/TestGroupRepro` 为手动双客户端工具，不纳入 CTest。
 
 ## 代码风格约定
