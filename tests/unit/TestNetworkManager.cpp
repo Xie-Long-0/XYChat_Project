@@ -985,6 +985,48 @@ private slots:
         QCOMPARE(nm.m_pendingFetchGroupKeysRequestId, quint64(0));
     }
 
+    // M11B B2: 重启恢复持久化 outbox 时必须一并还原引用目标。漏还原不会报错
+    //（QML 侧只看到消息发出去了），只是重启后重发的回复静默退化成普通消息，
+    // 故用"独立实例载入"锁住 LocalStore → 内存 outbox 的搬运是否完整
+    void openLocalStoreRestoresOutboxReplyTarget()
+    {
+        const QString user =
+            "outbox_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+        const QString deviceId = "dev0";
+
+        // 上一次运行留下的持久化 outbox：一条带引用的回复 + 一条普通消息
+        {
+            LocalStore store;
+            QVERIFY(store.open(user, deviceId));
+            QVERIFY(store.addOutboxItem("cmid-reply", 7, "offline reply", 0, 4242));
+            QVERIFY(store.addOutboxItem("cmid-plain", 8, "offline plain"));
+            store.close();
+        }
+
+        // 重启：新实例经 openLocalStore 载入，逐条比对搬运结果
+        NetworkManager nm;
+        nm.m_userId = 7;
+        nm.m_username = user;
+        nm.m_localDeviceId = deviceId;
+        nm.openLocalStore();
+        QVERIFY(nm.m_localStore.isOpen());
+        QCOMPARE(nm.m_outbox.size(), 2);
+
+        qint64 replyTarget = -1;
+        qint64 plainTarget = -1;
+        for (int i = 0; i < nm.m_outbox.size(); ++i) {
+            if (nm.m_outbox.at(i).clientMessageId == "cmid-reply") {
+                replyTarget = nm.m_outbox.at(i).replyToMessageId;
+            } else if (nm.m_outbox.at(i).clientMessageId == "cmid-plain") {
+                plainTarget = nm.m_outbox.at(i).replyToMessageId;
+            }
+        }
+        QCOMPARE(replyTarget, 4242LL);
+        QCOMPARE(plainTarget, 0LL);
+
+        nm.m_localStore.closeAndDestroy();
+    }
+
     // P2 欠账修复（续）：分发被切成多条分片后，同一 keyId 的分发消息会到达多次
     //（历史同步亦可能重投）。而 decodeDistribution 不回传 iteration（恒 0），
     // 无条件 saveSenderKey 会把接收端已推进的 ratchet 打回 0——轻则重放时从零

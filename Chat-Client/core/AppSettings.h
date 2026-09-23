@@ -13,6 +13,9 @@ class AppSettings : public QObject
     Q_PROPERTY(bool notificationsEnabled READ notificationsEnabled WRITE setNotificationsEnabled NOTIFY notificationsEnabledChanged)
     Q_PROPERTY(bool messagePreviewEnabled READ messagePreviewEnabled WRITE setMessagePreviewEnabled NOTIFY messagePreviewEnabledChanged)
     Q_PROPERTY(bool minimizeToTray READ minimizeToTray WRITE setMinimizeToTray NOTIFY minimizeToTrayChanged)
+    // M11B B4: 最近使用的 emoji（空格分隔的存储形态，QML 侧拆成数组）。
+    // 只存表情本身，不含任何消息内容
+    Q_PROPERTY(QString recentEmojis READ recentEmojis WRITE setRecentEmojis NOTIFY recentEmojisChanged)
 
 public:
     explicit AppSettings(QObject *parent = nullptr) : QObject(parent)
@@ -21,12 +24,14 @@ public:
         m_notificationsEnabled = m_settings.value("notifications/enabled", true).toBool();
         m_messagePreviewEnabled = m_settings.value("notifications/messagePreview", true).toBool();
         m_minimizeToTray = m_settings.value("tray/minimizeOnClose", true).toBool();
+        m_recentEmojis = m_settings.value("chat/recentEmojis", QString()).toString();
     }
 
     bool darkMode() const { return m_darkMode; }
     bool notificationsEnabled() const { return m_notificationsEnabled; }
     bool messagePreviewEnabled() const { return m_messagePreviewEnabled; }
     bool minimizeToTray() const { return m_minimizeToTray; }
+    QString recentEmojis() const { return m_recentEmojis; }
 
     void setDarkMode(bool dark)
     {
@@ -60,11 +65,20 @@ public:
         emit minimizeToTrayChanged();
     }
 
+    void setRecentEmojis(const QString &emojis)
+    {
+        if (m_recentEmojis == emojis) return;
+        m_recentEmojis = emojis;
+        m_settings.setValue("chat/recentEmojis", emojis);
+        emit recentEmojisChanged();
+    }
+
 signals:
     void darkModeChanged();
     void notificationsEnabledChanged();
     void messagePreviewEnabledChanged();
     void minimizeToTrayChanged();
+    void recentEmojisChanged();
 
 private:
     QSettings m_settings;
@@ -72,4 +86,5 @@ private:
     bool m_notificationsEnabled = true;
     bool m_messagePreviewEnabled = true;
     bool m_minimizeToTray = true;
+    QString m_recentEmojis;
 };

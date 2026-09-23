@@ -982,7 +982,8 @@ void NetworkManager::getConversations()
 }
 
 // M3: 发送消息
-QString NetworkManager::sendMessage(qint64 toUserId, const QString &content, qint64 fileId)
+QString NetworkManager::sendMessage(qint64 toUserId, const QString &content, qint64 fileId,
+                                    qint64 replyToMessageId)
 {
     // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
     // M4.5: 返回幂等键供 QML 跟踪乐观消息气泡状态
@@ -1005,23 +1006,23 @@ QString NetworkManager::sendMessage(qint64 toUserId, const QString &content, qin
                 m_localStore.open(user, deviceId);
             }
         }
-        m_localStore.addOutboxItem(clientMessageId, toUserId, content);
+        m_localStore.addOutboxItem(clientMessageId, toUserId, content, 0, replyToMessageId);
     }
 
     if (m_state != ConnectionState::Authenticated) {
         // M5.5: 未认证时进入 outbox，登录成功后自动重发
-        m_outbox.append({clientMessageId, toUserId, 0, content, fileId});
+        m_outbox.append({clientMessageId, toUserId, 0, content, fileId, replyToMessageId});
         return clientMessageId;
     }
 
-    m_outbox.append({clientMessageId, toUserId, 0, content, fileId});
+    m_outbox.append({clientMessageId, toUserId, 0, content, fileId, replyToMessageId});
     flushOutbox();
     return clientMessageId;
 }
 
 // M7a: 发送群消息（明文；返回幂等键供 QML 乐观消息跟踪）
 QString NetworkManager::sendGroupMessage(qint64 conversationId, const QString &content,
-                                         qint64 fileId)
+                                         qint64 fileId, qint64 replyToMessageId)
 {
     if (conversationId <= 0 || content.trimmed().isEmpty()) {
         emit messageSendFailed("Invalid group message");
@@ -1043,10 +1044,11 @@ QString NetworkManager::sendGroupMessage(qint64 conversationId, const QString &c
                 m_localStore.open(user, deviceId);
             }
         }
-        m_localStore.addOutboxItem(clientMessageId, 0, content, conversationId);
+        m_localStore.addOutboxItem(clientMessageId, 0, content, conversationId,
+                                   replyToMessageId);
     }
 
-    m_outbox.append({clientMessageId, 0, conversationId, content, fileId});
+    m_outbox.append({clientMessageId, 0, conversationId, content, fileId, replyToMessageId});
     if (m_state == ConnectionState::Authenticated) {
         flushOutbox();
     }
@@ -1099,6 +1101,10 @@ void NetworkManager::flushOutbox()
             // 并随消息同步给接收端；缺它会把清单当普通文本投递）
             if (item.fileId > 0) {
                 json["fileId"] = item.fileId;
+            }
+            // M11B B2: 引用目标（服务端校验须属同一会话）
+            if (item.replyToMessageId > 0) {
+                json["replyToMessageId"] = item.replyToMessageId;
             }
             addReplayProtection(json);
 
@@ -1463,6 +1469,10 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
         // M8.2: 同群聊路径，文件消息带上 files.id
         if (item.fileId > 0) {
             json["fileId"] = item.fileId;
+        }
+        // M11B B2: 同群聊路径，引用目标随消息带上
+        if (item.replyToMessageId > 0) {
+            json["replyToMessageId"] = item.replyToMessageId;
         }
         addReplayProtection(json);
 
@@ -3566,8 +3576,11 @@ void NetworkManager::openLocalStore()
             }
         }
         if (!exists) {
+            // M11B B2: 引用目标随持久化 outbox 一并恢复（否则重启后重发的
+            // 回复会退化成普通消息）
             m_outbox.append({item.clientMessageId, item.toUserId,
-                             item.conversationId, item.content});
+                             item.conversationId, item.content, 0,
+                             item.replyToMessageId});
         }
     }
 

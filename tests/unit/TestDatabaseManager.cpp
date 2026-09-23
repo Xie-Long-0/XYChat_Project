@@ -107,6 +107,11 @@ private slots:
     void unreferencedReadyFilesAreReclaimable();
     void sendMessageGuardsFileReadyStateAtomically();
 
+    // M11B B2: 引用（回复）
+    void v11ReplyColumnExists();
+    void replyToMessageRoundTrips();
+    void replyTargetMustBeInSameConversation();
+
 private:
     DatabaseManager *m_db = nullptr;
     QString m_connectionName;
@@ -945,11 +950,14 @@ void TestDatabaseManager::groupMigrationAddsNameAndRoleColumns()
     // V10 迁移补齐消息的文件关联列
     QVERIFY(v9MsgCols.contains("file_id"));
 
+    // M11B B2（V11）：引用（回复）目标列，旧库一路升级后同样补齐
+    QVERIFY(v9MsgCols.contains("reply_to_message_id"));
+
     // 版本号推进到最新（V7 群迁移之后还有 V8 同步事件、V9 置顶/免打扰与
-    // 编辑/删除、V10 文件元数据与票据）
+    // 编辑/删除、V10 文件元数据与票据、V11 引用/回复）
     QVERIFY(check.exec("SELECT MAX(version) FROM schema_version"));
     QVERIFY(check.next());
-    QCOMPARE(check.value(0).toInt(), 10);
+    QCOMPARE(check.value(0).toInt(), 11);
 }
 
 void TestDatabaseManager::createGroupInsertsOwnerAndMembers()
@@ -1419,7 +1427,109 @@ void TestDatabaseManager::v10TablesAndColumnsExist()
 
     QVERIFY(q.exec("SELECT MAX(version) FROM schema_version"));
     QVERIFY(q.next());
-    QCOMPARE(q.value(0).toInt(), 10);
+    // 版本号随迁移递增（V11 起由下方 v11ReplyColumnExists 断言具体值）
+    QVERIFY(q.value(0).toInt() >= 10);
+}
+
+// M11B B2: 引用（回复）列与版本号
+void TestDatabaseManager::v11ReplyColumnExists()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    QVERIFY(q.exec("PRAGMA table_info(messages)"));
+    QStringList msgCols;
+    while (q.next()) {
+        msgCols << q.value(1).toString();
+    }
+    QVERIFY(msgCols.contains("reply_to_message_id"));
+
+    QVERIFY(q.exec("SELECT MAX(version) FROM schema_version"));
+    QVERIFY(q.next());
+    QCOMPARE(q.value(0).toInt(), 11);
+}
+
+// M11B B2: 引用字段经 sendMessage 落库，并从三条读路径（getMessage /
+// getMessages / syncMessages）带出被引用者名
+void TestDatabaseManager::replyToMessageRoundTrips()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 targetId = m_db->sendMessage(convId, user2->id, "被引用的原消息");
+    QVERIFY(targetId > 0);
+    const qint64 replyId = m_db->sendMessage(convId, user1->id, "回复正文", "text",
+                                             "reply-key-1", "deviceA", 0, nullptr, targetId);
+    QVERIFY(replyId > 0);
+    QVERIFY(replyId != targetId);
+
+    // 单条读取：ID 与发送者名都要在（正文摘要由客户端本地解密渲染，
+    // 服务端不下发被引用消息的 content）
+    auto reply = m_db->getMessage(replyId);
+    QVERIFY(reply.has_value());
+    QCOMPARE(reply->replyToMessageId, targetId);
+    QCOMPARE(reply->replyToSender, QString("user2"));
+
+    // 非引用消息保持 0 / 空（NULL 列不得读成脏值）
+    auto original = m_db->getMessage(targetId);
+    QVERIFY(original.has_value());
+    QCOMPARE(original->replyToMessageId, qint64(0));
+    QVERIFY(original->replyToSender.isEmpty());
+
+    // 历史页与增量同步两条路径同口径
+    bool seenInGet = false;
+    for (const auto &m : m_db->getMessages(convId)) {
+        if (m.id == replyId) {
+            seenInGet = true;
+            QCOMPARE(m.replyToMessageId, targetId);
+            QCOMPARE(m.replyToSender, QString("user2"));
+        }
+    }
+    QVERIFY(seenInGet);
+
+    bool seenInSync = false;
+    for (const auto &m : m_db->syncMessages(convId, 0, 100)) {
+        if (m.id == replyId) {
+            seenInSync = true;
+            QCOMPARE(m.replyToMessageId, targetId);
+            QCOMPARE(m.replyToSender, QString("user2"));
+        }
+    }
+    QVERIFY(seenInSync);
+}
+
+// M11B B2: 引用目标必须属于同一会话（跨会话引用会被接收端本地缓存查不到，
+// 也确实可被滥用探测其他会话的消息存在性）
+void TestDatabaseManager::replyTargetMustBeInSameConversation()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convA = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 msgInA = m_db->sendMessage(convA, user1->id, "in A");
+    QVERIFY(msgInA > 0);
+
+    // 另一个会话：user1 与 user3（若不存在则注册）
+    auto user3 = m_db->getUserByUsername("replyuser3");
+    if (!user3.has_value()) {
+        m_db->registerUser("replyuser3", "", "", "hash3");
+        user3 = m_db->getUserByUsername("replyuser3");
+    }
+    QVERIFY(user3.has_value());
+    const qint64 convB = m_db->getOrCreatePrivateConversation(user1->id, user3->id);
+    QVERIFY(convB > 0);
+    QVERIFY(convB != convA);
+
+    QVERIFY(m_db->isMessageInConversation(msgInA, convA));
+    QVERIFY(!m_db->isMessageInConversation(msgInA, convB));
+    QVERIFY(!m_db->isMessageInConversation(99999999, convA));
+    QVERIFY(!m_db->isMessageInConversation(0, convA));
+    QVERIFY(!m_db->isMessageInConversation(msgInA, 0));
 }
 
 void TestDatabaseManager::fileRecordCreateAndRetrieve()

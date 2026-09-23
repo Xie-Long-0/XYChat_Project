@@ -54,8 +54,28 @@ Item {
     signal deleteRequested()
     signal resendRequested()
     signal copyRequested()
+    // M11B B1: 多选模式（选中态由 ChatView 的选择集持有并驱动，本组件只渲染指示
+    // 与上报点击——选择集属视图级状态，气泡 delegate 销毁重建不得丢选择）
+    signal selectionToggled()
+    signal selectionRequested()
+    // M11B B2: 回复（引用）本消息 / 点引用块跳到被引用消息
+    signal replyRequested()
+    // 参数是被引用消息的 ID——点击引用块要跳到**被引用**那条，不是承载引用的这条
+    signal replyJumpRequested(int messageId)
 
     property string clientMessageId: ""
+    property bool selectionMode: false
+    property bool selected: false
+
+    // M11B B2: 引用（回复）。摘要由客户端本地渲染（服务端只有密文），
+    // replyToSender 是服务端回传的被引用者名——仅在本地预览表未命中时用作回退
+    property int replyToMessageId: 0
+    property string replyToSender: ""
+    property string replyPreviewSender: ""
+    property string replyPreviewText: ""
+    property bool replyPreviewDeleted: false
+    // M11B B2: 跳转引用后的短暂高亮（由 ChatView 定时清除）
+    property bool highlighted: false
 
     // 气泡内容区可用宽度上限
     readonly property int maxContentWidth: Theme.messageMaxWidth - Theme.spacingMedium * 2
@@ -82,6 +102,11 @@ Item {
         }
         if (filePanel.visible) {
             w = Math.max(w, filePanel.width)
+        }
+        // M11B B2: 引用块也要参与宽度计算，否则短消息（如 "ok"）的引用块
+        // 会被压到最小宽度里、摘要被截得只剩几个字
+        if (replyQuote.visible) {
+            w = Math.max(w, Math.min(replyQuote.implicitWidth, maxContentWidth))
         }
         return Math.max(w, metaRow.width)
     }
@@ -130,8 +155,10 @@ Item {
             height: contentColumn.implicitHeight + Theme.spacingMedium * 2
             radius: Theme.radiusBubble
             color: isMine ? Theme.bubbleOutColor : Theme.bubbleInColor
-            border.width: 1
-            border.color: isMine ? Theme.bubbleOutBorderColor : Theme.bubbleInBorderColor
+            // M11B B2: 跳转引用后短暂高亮（与多选选中态同一视觉口径）
+            border.width: (selected || highlighted) ? 2 : 1
+            border.color: (selected || highlighted) ? Theme.primaryColor
+                                  : (isMine ? Theme.bubbleOutBorderColor : Theme.bubbleInBorderColor)
 
             Column {
                 id: contentColumn
@@ -139,6 +166,73 @@ Item {
                 y: Theme.spacingMedium
                 width: bubbleRect.width - Theme.spacingMedium * 2
                 spacing: Theme.spacingXSmall
+
+                // M11B B2: 引用块。摘要由本地引用预览表渲染（服务端只有密文）；
+                // 表未命中（被引用消息不在本页）时退回服务端带出的发送者名 +
+                // "原消息不可见"占位。点击跳到被引用消息
+                Rectangle {
+                    id: replyQuote
+                    visible: messageBubble.replyToMessageId > 0 && !deleted
+                    width: contentColumn.width
+                    height: quoteColumn.implicitHeight + Theme.spacingSmall
+                    radius: Theme.radiusSmall
+                    color: isMine ? Theme.bubbleOutBorderColor : Theme.hoverColor
+                    // 自然宽度参与 contentWidth 计算（见那里的说明）
+                    implicitWidth: quoteColumn.implicitWidth + Theme.spacingMedium
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingXSmall
+                        spacing: Theme.spacingXSmall
+
+                        Rectangle {
+                            width: 3
+                            height: parent.height
+                            radius: 1.5
+                            color: Theme.primaryColor
+                        }
+
+                        Column {
+                            id: quoteColumn
+                            spacing: 0
+
+                            Label {
+                                text: {
+                                    if (messageBubble.replyPreviewSender.length > 0) {
+                                        return messageBubble.replyPreviewSender
+                                    }
+                                    if (messageBubble.replyToSender.length > 0) {
+                                        return messageBubble.replyToSender
+                                    }
+                                    return "引用消息"
+                                }
+                                width: Math.min(implicitWidth,
+                                                messageBubble.maxContentWidth - Theme.spacingMedium)
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                font.weight: Font.DemiBold
+                                color: Theme.primaryColor
+                                elide: Text.ElideRight
+                            }
+
+                            Label {
+                                text: messageBubble.replyPreviewText
+                                width: Math.min(implicitWidth,
+                                                messageBubble.maxContentWidth - Theme.spacingMedium)
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                font.italic: messageBubble.replyPreviewDeleted
+                                color: Theme.textSecondary
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: messageBubble.replyJumpRequested(messageBubble.replyToMessageId)
+                    }
+                }
 
                 // 消息内容：短消息单行自然宽度，长消息在最大宽度内自动换行。
                 // P2.2: 用只读 TextEdit 替代 Label，让正文可鼠标选中并 Ctrl+C
@@ -384,8 +478,13 @@ Item {
                 anchors.fill: parent
                 hoverEnabled: true
                 acceptedButtons: Qt.RightButton
+                // 多选模式下行级左键由选择覆盖层接管；右键菜单同时让位，
+                // 避免"以为在勾选、实际弹出菜单"的错位交互
+                enabled: !selectionMode
                 onClicked: {
-                    if (isMine && !deleted) contextMenu.popup()
+                    // M11B B1: 对方消息也开放右键（复制/多选），编辑/删除两项
+                    // 仅对自己的消息可见
+                    if (!deleted) contextMenu.popup()
                 }
             }
 
@@ -408,11 +507,35 @@ Item {
 
                 // 显隐由整行 hover 统一驱动（见根节点的 HoverHandler）。
                 // 只改 opacity，让淡出动画真正可见；enabled 保证不可见时不吞点击
-                //（disabled 会向下传递给按钮上的 MouseArea）
-                opacity: (!deleted && rowHover.hovered) ? 1 : 0
+                //（disabled 会向下传递给按钮上的 MouseArea）。
+                // 多选模式下整行让位给选择覆盖层，悬浮按钮一并隐藏
+                opacity: (!deleted && !selectionMode && rowHover.hovered) ? 1 : 0
                 visible: opacity > 0
                 enabled: opacity > 0
                 Behavior on opacity { NumberAnimation { duration: Theme.animationFast } }
+
+                // M11B B2: 回复（引用）本条消息。乐观/失败气泡还没有服务端 ID，
+                // 引用它们只会得到 messageId=0 的空引用，故不可回复
+                Rectangle {
+                    width: 22; height: 22; radius: 11
+                    opacity: messageId > 0 ? 1 : 0.4
+                    color: replyMouseArea.containsMouse && messageId > 0
+                           ? Theme.hoverColor : "transparent"
+                    MouseArea {
+                        id: replyMouseArea
+                        anchors.fill: parent
+                        enabled: messageBubble.messageId > 0
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: messageBubble.replyRequested()
+                    }
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "reply"
+                        size: 11
+                        iconColor: Theme.textSecondary
+                    }
+                }
 
                 Rectangle {
                     width: 22; height: 22; radius: 11
@@ -476,13 +599,30 @@ Item {
             AppMenu {
                 id: contextMenu
                 AppMenuItem {
+                    text: "回复"
+                    iconName: "reply"
+                    // 乐观/失败气泡无服务端 ID，引用它们只会得到空引用
+                    enabled: messageId > 0
+                    onTriggered: messageBubble.replyRequested()
+                }
+                AppMenuItem {
                     text: "复制"
                     iconName: "copy"
+                    // 文件消息正文是清单（已置空），无内容可复制
+                    enabled: !isFileMessage && content.length > 0
                     onTriggered: messageBubble.copyRequested()
+                }
+                AppMenuItem {
+                    text: "多选"
+                    iconName: "checkbox-checked"
+                    // 乐观气泡尚无服务端 ID，选择集按 messageId 记，故不可选
+                    enabled: messageId > 0
+                    onTriggered: messageBubble.selectionRequested()
                 }
                 AppMenuItem {
                     text: "编辑"
                     iconName: "edit"
+                    visible: isMine
                     enabled: !isFileMessage
                     onTriggered: messageBubble.editRequested()
                     ToolTip.visible: hovered && !enabled
@@ -491,11 +631,43 @@ Item {
                 AppMenuItem {
                     text: "删除"
                     iconName: "delete"
+                    visible: isMine
                     danger: true
                     onTriggered: messageBubble.deleteRequested()
                 }
             }
         }
+    }
+
+    // M11B B1: 选中指示圆点。放在气泡与对齐边之间的空白处（自己的消息在左、
+    // 对方在右），与 Telegram 一致：不遮挡正文，也不会把气泡推离窗口边缘
+    Rectangle {
+        id: selectionIndicator
+        visible: messageBubble.selectionMode
+        width: 22
+        height: 22
+        color: "transparent"
+        x: isMine ? bubbleColumn.x - Theme.spacingMedium - width
+                  : bubbleColumn.x + bubbleColumn.width + Theme.spacingMedium
+        y: bubbleColumn.y + bubbleRect.y + Math.round((bubbleRect.height - height) / 2)
+
+        Icon {
+            anchors.centerIn: parent
+            name: messageBubble.selected ? "checkbox-checked" : "checkbox-unchecked"
+            size: 20
+            iconColor: messageBubble.selected ? Theme.primaryColor : Theme.textTertiary
+        }
+    }
+
+    // M11B B1: 多选模式的行级点击区。声明在最后（z 序高于气泡内容与悬浮按钮），
+    // 选中模式下接管整行左键：正文 TextEdit 的文本选择、附件面板的下载/预览
+    // 按钮在此期间都不应响应——整行即"勾选开关"。disabled 时不消费任何事件
+    MouseArea {
+        anchors.fill: parent
+        enabled: messageBubble.selectionMode
+        acceptedButtons: Qt.LeftButton
+        cursorShape: Qt.PointingHandCursor
+        onClicked: messageBubble.selectionToggled()
     }
 
     // M8.2: 字节数转可读大小（清单里的 plainSize 为加密前字节数）

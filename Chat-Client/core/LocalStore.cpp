@@ -283,7 +283,9 @@ bool LocalStore::ensureSchema()
                        "client_message_id TEXT NOT NULL DEFAULT '',"
                        "created_at TEXT NOT NULL DEFAULT '',"
                        "edited_at TEXT NOT NULL DEFAULT '',"
-                       "deleted INTEGER NOT NULL DEFAULT 0)",
+                       "deleted INTEGER NOT NULL DEFAULT 0,"
+                       "reply_to_message_id INTEGER NOT NULL DEFAULT 0,"
+                       "reply_to_sender TEXT NOT NULL DEFAULT '')",
         "CREATE INDEX IF NOT EXISTS idx_messages_conv "
                        "ON messages(conversation_id, message_id)",
         "CREATE TABLE IF NOT EXISTS conversations ("
@@ -304,7 +306,8 @@ bool LocalStore::ensureSchema()
                        "to_user_id INTEGER NOT NULL,"
                        "content_enc TEXT NOT NULL,"
                        "created_at TEXT NOT NULL DEFAULT '',"
-                       "conversation_id INTEGER NOT NULL DEFAULT 0)",
+                       "conversation_id INTEGER NOT NULL DEFAULT 0,"
+                       "reply_to_message_id INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS decrypt_cache ("
                        "message_id INTEGER PRIMARY KEY,"
                        "content_enc TEXT NOT NULL)",
@@ -396,6 +399,28 @@ bool LocalStore::ensureSchema()
         qWarning() << "[LocalStore] Add messages.deleted failed:" << query.lastError().text();
         return false;
     }
+    // M11B B2: 引用（回复）列。存量库补列，新建库已在建表语句里带上
+    if (!hasColumn("messages", "reply_to_message_id")
+        && !query.exec("ALTER TABLE messages "
+                       "ADD COLUMN reply_to_message_id INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add messages.reply_to_message_id failed:"
+                   << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("messages", "reply_to_sender")
+        && !query.exec("ALTER TABLE messages "
+                       "ADD COLUMN reply_to_sender TEXT NOT NULL DEFAULT ''")) {
+        qWarning() << "[LocalStore] Add messages.reply_to_sender failed:"
+                   << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("outbox", "reply_to_message_id")
+        && !query.exec("ALTER TABLE outbox "
+                       "ADD COLUMN reply_to_message_id INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add outbox.reply_to_message_id failed:"
+                   << query.lastError().text();
+        return false;
+    }
 
     // 记录 schema 版本（首次插入）
     query.exec("INSERT INTO schema_meta(version) "
@@ -455,7 +480,8 @@ QString LocalStore::decryptText(const QString &cipher) const
 // 持久化 outbox
 
 bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
-                               const QString &plaintext, qint64 conversationId)
+                               const QString &plaintext, qint64 conversationId,
+                               qint64 replyToMessageId)
 {
     // 私聊需有效接收者；群聊需有效会话 ID（两者至少一个）
     if (!ensureUsableDb() || clientMessageId.isEmpty()
@@ -471,13 +497,15 @@ bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
     QSqlQuery query(m_db);
     query.prepare(
         "INSERT OR REPLACE INTO outbox"
-        "(client_message_id, to_user_id, content_enc, created_at, conversation_id) "
-        "VALUES (?, ?, ?, ?, ?)");
+        "(client_message_id, to_user_id, content_enc, created_at, conversation_id,"
+        " reply_to_message_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)");
     query.addBindValue(clientMessageId);
     query.addBindValue(toUserId);
     query.addBindValue(enc);
     query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     query.addBindValue(conversationId);
+    query.addBindValue(replyToMessageId > 0 ? replyToMessageId : 0);
     if (!query.exec()) {
         qWarning() << "[LocalStore] addOutboxItem failed:" << query.lastError().text();
         return false;
@@ -504,7 +532,8 @@ QList<LocalStore::OutboxItem> LocalStore::loadOutbox() const
     }
     QSqlQuery query(m_db);
     query.prepare(
-        "SELECT client_message_id, to_user_id, content_enc, conversation_id "
+        "SELECT client_message_id, to_user_id, content_enc, conversation_id,"
+        " reply_to_message_id "
         "FROM outbox ORDER BY created_at");
     if (!query.exec()) {
         return result;
@@ -515,6 +544,7 @@ QList<LocalStore::OutboxItem> LocalStore::loadOutbox() const
         item.toUserId = query.value(1).toLongLong();
         item.content = decryptText(query.value(2).toString());
         item.conversationId = query.value(3).toLongLong();
+        item.replyToMessageId = query.value(4).toLongLong();
         const bool validTarget = item.toUserId > 0 || item.conversationId > 0;
         if (!item.clientMessageId.isEmpty() && validTarget && !item.content.isEmpty()) {
             result.append(item);
@@ -619,8 +649,9 @@ bool LocalStore::upsertMessageRow(const QJsonObject &msg)
     QSqlQuery query(m_db);
     query.prepare(
         "INSERT INTO messages(message_id, conversation_id, sender_id, sender_username,"
-        " content_enc, content_type, status, status_rank, undecryptable, client_message_id, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " content_enc, content_type, status, status_rank, undecryptable, client_message_id, created_at,"
+        " reply_to_message_id, reply_to_sender)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(message_id) DO UPDATE SET"
         " conversation_id = excluded.conversation_id,"
         " sender_id = excluded.sender_id,"
@@ -638,6 +669,14 @@ bool LocalStore::upsertMessageRow(const QJsonObject &msg)
         " undecryptable = CASE WHEN excluded.content_enc != '' THEN 0"
         "                      ELSE messages.undecryptable END,"
         " client_message_id = excluded.client_message_id,"
+        // M11B B2: 引用字段只被"带值"的来源覆盖——缺字段的同步源
+        //（旧版事件、回显路径）不得把已有的引用清成空
+        " reply_to_message_id = CASE WHEN excluded.reply_to_message_id > 0"
+        "                            THEN excluded.reply_to_message_id"
+        "                            ELSE messages.reply_to_message_id END,"
+        " reply_to_sender = CASE WHEN excluded.reply_to_sender != ''"
+        "                        THEN excluded.reply_to_sender"
+        "                        ELSE messages.reply_to_sender END,"
         " created_at = excluded.created_at");
     query.addBindValue(messageId);
     query.addBindValue(conversationId);
@@ -646,10 +685,15 @@ bool LocalStore::upsertMessageRow(const QJsonObject &msg)
     query.addBindValue(enc.isEmpty() ? QString("") : enc);
     query.addBindValue(text(msg, "contentType", "text"));
     query.addBindValue(text(msg, "status", "sent"));
+    // 绑定序必须与上面的列清单逐一对齐（2026-09-20 修复：这四行此前顺序颠倒，
+    // 使 status_rank/undecryptable/client_message_id/created_at 四列互相错位写入，
+    // 表现为本地缓存页的时间戳是 "0".."3"、undecryptable 标志失效）
+    query.addBindValue(statusRank(msg.value("status").toString()));
     query.addBindValue(markUndecryptable && content.isEmpty() ? 1 : 0);
     query.addBindValue(text(msg, "clientMessageId"));
     query.addBindValue(text(msg, "createdAt"));
-    query.addBindValue(statusRank(msg.value("status").toString()));
+    query.addBindValue(msg.value("replyToMessageId").toVariant().toLongLong());
+    query.addBindValue(text(msg, "replyToSender"));
     if (!query.exec()) {
         qWarning() << "[LocalStore] upsertMessage failed:" << query.lastError().text();
         return false;
@@ -682,7 +726,8 @@ QJsonArray LocalStore::loadMessageRows(qint64 conversationId, int limit) const
     QSqlQuery query(m_db);
     query.prepare(
         "SELECT message_id, conversation_id, sender_id, sender_username, content_enc,"
-        " content_type, status, created_at, edited_at, deleted"
+        " content_type, status, created_at, edited_at, deleted,"
+        " reply_to_message_id, reply_to_sender"
         " FROM messages WHERE conversation_id = ? ORDER BY message_id DESC LIMIT ?");
     query.addBindValue(conversationId);
     query.addBindValue(limit);
@@ -710,6 +755,11 @@ QJsonArray LocalStore::loadMessageRows(qint64 conversationId, int limit) const
         if (!editedAt.isEmpty()) {
             msg["edited"] = true;
             msg["editedAt"] = editedAt;
+        }
+        const qint64 replyTo = query.value(10).toLongLong();
+        if (replyTo > 0) {
+            msg["replyToMessageId"] = replyTo;
+            msg["replyToSender"] = query.value(11).toString();
         }
         rows.append(msg);
     }

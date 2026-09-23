@@ -28,6 +28,9 @@ public:
         qint64 toUserId = 0;      // 私聊目标（群消息为 0）
         qint64 conversationId = 0; // M7a: 群聊目标会话（私聊为 0）
         QString content; // 明文正文（群消息为原文，私聊为待加密明文）
+        // M11B B2: 引用目标消息 ID（0 表示非引用消息）。必须随 outbox 落库：
+        // 离线排队/重启重发若不带回它，回复会静默退化成普通消息
+        qint64 replyToMessageId = 0;
     };
 
     LocalStore() = default;
@@ -50,9 +53,11 @@ public:
     bool isOpen() const { return m_open; }
     QString username() const { return m_username; }
 
-    // 持久化 outbox（正文加密存储）；M7a: conversationId > 0 表示群消息
+    // 持久化 outbox（正文加密存储）；M7a: conversationId > 0 表示群消息；
+    // M11B B2: replyToMessageId > 0 表示这是一条回复（引用目标随队列保留）
     bool addOutboxItem(const QString &clientMessageId, qint64 toUserId,
-                       const QString &plaintext, qint64 conversationId = 0);
+                       const QString &plaintext, qint64 conversationId = 0,
+                       qint64 replyToMessageId = 0);
     bool removeOutboxItem(const QString &clientMessageId);
     QList<OutboxItem> loadOutbox() const;
 

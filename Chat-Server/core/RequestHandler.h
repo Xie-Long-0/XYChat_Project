@@ -123,9 +123,19 @@ private:
     XYChat::Protocol::ErrorCode requireOwnedFile(qint64 fileId, FileRecord *outRecord,
                                                  QString *outReason);
 
-    // M7a: 群消息发送（明文入库 + fan-out，与私聊 E2EE 路径分流）
+    // M11B B2: 解析 send_message 的 replyToMessageId。仅做形态校验（缺省/0 表示
+    // 非引用消息，非整数或越界一律拒绝），由调用方在限流消费前调用
+    static bool parseReplyTarget(const QJsonObject &request, qint64 *outId);
+    // M11B B2: 引用目标语义校验——被引用消息必须存在且属于本会话，通过时
+    // *outSender 为被引用消息的发送者名。跨会话引用一律拒绝
+    bool resolveReplyTarget(qint64 replyToMessageId, qint64 conversationId,
+                            QString *outSender);
+
+    // M7a: 群消息发送（明文入库 + fan-out，与私聊 E2EE 路径分流）。
+    // replyToMessageId 已由调用方做过形态校验（见 parseReplyTarget）
     void processSendGroupMessage(const XYChat::Protocol::Packet &packet, const QJsonObject &request,
-                                 qint64 conversationId, const QString &clientMessageId);
+                                 qint64 conversationId, const QString &clientMessageId,
+                                 qint64 replyToMessageId);
     // M7a: 群系统消息入库并 fan-out（contentType=system，无幂等键）
     void postGroupSystemMessage(qint64 conversationId, qint64 operatorId, const QJsonObject &payload);
     // M7a: 向全体现任成员推送群变更通知并写入各自 sync_events

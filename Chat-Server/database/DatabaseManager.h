@@ -77,6 +77,10 @@ struct MessageInfo
     bool deleted = false;
     // M8: 关联的文件 ID（>0 表示这是一条文件消息，正文密文解出后为 FileManifest）
     qint64 fileId = 0;
+    // M11B B2: 引用（回复）目标消息 ID（0 表示非引用消息）。仅存 ID 与发送者名——
+    // 被引用消息的正文对服务端是密文，摘要一律由客户端本地解密后渲染
+    qint64 replyToMessageId = 0;
+    QString replyToSender;
 };
 
 // M8: 文件元数据
@@ -220,8 +224,12 @@ public:
                        const QString &content, const QString &contentType = "text",
                        const QString &clientMessageId = {},
                        const QString &senderDeviceId = {},
-                       qint64 fileId = 0, bool *fileNotReady = nullptr);
+                       qint64 fileId = 0, bool *fileNotReady = nullptr,
+                       qint64 replyToMessageId = 0);
     std::optional<MessageInfo> getMessage(qint64 messageId);
+    // M11B B2: 引用目标校验——被引用消息必须存在且属于同一会话
+    //（跨会话引用一律拒绝；由调用方在写库前判定）
+    bool isMessageInConversation(qint64 messageId, qint64 conversationId);
     // M5.5: 客户端幂等键去重
     std::optional<MessageInfo> getMessageByClientKey(qint64 senderId,
                                                      const QString &senderDeviceId,
@@ -403,6 +411,8 @@ private:
     bool migrateToV8();
     bool migrateToV9();
     bool migrateToV10();
+    // M11B B2: messages.reply_to_message_id（引用/回复）
+    bool migrateToV11();
 
     // M7a: 插入单个会话成员（供 createGroup/addGroupMembers 复用）
     bool insertMember(qint64 conversationId, qint64 userId, const QString &role);

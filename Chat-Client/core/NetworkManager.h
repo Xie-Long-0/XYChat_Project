@@ -57,7 +57,9 @@ public:
     // M3: 会话与消息
     Q_INVOKABLE void getConversations();
     // M4.5: 返回客户端幂等键 clientMessageId，供 QML 跟踪乐观消息状态
-    Q_INVOKABLE QString sendMessage(qint64 toUserId, const QString &content, qint64 fileId = 0);
+    // M11B B2: replyToMessageId > 0 表示这是一条回复（引用目标须属同一会话）
+    Q_INVOKABLE QString sendMessage(qint64 toUserId, const QString &content,
+                                    qint64 fileId = 0, qint64 replyToMessageId = 0);
     Q_INVOKABLE void ackMessage(qint64 messageId, const QString &status = "delivered");
     Q_INVOKABLE void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
     // M5.5: 账号级增量同步
@@ -70,8 +72,9 @@ public:
     Q_INVOKABLE void kickGroupMember(qint64 conversationId, qint64 userId);
     Q_INVOKABLE void getGroupInfo(qint64 conversationId);
     // M7a: 发送群消息（明文，返回幂等键供乐观消息跟踪）
+    // M11B B2: replyToMessageId > 0 表示回复群内某条消息
     Q_INVOKABLE QString sendGroupMessage(qint64 conversationId, const QString &content,
-                                         qint64 fileId = 0);
+                                         qint64 fileId = 0, qint64 replyToMessageId = 0);
 
     // M9 特性栈：会话偏好（置顶/免打扰）与消息编辑/删除
     Q_INVOKABLE void setConversationPrefs(qint64 conversationId, bool pinned, bool muted);
@@ -500,6 +503,9 @@ private:
         // 持久化 outbox 表不带此列，落库后重发会退化成"正文是清单"的
         // 普通消息，等于把文件密钥当文本发给对方
         qint64 fileId = 0;
+        // M11B B2: 引用（回复）目标消息 ID（0 表示非引用消息）。与 fileId 不同，
+        // 它不含密钥材料，持久化 outbox 一并保存（重启重发仍带引用）
+        qint64 replyToMessageId = 0;
     };
     QList<OutboxItem> m_outbox;
     QHash<quint64, QString> m_pendingSendByRequestId; // requestId -> clientMessageId

@@ -35,7 +35,7 @@ Rectangle {
     // M11A A4: 暴露输入框文本供 MainPage 草稿保存/恢复
     property alias inputText: messageInput.text
 
-    signal sendMessage(string content)
+    signal sendMessage(string content, int replyToMessageId)
     signal backClicked()
     signal groupInfoRequested()
     // P3.2: 用户键入（true）或发送/清空（false），转发到 MainPage 发“正在输入”信号
@@ -44,7 +44,8 @@ Rectangle {
     signal editRequested(int messageId, string content)
     signal deleteRequested(int messageId)
     // P2.2: failed 气泡点击重发（带幂等键与正文）与复制正文（均转发到 MainPage）
-    signal resendRequested(string clientMessageId, string content)
+    // M11B B2: 一并回传引用目标，重发不得丢引用（否则静默退化成普通消息）
+    signal resendRequested(string clientMessageId, string content, int replyToMessageId)
     signal copyRequested(string content)
     // M8.2: 文件消息的下载/另存请求（由 MainPage 接到传输引擎）
     signal fileDownloadRequested(int messageId)
@@ -56,6 +57,63 @@ Rectangle {
     // M8.2: 附件选择上转（由 MainPage 按会话类型分流到群聊/私聊，与 sendMessage 一致）。
     // 用 var 保留 QUrl，避免转字符串引入编解码歧义
     signal attachmentSelected(var fileUrl)
+    // M11B B1: 多选工具栏动作（选中消息 ID 列表，按消息先后排序；由 MainPage 接）
+    signal deleteSelectedRequested(var messageIds)
+    signal forwardSelectedRequested(var messageIds)
+    // M11B B2: 需要向用户提示的一句话（引用跳转未命中时用）
+    signal noticeRequested(string text)
+
+    // M11B B1: 多选模式。选择集按 messageId 记（乐观气泡无服务端 ID，不参与多选），
+    // 变更时整表重新赋值以驱动 delegate 与工具栏绑定重算（与 typingUsers 同口径）
+    property bool selectionMode: false
+    property var selectedIds: ({})
+    readonly property int selectedCount: Object.keys(selectedIds).length
+
+    // M11B B2: 引用预览表（被引用消息 → {sender, text, deleted, isMine}）。
+    // 渲染引用块需要被引用消息的正文与发送者，而服务端只有密文、本地又没有
+    // 全量消息（分页），故在消息进入模型时建表：delegate 按
+    // replyPreviewMap[replyToMessageId] 绑定，未命中（被引用消息不在本页）
+    // 时回退到服务端给的 replyToSender + 占位文案
+    property var replyPreviewMap: ({})
+    // M11B B2: 正在回复的目标（输入区展示引用条；发送后清空）
+    property var replyTarget: null
+    // M11B B2: 跳转引用后的短暂高亮（1.5s 自动清除）
+    property int highlightMessageId: 0
+    // M11B B2: 引用块摘要单行最大字符数（超出截断，避免超长引用撑爆气泡宽度）
+    readonly property int replyPreviewMaxChars: 120
+
+    // M11B B1: 选择集落到模型行上的快照（工具栏可用性与动作过滤共用）。
+    // 直接内联计算而非函数调用：QML 的依赖跟踪不穿透函数体，写成函数会让
+    // 工具栏可用状态在选完人之后不再刷新
+    readonly property var selectedRows: {
+        var ids = selectedIds
+        var n = msgModel.count
+        var rows = []
+        for (var i = 0; i < n; i++) {
+            var item = msgModel.get(i)
+            if (item.isDivider || item.messageId <= 0) continue
+            if (ids[item.messageId] === true) rows.push(item)
+        }
+        return rows
+    }
+    // 批量删除要求选中项全部是自己的且未删除（服务端按发送者校验）
+    readonly property bool canDeleteSelected: {
+        var rows = selectedRows
+        if (rows.length === 0) return false
+        for (var i = 0; i < rows.length; i++) {
+            if (!rows[i].isMine || rows[i].deleted === true) return false
+        }
+        return true
+    }
+    // 只要有一条可转发的文本消息，转发动作就可用；不可转发的（文件/系统/
+    // 已删除/不可解密）在确认动作时过滤，并在结果提示里说明跳过条数
+    readonly property bool hasForwardableSelected: {
+        var rows = selectedRows
+        for (var i = 0; i < rows.length; i++) {
+            if (forwardableRow(rows[i])) return true
+        }
+        return false
+    }
 
     // 顶部标题栏
     Rectangle {
@@ -65,6 +123,8 @@ Rectangle {
         anchors.right: parent.right
         height: 52
         color: Theme.windowBackground
+        // M11B B1: 多选模式由选择工具栏接管同一位置（两者几何一致，切换不跳动）
+        visible: !chatView.selectionMode
 
         Rectangle {
             anchors.bottom: parent.bottom
@@ -170,6 +230,131 @@ Rectangle {
 
             Item {
                 Layout.fillWidth: !hasConversation
+            }
+        }
+    }
+
+    // M11B B1: 多选工具栏。与标题栏同高同位置，进入多选后替换标题栏：
+    // 左侧关闭、中部"已选 N 条"、右侧转发/删除
+    Rectangle {
+        id: selectionHeader
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 52
+        color: Theme.windowBackground
+        visible: chatView.selectionMode
+
+        Rectangle {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 1
+            color: Theme.separatorColor
+        }
+
+        // Esc 退出多选。矩形本身不可聚焦，故用一个 0 尺寸可聚焦 Item 承接键盘
+        //（进入多选时显式夺焦，见 enterSelectionMode）
+        Item {
+            id: selectionFocusSink
+            width: 0
+            height: 0
+            focus: true
+            Keys.onEscapePressed: chatView.exitSelectionMode()
+        }
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Theme.spacingMedium
+            anchors.rightMargin: Theme.spacingMedium
+            spacing: Theme.spacingSmall
+
+            Rectangle {
+                id: selectionCloseBtn
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
+                radius: 18
+                color: selectionCloseMouse.containsMouse ? Theme.hoverColor : "transparent"
+
+                MouseArea {
+                    id: selectionCloseMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: chatView.exitSelectionMode()
+                }
+
+                Icon {
+                    anchors.centerIn: parent
+                    name: "close"
+                    size: 14
+                    iconColor: Theme.textSecondary
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "已选 " + chatView.selectedCount + " 条"
+                font.pixelSize: Theme.fontSizeLarge
+                font.weight: Font.DemiBold
+                color: Theme.textPrimary
+                elide: Text.ElideRight
+            }
+
+            Rectangle {
+                id: selectionForwardBtn
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
+                radius: 18
+                color: selectionForwardMouse.containsMouse && canAct ? Theme.hoverColor : "transparent"
+                opacity: canAct ? 1 : 0.4
+                // 有可转发消息（文本类、未删除、可解密）才可用；文件消息暂不参与转发
+                readonly property bool canAct: chatView.hasForwardableSelected
+
+                MouseArea {
+                    id: selectionForwardMouse
+                    anchors.fill: parent
+                    enabled: selectionForwardBtn.canAct
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    // 回传整个选择集（含文件/不可解密项），由 MainPage 过滤出可转发
+                    // 子集并在结果提示里说明跳过条数——只回传子集会丢失"跳过了几条"
+                    onClicked: chatView.forwardSelectedRequested(chatView.selectedMessageIds())
+                }
+
+                Icon {
+                    anchors.centerIn: parent
+                    name: "forward"
+                    size: 16
+                    iconColor: Theme.textSecondary
+                }
+            }
+
+            Rectangle {
+                id: selectionDeleteBtn
+                Layout.preferredWidth: 36
+                Layout.preferredHeight: 36
+                radius: 18
+                color: selectionDeleteMouse.containsMouse && canAct ? Theme.hoverColor : "transparent"
+                opacity: canAct ? 1 : 0.4
+                // 批量删除只覆盖自己的、未删除的消息（服务端按发送者校验）
+                readonly property bool canAct: chatView.canDeleteSelected
+
+                MouseArea {
+                    id: selectionDeleteMouse
+                    anchors.fill: parent
+                    enabled: selectionDeleteBtn.canAct
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: chatView.deleteSelectedRequested(chatView.selectedMessageIds())
+                }
+
+                Icon {
+                    anchors.centerIn: parent
+                    name: "delete"
+                    size: 16
+                    iconColor: Theme.textSecondary
+                }
             }
         }
     }
@@ -308,6 +493,9 @@ Rectangle {
                 clientMessageId: model.clientMessageId || ""
                 edited: model.edited === true
                 deleted: model.deleted === true
+                // M11B B1: 多选模式与选中态（选择集在 ChatView 上，气泡只渲染）
+                selectionMode: chatView.selectionMode
+                selected: chatView.selectedIds[model.messageId] === true
                 // M8.2: 文件消息的脱敏展示与下载/保存交互
                 isFileMessage: model.isFileMessage === true
                 fileName: model.fileName || ""
@@ -326,8 +514,33 @@ Rectangle {
                 onEditRequested: chatView.editRequested(model.messageId, model.content)
                 onDeleteRequested: chatView.deleteRequested(model.messageId)
                 // P2.2: failed 气泡点击重发；复制正文（经 MainPage 剪贴板助手）
-                onResendRequested: chatView.resendRequested(model.clientMessageId || "", model.content || "")
+                // M11B B2: 引用目标随重发带回（漏传会让回复静默退化成普通消息）
+                onResendRequested: chatView.resendRequested(model.clientMessageId || "",
+                                                            model.content || "",
+                                                            model.replyToMessageId || 0)
                 onCopyRequested: chatView.copyRequested(model.content || "")
+                // M11B B1: 右键"多选"进入选择模式并选中该条；模式内点击整行切换选中
+                onSelectionRequested: chatView.enterSelectionMode(model.messageId)
+                onSelectionToggled: chatView.toggleSelection(model.messageId)
+                // M11B B2: 引用（回复）渲染与跳转。摘要取自 replyPreviewMap
+                //（被引用消息不在本页时表未命中，回退到服务端带出的发送者名）
+                replyToMessageId: model.replyToMessageId || 0
+                replyToSender: model.replyToSender || ""
+                highlighted: chatView.highlightMessageId === model.messageId
+                replyPreviewSender: {
+                    var entry = chatView.replyPreviewMap[model.replyToMessageId]
+                    return entry ? entry.sender : (model.replyToSender || "")
+                }
+                replyPreviewText: {
+                    var entry = chatView.replyPreviewMap[model.replyToMessageId]
+                    return entry ? entry.text : "原消息不可见"
+                }
+                replyPreviewDeleted: {
+                    var entry = chatView.replyPreviewMap[model.replyToMessageId]
+                    return entry ? entry.deleted : false
+                }
+                onReplyRequested: chatView.beginReply(model.messageId)
+                onReplyJumpRequested: function(messageId) { chatView.jumpToMessage(messageId) }
             }
         }
 
@@ -503,8 +716,15 @@ Rectangle {
         anchors.right: parent.right
         visible: hasConversation
         maxLength: isGroup ? 16384 : 4096
+        // M11B B2: 引用条（正在回复谁）
+        replyInfo: chatView.replyTarget
+        onReplyCancelRequested: chatView.cancelReply()
         onMessageSent: function(text) {
-            chatView.sendMessage(text)
+            // M11B B2: 引用目标随发送一起交出去，发送后立即清空输入区的引用条；
+            // 失败气泡仍保留引用 ID（重发走 resendRequested 带回）
+            var replyTo = chatView.replyTarget ? chatView.replyTarget.messageId : 0
+            chatView.sendMessage(text, replyTo)
+            chatView.cancelReply()
             // P3.2: 发送后停止“正在输入”
             chatView.typingSignal(false)
         }
@@ -513,6 +733,14 @@ Rectangle {
         }
         // P3.2: 键入时上报“正在输入”（C++ 侧节流）
         onTypingActivity: chatView.typingSignal(true)
+    }
+
+    // M11B B2: 引用跳转后的短暂高亮（1.5s 后自动清除）
+    Timer {
+        id: highlightTimer
+        interval: 1500
+        repeat: false
+        onTriggered: chatView.highlightMessageId = 0
     }
 
     // P2.3: “跳到底部”悬浮按钮（向上滚动离开底部时出现，右下角，带新消息徽标）
@@ -677,7 +905,9 @@ Rectangle {
             isFileMessage: false, fileName: "", fileSizeBytes: 0,
             fileSha256: "", fileState: "missing", fileProgress: 0,
             fileWidth: 0, fileHeight: 0, fileThumb: "", fileMime: "",
-            fileDurationMs: 0
+            fileDurationMs: 0,
+            // M11B B2: 引用字段（分隔线恒为 0/空）
+            replyToMessageId: 0, replyToSender: ""
         }
     }
 
@@ -733,7 +963,11 @@ Rectangle {
             fileHeight: msg.fileHeight || 0,
             fileThumb: msg.fileThumb || "",
             // M8.3b: 音视频时长（毫秒，不含密钥），UI 据此展示时长标签
-            fileDurationMs: msg.fileDurationMs || 0
+            fileDurationMs: msg.fileDurationMs || 0,
+            // M11B B2: 引用（回复）字段。回复块正文由 replyPreviewMap 本地渲染，
+            // 这里只带 ID 与服务端回传的被引用者名
+            replyToMessageId: msg.replyToMessageId || 0,
+            replyToSender: msg.replyToSender || ""
         }
     }
 
@@ -776,6 +1010,55 @@ Rectangle {
             }
         }
         return -1
+    }
+
+    // M11B B2: 引用预览表维护。被引用消息的正文只存在于本地（服务端只有密文），
+    // 故在消息进入模型时把摘要登记进 replyPreviewMap：delegate 绑定该表，
+    // 被引用消息后到、被编辑、被删除时引用块都能自动跟上
+    function replyPreviewTextFor(item) {
+        if (item.deleted === true) return "已删除的消息"
+        if (item.undecryptable === true) return "无法解密的消息"
+        if (item.isFileMessage === true) {
+            return item.fileName && item.fileName.length > 0
+                   ? "[文件] " + item.fileName : "[文件]"
+        }
+        if (item.contentType === "system") return ChatText.systemMessageText(item.content || "")
+        return item.content || ""
+    }
+
+    function setReplyPreviewEntry(item) {
+        if (!item || item.isDivider || item.messageId <= 0) {
+            return
+        }
+        var text = replyPreviewTextFor(item)
+        if (text.length > replyPreviewMaxChars) {
+            text = text.substring(0, replyPreviewMaxChars) + "…"
+        }
+        var map = replyPreviewMap
+        map[item.messageId] = {
+            sender: item.senderUsername || "",
+            text: text,
+            deleted: item.deleted === true,
+            isMine: item.isMine === true
+        }
+        replyPreviewMap = map
+    }
+
+    // M11B B2: 开始/取消回复。目标摘要取自预览表（与引用块同一份数据，
+    // 避免两处渲染口径漂移）
+    function beginReply(messageId) {
+        var entry = replyPreviewMap[messageId]
+        replyTarget = {
+            messageId: messageId,
+            senderName: entry ? entry.sender : "",
+            text: entry ? entry.text : "原消息不可见",
+            isMine: entry ? entry.isMine : false
+        }
+        messageInput.setFocus()
+    }
+
+    function cancelReply() {
+        replyTarget = null
     }
 
     // M8.2: 更新某条消息的附件状态与下载进度（P4.2: 经索引 O(1) 定位）
@@ -845,6 +1128,13 @@ Rectangle {
         var deleted = msg.deleted === true
         if (cur.deleted !== deleted) {
             msgModel.setProperty(row, "deleted", deleted)
+            // M11B B1: 别的设备删掉的消息要从选择集里剔除——否则工具栏可用性
+            // 会基于陈旧的选择集继续报"可删除/可转发"（模型行数未变，绑定不重算）
+            if (deleted && selectedIds[cur.messageId] === true) {
+                var pruned = selectedIds
+                delete pruned[cur.messageId]
+                selectedIds = pruned
+            }
         }
         var status = msg.status || ""
         if (statusRankValue(status) > statusRankValue(cur.status)) {
@@ -859,6 +1149,14 @@ Rectangle {
         setRowIfChanged(row, "fileHeight", msg.fileHeight || 0)
         setRowIfChanged(row, "fileThumb", msg.fileThumb || "")
         setRowIfChanged(row, "fileDurationMs", msg.fileDurationMs || 0)
+        // M11B B2: 引用字段（只被带值的页覆盖——旧页/无引用消息不得清掉它）
+        var replyTo = msg.replyToMessageId || 0
+        if (replyTo > 0 && cur.replyToMessageId !== replyTo) {
+            msgModel.setProperty(row, "replyToMessageId", replyTo)
+            msgModel.setProperty(row, "replyToSender", msg.replyToSender || "")
+        }
+        // 正文/文件信息可能刚变化（重新解密、编辑），同步引用预览表
+        setReplyPreviewEntry(msgModel.get(row))
     }
 
     // M12.3: 插入点是否需要补日期分隔线。向上找到第一条带日期的行（日期分隔线
@@ -897,6 +1195,7 @@ Rectangle {
         if (at !== undefined && at.isDivider && at.isUnreadDivider !== true
                 && at.dateKeyStr === key) {
             msgModel.insert(pos + 1, makeMessageEntry(msg))
+            setReplyPreviewEntry(msgModel.get(pos + 1))
             return
         }
         if (needsDividerAt(pos, createdAt)) {
@@ -904,6 +1203,7 @@ Rectangle {
             pos++
         }
         msgModel.insert(pos, makeMessageEntry(msg))
+        setReplyPreviewEntry(msgModel.get(pos))
     }
 
     // 公共方法
@@ -989,7 +1289,8 @@ Rectangle {
             isFileMessage: false, fileName: "", fileSizeBytes: 0,
             fileSha256: "", fileState: "missing", fileProgress: 0,
             fileWidth: 0, fileHeight: 0, fileThumb: "", fileMime: "",
-            fileDurationMs: 0
+            fileDurationMs: 0,
+            replyToMessageId: 0, replyToSender: ""
         })
         unreadCount = 0
     }
@@ -1010,6 +1311,8 @@ Rectangle {
         var appended = msgModel.get(msgModel.count - 1)
         if (appended.messageId > 0) {
             msgIndex[appended.messageId] = msgModel.count - 1
+            // M11B B2: 补进引用预览表（该消息此后可能被引用）
+            setReplyPreviewEntry(appended)
         }
         if (wasAtBottom) {
             scrollToBottom()
@@ -1019,7 +1322,7 @@ Rectangle {
     }
 
     // M4.5: 乐观插入“发送中”消息（本地立即展示）
-    function appendOptimisticMessage(clientMessageId, content) {
+    function appendOptimisticMessage(clientMessageId, content, replyToMessageId) {
         var now = new Date().toISOString()
         ensureDivider(now)
         msgModel.append({
@@ -1036,7 +1339,10 @@ Rectangle {
             displayTime: formatTime(now),
             status: "sending",
             isMine: true,
-            undecryptable: false
+            undecryptable: false,
+            // M11B B2: 乐观气泡立即显示引用块（摘要取自 replyPreviewMap）
+            replyToMessageId: replyToMessageId || 0,
+            replyToSender: ""
         })
         scrollToBottom()
     }
@@ -1051,6 +1357,8 @@ Rectangle {
                 // P4.2: 乐观消息获得真实 messageId，补入索引
                 if (messageId > 0) {
                     msgIndex[messageId] = i
+                    // M11B B2: 同一条消息此后可能被引用，补进引用预览表
+                    setReplyPreviewEntry(msgModel.get(i))
                 }
                 return
             }
@@ -1077,6 +1385,12 @@ Rectangle {
                 msgModel.setProperty(i, "content", content)
                 msgModel.setProperty(i, "undecryptable", false)
                 msgModel.setProperty(i, "edited", true)
+                // M11B B2: 引用块摘要跟着编辑后的正文走（引用仍指向原消息 ID）
+                setReplyPreviewEntry(msgModel.get(i))
+                // 正在回复这条消息时，输入区的引用条同步刷新
+                if (replyTarget && replyTarget.messageId == messageId) {
+                    beginReply(messageId)
+                }
                 return
             }
         }
@@ -1084,11 +1398,19 @@ Rectangle {
 
     // M9 特性栈：删除消息后本地置灰占位
     function markMessageDeleted(messageId) {
+        // M11B B1: 已删除的消息不可再转发/再次删除，从选择集里剔除
+        if (selectedIds[messageId] === true) {
+            var m = selectedIds
+            delete m[messageId]
+            selectedIds = m
+        }
         for (var i = 0; i < msgModel.count; i++) {
             var item = msgModel.get(i)
             if (!item.isDivider && item.messageId == messageId) {
                 msgModel.setProperty(i, "content", "")
                 msgModel.setProperty(i, "deleted", true)
+                // M11B B2: 引用块转为"已删除的消息"占位
+                setReplyPreviewEntry(msgModel.get(i))
                 return
             }
         }
@@ -1203,6 +1525,55 @@ Rectangle {
         scrollTimer.restart()
     }
 
+    // M11B B1: 多选模式入口（右键"多选"）。首次进入时把键盘焦点从输入框移到
+    // 工具栏（Esc 退出），已在模式内则只切换该条的选中态
+    function enterSelectionMode(messageId) {
+        if (!selectionMode) {
+            selectionMode = true
+            selectionFocusSink.forceActiveFocus()
+        }
+        if (messageId > 0) {
+            toggleSelection(messageId)
+        }
+    }
+
+    function exitSelectionMode() {
+        selectionMode = false
+        selectedIds = ({})
+    }
+
+    function toggleSelection(messageId) {
+        if (messageId <= 0) {
+            return
+        }
+        var m = selectedIds
+        if (m[messageId] === true) {
+            delete m[messageId]
+        } else {
+            m[messageId] = true
+        }
+        selectedIds = m
+    }
+
+    // M11B B1: 选择集转 ID 列表（按行序 = 消息先后）。工具栏动作用它而不是
+    // Object.keys：后者顺序无保证，且会带上已不在模型里的陈旧 ID
+    function selectedMessageIds() {
+        var ids = []
+        var rows = selectedRows
+        for (var i = 0; i < rows.length; i++) {
+            ids.push(rows[i].messageId)
+        }
+        return ids
+    }
+
+    // M11B B3: 可转发判定。文件消息要把清单按目标会话重新加密后再投递，
+    // 本阶段不做（已登记欠账）；系统消息、已删除、不可解密消息无正文可转发
+    function forwardableRow(item) {
+        return item.contentType !== "system" && item.deleted !== true
+                && item.undecryptable !== true && item.isFileMessage !== true
+                && (item.content || "").length > 0
+    }
+
     // M11A A5: 滚动到指定消息（本地搜索结果跳转）
     // 返回是否成功定位（消息不在当前列表中时返回 false）
     function scrollToMessage(messageId) {
@@ -1216,5 +1587,19 @@ Rectangle {
         messageListView.positionViewAtIndex(row, ListView.Center)
         Qt.callLater(function() { chatView.programmaticScroll = false })
         return true
+    }
+
+    // M11B B2: 跳到被引用消息并短暂高亮。消息不在本页（更早的历史）时
+    // 明确提示——本地只持有已加载/已缓存的页，服务端也没有跨页定位接口
+    function jumpToMessage(messageId) {
+        if (messageId <= 0) {
+            return
+        }
+        if (scrollToMessage(messageId)) {
+            highlightMessageId = messageId
+            highlightTimer.restart()
+        } else {
+            noticeRequested("被引用的消息不在当前加载范围内")
+        }
     }
 }

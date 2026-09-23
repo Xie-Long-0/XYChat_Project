@@ -493,6 +493,24 @@ Rectangle {
         return null
     }
 
+    // M11B B3: 会话快照（转发目标选择用）。返回 JS 数组副本而非内部 ListModel，
+    // 对话框只读不改，避免外部持有 ListModel 引用后被这里 clear/append 搅乱
+    function conversationSummaries() {
+        var out = []
+        for (var i = 0; i < convModel.count; i++) {
+            var c = convModel.get(i)
+            out.push({
+                conversationId: c.conversationId,
+                type: c.type || "private",
+                peerUserId: c.peerUserId || 0,
+                peerUsername: c.peerUsername || "",
+                displayName: c.displayName || "",
+                memberCount: c.memberCount || 0
+            })
+        }
+        return out
+    }
+
     // M4.5: 按会话 ID 选中（会话刷新后恢复高亮）
     function setSelectedByConversationId(conversationId) {
         var target = normalizeConversationId(conversationId)

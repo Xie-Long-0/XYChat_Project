@@ -175,6 +175,8 @@ private slots:
 
     void serverRefusesPlaintextStartWithoutTls();
     void encryptedRoundTripAcrossTwoUsersAndConnections();
+    void replyToMessageRoundTripOverChannel();
+    void replyTargetValidationRejectsBadReferences();
     void clientWithoutCaRejectsHandshake();
     void plaintextClientCannotReachTlsChannel();
 
@@ -269,6 +271,185 @@ void TestTlsIntegration::encryptedRoundTripAcrossTwoUsersAndConnections()
     const QJsonArray users = search.value("data").toObject().value("users").toArray();
     QCOMPARE(users.size(), 1);
     QCOMPARE(users.at(0).toObject().value("username").toString(), QString("tls_bob"));
+
+    alice.close();
+    bob.close();
+}
+
+// M11B B2：引用（回复）全链路。群路径可用明文 text 构造（私聊路径要求合法
+// E2EE envelope，需预密钥体系，故协议面校验由群路径代表）：
+// 解析形态 → 校验目标属本会话 → 落库 → sync_messages 回读引用字段
+void TestTlsIntegration::replyToMessageRoundTripOverChannel()
+{
+    TlsTestClient alice;
+    QVERIFY(alice.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(alice.registerUser("reply_alice", "test123456")), int(ErrorCode::Ok));
+    QVERIFY(!alice.login("reply_alice", "test123456", "reply-dev-a")
+                 .value("data").toObject().value("token").toString().isEmpty());
+
+    TlsTestClient bob;
+    QVERIFY(bob.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(bob.registerUser("reply_bob", "test123456")), int(ErrorCode::Ok));
+    QVERIFY(!bob.login("reply_bob", "test123456", "reply-dev-b")
+                 .value("data").toObject().value("token").toString().isEmpty());
+
+    const QJsonObject search = alice.request(MessageType::SearchUsersRequest, "search_users",
+                                             { { "query", "reply_bob" } });
+    QCOMPARE(codeOf(search), int(ErrorCode::Ok));
+    const QJsonArray users = search.value("data").toObject().value("users").toArray();
+    QCOMPARE(users.size(), 1);
+    const qint64 bobId = users.at(0).toObject().value("userId").toVariant().toLongLong();
+    QVERIFY(bobId > 0);
+
+    const QJsonObject created = alice.request(MessageType::CreateGroupRequest, "create_group",
+                                              { { "name", "reply-group" },
+                                                { "memberIds", QJsonArray{ bobId } } });
+    QCOMPARE(codeOf(created), int(ErrorCode::Ok));
+    const qint64 convId = created.value("data").toObject()
+                                 .value("conversationId").toVariant().toLongLong();
+    QVERIFY(convId > 0);
+
+    const QJsonObject first = alice.request(MessageType::SendMessageRequest, "send_message",
+                                            { { "conversationId", convId },
+                                              { "content", "original message" },
+                                              { "contentType", "text" },
+                                              { "clientMessageId", "reply-cm-1" } });
+    QCOMPARE(codeOf(first), int(ErrorCode::Ok));
+    const qint64 firstId = first.value("data").toObject()
+                                .value("messageId").toVariant().toLongLong();
+    QVERIFY(firstId > 0);
+
+    // 带引用的发送：响应回带 replyToMessageId
+    const QJsonObject reply = alice.request(MessageType::SendMessageRequest, "send_message",
+                                            { { "conversationId", convId },
+                                              { "content", "a reply" },
+                                              { "contentType", "text" },
+                                              { "clientMessageId", "reply-cm-2" },
+                                              { "replyToMessageId", firstId } });
+    QCOMPARE(codeOf(reply), int(ErrorCode::Ok));
+    const QJsonObject replyData = reply.value("data").toObject();
+    QCOMPARE(replyData.value("replyToMessageId").toVariant().toLongLong(), firstId);
+    const qint64 replyId = replyData.value("messageId").toVariant().toLongLong();
+    QVERIFY(replyId > firstId);
+
+    // 接收方（另一连接、另一账号）经 sync_messages 拿到引用字段：
+    // 只回 ID 与被引用者名，正文摘要不在服务端（仍为密文/原文由客户端渲染）
+    const QJsonObject synced = bob.request(MessageType::SyncMessagesRequest, "sync_messages",
+                                           { { "conversationId", convId },
+                                             { "afterId", 0 },
+                                             { "limit", 50 } });
+    QCOMPARE(codeOf(synced), int(ErrorCode::Ok));
+    const QJsonArray messages = synced.value("data").toObject().value("messages").toArray();
+    bool seenOriginal = false;
+    bool seenReply = false;
+    for (const QJsonValue &value : messages) {
+        const QJsonObject msg = value.toObject();
+        const qint64 id = msg.value("messageId").toVariant().toLongLong();
+        if (id == firstId) {
+            seenOriginal = true;
+            QVERIFY(!msg.contains("replyToMessageId"));
+        } else if (id == replyId) {
+            seenReply = true;
+            QCOMPARE(msg.value("replyToMessageId").toVariant().toLongLong(), firstId);
+            QCOMPARE(msg.value("replyToSender").toString(), QString("reply_alice"));
+            // 不允许服务端把被引用消息的正文塞进引用字段（E2EE 下它本就是密文，
+            // 一旦有"摘要"字段就意味着服务端在拼明文）
+            QVERIFY(!msg.contains("replyPreview"));
+        }
+    }
+    QVERIFY(seenOriginal);
+    QVERIFY(seenReply);
+
+    alice.close();
+    bob.close();
+}
+
+// M11B B2：非法引用一律拒绝——形态错误（字符串/负数/小数）与语义错误
+//（不存在、跨会话）都回 InvalidRequest，且不落库（校验在写库之前）
+void TestTlsIntegration::replyTargetValidationRejectsBadReferences()
+{
+    TlsTestClient alice;
+    QVERIFY(alice.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(alice.registerUser("reply_val_alice", "test123456")), int(ErrorCode::Ok));
+    QVERIFY(!alice.login("reply_val_alice", "test123456", "val-dev-a")
+                 .value("data").toObject().value("token").toString().isEmpty());
+
+    TlsTestClient bob;
+    QVERIFY(bob.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(bob.registerUser("reply_val_bob", "test123456")), int(ErrorCode::Ok));
+    QVERIFY(!bob.login("reply_val_bob", "test123456", "val-dev-b")
+                 .value("data").toObject().value("token").toString().isEmpty());
+
+    const QJsonObject search = bob.request(MessageType::SearchUsersRequest, "search_users",
+                                           { { "query", "reply_val_alice" } });
+    const QJsonArray users = search.value("data").toObject().value("users").toArray();
+    QCOMPARE(users.size(), 1);
+    const qint64 aliceId = users.at(0).toObject().value("userId").toVariant().toLongLong();
+
+    const QJsonObject created = bob.request(MessageType::CreateGroupRequest, "create_group",
+                                            { { "name", "reply-val-group" },
+                                              { "memberIds", QJsonArray{ aliceId } } });
+    QCOMPARE(codeOf(created), int(ErrorCode::Ok));
+    const qint64 convId = created.value("data").toObject()
+                                 .value("conversationId").toVariant().toLongLong();
+
+    const QJsonObject inGroup = bob.request(MessageType::SendMessageRequest, "send_message",
+                                            { { "conversationId", convId },
+                                              { "content", "target" },
+                                              { "contentType", "text" },
+                                              { "clientMessageId", "reply-val-1" } });
+    QCOMPARE(codeOf(inGroup), int(ErrorCode::Ok));
+    const qint64 inGroupId = inGroup.value("data").toObject()
+                                    .value("messageId").toVariant().toLongLong();
+
+    // 另一个群（bob 自己开的）里的消息：跨会话引用必须被拒
+    const QJsonObject other = bob.request(MessageType::CreateGroupRequest, "create_group",
+                                          { { "name", "reply-val-other" },
+                                            { "memberIds", QJsonArray{} } });
+    QCOMPARE(codeOf(other), int(ErrorCode::Ok));
+    const qint64 otherConvId = other.value("data").toObject()
+                                     .value("conversationId").toVariant().toLongLong();
+    QVERIFY(otherConvId != convId);
+    const QJsonObject inOther = bob.request(MessageType::SendMessageRequest, "send_message",
+                                            { { "conversationId", otherConvId },
+                                              { "content", "message in another group" },
+                                              { "contentType", "text" },
+                                              { "clientMessageId", "reply-val-other-1" } });
+    QCOMPARE(codeOf(inOther), int(ErrorCode::Ok));
+    const qint64 inOtherId = inOther.value("data").toObject()
+                                    .value("messageId").toVariant().toLongLong();
+    QVERIFY(inOtherId > 0 && inOtherId != inGroupId);
+
+    auto sendWith = [&](const QString &key, const QJsonValue &replyValue) {
+        return bob.request(MessageType::SendMessageRequest, "send_message",
+                           { { "conversationId", convId },
+                             { "content", "bad reply" },
+                             { "contentType", "text" },
+                             { "clientMessageId", key },
+                             { "replyToMessageId", replyValue } });
+    };
+
+    // 形态错误
+    QCOMPARE(codeOf(sendWith("reply-val-str", QString("1"))), int(ErrorCode::InvalidRequest));
+    QCOMPARE(codeOf(sendWith("reply-val-neg", -3)), int(ErrorCode::InvalidRequest));
+    QCOMPARE(codeOf(sendWith("reply-val-frac", 1.5)), int(ErrorCode::InvalidRequest));
+    // 语义错误：不存在 / 属于别的会话
+    QCOMPARE(codeOf(sendWith("reply-val-missing", 999999)), int(ErrorCode::InvalidRequest));
+    QCOMPARE(codeOf(sendWith("reply-val-cross", inOtherId)), int(ErrorCode::InvalidRequest));
+
+    // 被拒的请求都不得落库：群里只应有那一条目标消息（+ 建群系统消息）
+    const QJsonObject synced = bob.request(MessageType::SyncMessagesRequest, "sync_messages",
+                                           { { "conversationId", convId },
+                                             { "afterId", 0 },
+                                             { "limit", 50 } });
+    QCOMPARE(codeOf(synced), int(ErrorCode::Ok));
+    const QJsonArray messages = synced.value("data").toObject().value("messages").toArray();
+    for (const QJsonValue &value : messages) {
+        const QJsonObject msg = value.toObject();
+        if (msg.value("contentType").toString() == QLatin1String("text")) {
+            QCOMPARE(msg.value("messageId").toVariant().toLongLong(), inGroupId);
+        }
+    }
 
     alice.close();
     bob.close();

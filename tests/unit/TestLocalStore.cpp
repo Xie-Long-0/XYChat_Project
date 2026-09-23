@@ -405,6 +405,86 @@ private slots:
         store.closeAndDestroy();
     }
 
+    // 2026-09-20 修复：upsertMessageRow 的绑定序与列清单错位（status_rank/
+    // undecryptable/client_message_id/created_at 四列互相写错位）。用例锁定
+    // "输入什么就回读什么"，避免再被"批量 vs 单条同源对比"式的用例掩盖
+    void upsertWritesColumnsInOrder()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        // created_at 往返（错位时该列会写成 status_rank 的 0..3）
+        QJsonObject msg = makeMessage(1, 55, "ordered write");
+        msg["createdAt"] = "2026-09-20T08:30:00Z";
+        msg["status"] = "read";
+        QVERIFY(store.upsertMessage(msg));
+        const QJsonArray rows = store.loadMessages(55);
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.at(0).toObject().value("createdAt").toString(),
+                 QString("2026-09-20T08:30:00Z"));
+        QCOMPARE(rows.at(0).toObject().value("status").toString(), QString("read"));
+
+        // status_rank 参与"只前进"判定：低秩状态（sent）不得把 read 拉回去
+        QJsonObject downgrade = makeMessage(1, 55, "edited body");
+        downgrade["status"] = "sent";
+        QVERIFY(store.upsertMessage(downgrade));
+        const QJsonArray after = store.loadMessages(55);
+        QCOMPARE(after.at(0).toObject().value("status").toString(), QString("read"));
+        QCOMPARE(after.at(0).toObject().value("content").toString(), QString("edited body"));
+
+        store.closeAndDestroy();
+    }
+
+    // M11B B2: 引用（回复）字段落库并可回读；缺失字段的同步源不得清空已有引用
+    void replyFieldsRoundTripAndSurvivePartialUpsert()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        QJsonObject reply = makeMessage(2, 30, "回复正文");
+        reply["replyToMessageId"] = 1;
+        reply["replyToSender"] = "bob";
+        QVERIFY(store.upsertMessage(reply));
+        QVERIFY(store.upsertMessage(makeMessage(1, 30, "被引用的原消息")));
+
+        QJsonArray messages = store.loadMessages(30);
+        QCOMPARE(messages.size(), 2);
+        const QJsonObject loadedReply = messages.at(1).toObject();
+        QCOMPARE(loadedReply.value("replyToMessageId").toVariant().toLongLong(), 1LL);
+        QCOMPARE(loadedReply.value("replyToSender").toString(), QString("bob"));
+        // 非引用消息不带字段（避免渲染出空引用块）
+        QVERIFY(!messages.at(0).toObject().contains("replyToMessageId"));
+
+        // 老版本来源（事件流不带引用字段）重写同一行：既有引用必须保留
+        QVERIFY(store.upsertMessage(makeMessage(2, 30, "回复正文")));
+        messages = store.loadMessages(30);
+        QCOMPARE(messages.at(1).toObject().value("replyToMessageId").toVariant().toLongLong(), 1LL);
+        QCOMPARE(messages.at(1).toObject().value("replyToSender").toString(), QString("bob"));
+
+        store.closeAndDestroy();
+    }
+
+    // M11B B2: 持久化 outbox 保留引用目标（否则重启后重发的回复退化为普通消息）
+    void outboxPreservesReplyTarget()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+        QVERIFY(store.addOutboxItem("cmid-reply", 7, "offline reply", 0, 4242));
+        QVERIFY(store.addOutboxItem("cmid-plain", 8, "offline plain"));
+        store.close();
+
+        QVERIFY(store.open(user, DeviceId));
+        const auto items = store.loadOutbox();
+        QCOMPARE(items.size(), 2);
+        QCOMPARE(items.at(0).clientMessageId, QString("cmid-reply"));
+        QCOMPARE(items.at(0).replyToMessageId, 4242LL);
+        QCOMPARE(items.at(1).replyToMessageId, 0LL);
+        store.closeAndDestroy();
+    }
+
     // M12: 批量落库与逐行解密（会话切换的异步分片加载依赖这两条路径）
     void batchUpsertAndRowDecryptMatchSinglePath()
     {

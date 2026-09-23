@@ -90,10 +90,12 @@ Window {
                 networkManager.syncMessages(conversationId, afterId)
             }
 
-            onSendMessageRequested: function(peerUserId, content) {
+            onSendMessageRequested: function(peerUserId, content, replyToMessageId) {
                 // M4.5: 发送后以返回的幂等键跟踪乐观消息气泡
-                var clientMessageId = networkManager.sendMessage(peerUserId, content)
-                mainPage.trackOutgoingMessage(clientMessageId, content)
+                // M11B B2: 回复（引用）目标随消息投递
+                var clientMessageId = networkManager.sendMessage(peerUserId, content, 0,
+                                                                 replyToMessageId)
+                mainPage.trackOutgoingMessage(clientMessageId, content, replyToMessageId)
             }
 
             onLogoutRequested: {
@@ -126,11 +128,12 @@ Window {
                 networkManager.getGroupInfo(conversationId)
             }
 
-            onSendGroupMessageRequested: function(conversationId, content) {
+            onSendGroupMessageRequested: function(conversationId, content, replyToMessageId) {
                 // 群消息同样以幂等键跟踪乐观气泡
-                var clientMessageId = networkManager.sendGroupMessage(conversationId, content)
+                var clientMessageId = networkManager.sendGroupMessage(conversationId, content, 0,
+                                                                      replyToMessageId)
                 if (clientMessageId) {
-                    mainPage.trackOutgoingMessage(clientMessageId, content)
+                    mainPage.trackOutgoingMessage(clientMessageId, content, replyToMessageId)
                 }
             }
 

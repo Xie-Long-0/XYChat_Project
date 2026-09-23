@@ -1,8 +1,8 @@
 # XYChat 协议文档
 
-## 当前协议状态（M10 完成后，2026-09-14 对齐）
+## 当前协议状态（M11B 完成后，2026-09-20 对齐）
 
-M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。**M9 特性栈（2026-09-05 实施）完成了会话置顶/免打扰与消息编辑/删除**：新增 `SetConversationPrefsRequest/Response (81/82)`、`ConversationPrefsNotification (83)`、`EditMessageRequest/Response (84/85)`、`DeleteMessageRequest/Response (86/87)`；数据库迁移至 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；编辑/删除仅发送者可操作、编辑正文须保持原 contentType 且经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入）；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件实现多端与离线同步，删除为软删除留墓碑（幂等）。**M8.1（2026-09-10 实施）完成了媒体与文件传输的协议与存储地基**：新增文件控制面消息类型 90-99（申请上传 / 断点续传查询 / 宣告完成 / 取消 / 申请下载票据）与错误码 3013-3021；`send_message` 新增可选 `fileId` 并在响应/推送/历史读取四条路径回传；数据库迁移至 V10（`files` + `file_tickets` 两表、`messages.file_id`）；文件字节在客户端加密后才上传，文件名/MIME/明文大小与文件密钥只存在于 `FileManifest` 中并随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发，服务端只见密文与密文侧元数据。**数据面（分片字节流的 HTTP(S) 上传下载服务）与客户端上传/下载已于 M8.2（2026-09-11）实施**：数据面为独立 `QHttpServer` + `QSslServer` 服务（与主通道同一套证书与 fail-closed 口径，默认端口 12346），基地址由登录响应的 `fileTransferBaseUrl` 下发；客户端 `FileTransferManager` 负责分片加密上传、流式下载与解密、密文本地缓存与“另存为”。多媒体元数据（缩略图/尺寸/时长）与应用内预览已于 M8.3 实施（见文末 M8 章节）。**M10（2026-09-14 实施）新增会话整表删除（类型 100-102）与“正在输入”指示（类型 103-105）**，两项均无需数据库迁移，见文末 M10 章节。
+M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。**M9 特性栈（2026-09-05 实施）完成了会话置顶/免打扰与消息编辑/删除**：新增 `SetConversationPrefsRequest/Response (81/82)`、`ConversationPrefsNotification (83)`、`EditMessageRequest/Response (84/85)`、`DeleteMessageRequest/Response (86/87)`；数据库迁移至 V9（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；编辑/删除仅发送者可操作、编辑正文须保持原 contentType 且经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入）；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件实现多端与离线同步，删除为软删除留墓碑（幂等）。**M8.1（2026-09-10 实施）完成了媒体与文件传输的协议与存储地基**：新增文件控制面消息类型 90-99（申请上传 / 断点续传查询 / 宣告完成 / 取消 / 申请下载票据）与错误码 3013-3021；`send_message` 新增可选 `fileId` 并在响应/推送/历史读取四条路径回传；数据库迁移至 V10（`files` + `file_tickets` 两表、`messages.file_id`）；文件字节在客户端加密后才上传，文件名/MIME/明文大小与文件密钥只存在于 `FileManifest` 中并随消息正文经既有 E2EE（私聊 envelope / 群聊 Sender-Key）分发，服务端只见密文与密文侧元数据。**数据面（分片字节流的 HTTP(S) 上传下载服务）与客户端上传/下载已于 M8.2（2026-09-11）实施**：数据面为独立 `QHttpServer` + `QSslServer` 服务（与主通道同一套证书与 fail-closed 口径，默认端口 12346），基地址由登录响应的 `fileTransferBaseUrl` 下发；客户端 `FileTransferManager` 负责分片加密上传、流式下载与解密、密文本地缓存与“另存为”。多媒体元数据（缩略图/尺寸/时长）与应用内预览已于 M8.3 实施（见文末 M8 章节）。**M10（2026-09-14 实施）新增会话整表删除（类型 100-102）与“正在输入”指示（类型 103-105）**，两项均无需数据库迁移，见文末 M10 章节。**M11B（2026-09-20 实施）新增消息回复/引用**：`send_message` 可选 `replyToMessageId`（仅指向本会话既有消息，服务端只回 ID 与被引用者名、绝不回摘要——正文对服务端是密文），响应/推送/历史/事件四条路径回传引用字段；数据库迁移至 V11（`messages.reply_to_message_id`），客户端 `LocalStore` 同步加列（消息表两列 + outbox 一列，保证离线/重启后重发的回复不退化）。同批的多选模式、消息转发（文本）与 emoji 选择器为纯客户端改动，无协议变更。
 
 仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、文件传输只有控制面与存储层（M8.1），数据面 HTTP(S) 服务、客户端上传下载与多媒体元数据（缩略图/尺寸/时长）仍待实施、设备信任为 TOFU（无安全码比对）。会话自动续期与失效自动重登已落地（2026-09-04：客户端解析 `expiresAt` 过期前自动 `renewToken`，失效回登录页）。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
 
@@ -302,7 +302,8 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - 设备信任为 TOFU，无安全码/二维码带外验证；密钥备份与设备间迁移未实现（更换设备/清除应用数据后无法解密历史消息，但同一设备登出重登不受影响）。
 - 预密钥超时回收阈值为 10 分钟；发送方在认领后 10 分钟内仍可正常消费。
 - 客户端解密缓存与本地持久化 outbox 均已实现（M6.5：`LocalStore` 加密落库，重启后自动重发且幂等不重复）。
-- 消息编辑/删除与会话置顶/免打扰已于 2026-09-05 实施（M9 特性栈：协议类型 81-87 + V9 迁移 + `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件，多端与离线一致）；`sync_events` 保留清理已于 2026-09-04 落地（30 天保留 + 落后设备全量回退）。会话整表删除仍未实现（无对应接口/事件，属后续）。
+- 消息编辑/删除与会话置顶/免打扰已于 2026-09-05 实施（M9 特性栈：协议类型 81-87 + V9 迁移 + `conversation_prefs`/`message_edited`/`message_deleted` 三类 `sync_events` 事件，多端与离线一致）；`sync_events` 保留清理已于 2026-09-04 落地（30 天保留 + 落后设备全量回退）。会话整表删除与"正在输入"已于 2026-09-14 实施（M10：类型 100-105）。
+- 消息回复/引用已于 2026-09-20 实施（M11B B2：`send_message` 可选 `replyToMessageId` + V11 迁移）。**已知限制**：引用摘要由客户端本地渲染，被引用消息不在本地缓存/加载页时只能显示发送者名与"原消息不可见"占位；引用跳转同此范围（无跨页定位接口）。文件消息暂不支持转发（需按目标会话重加密 `FileManifest`）。
 
 ## M5 新增：传输层加密
 
@@ -346,7 +347,8 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - `TestPacketCodec::parsesManyConsecutiveSmallPackets` 覆盖连续 1000 个小包解析。
 - `TestPacketCodec::waitsForSplitLargePacket` 覆盖单个大包拆成多次到达后的解析。
 - `TestEncryptionManager` 覆盖 PBKDF2 哈希、验证、token 生成；M6 新增：X25519 密钥对生成/重建、ECDH 双向一致性、HKDF 确定性、AES-GCM 加解密往返、篡改密文/IV/错误密钥必须失败、公钥指纹、envelope 编解码往返与非法输入拒绝、完整发送方/接收方密钥协商流程。
-- `TestDatabaseManager` 覆盖迁移（V1-V9，含 M7a 群组数据层、M9 `sync_meta` 与 V9 置顶/免打扰/编辑/删除列）、用户注册、session 管理（含按 ID 查询 token 哈希）、登录审计、设备管理、联系人、会话、消息；M5.5 新增：会话成员/消息访问授权、`clientMessageId` 幂等去重、回执聚合、读游标单调前进、`sync_events` 游标；M6 新增：身份密钥 upsert、预密钥上传/计数、每设备一次性认领与耗尽、claimed 校验与消费、删除设备清除密钥材料、身份变更废弃旧预密钥；M7a 新增：群组创建/成员管理/角色白名单/按用户去重回执计数等 8 个用例；M9 新增：`sync_events` 保留清理、`read_cursor` 事件往返、V9 列存在性、会话偏好 set/get/回填、消息编辑/删除软删幂等（共 49 个）。
+- `TestDatabaseManager` 覆盖迁移（V1-V11，含 M7a 群组数据层、M9 `sync_meta` 与 V9 置顶/免打扰/编辑/删除列、V10 文件元数据、V11 引用/回复列）、用户注册、session 管理（含按 ID 查询 token 哈希）、登录审计、设备管理、联系人、会话、消息；M5.5 新增：会话成员/消息访问授权、`clientMessageId` 幂等去重、回执聚合、读游标单调前进、`sync_events` 游标；M6 新增：身份密钥 upsert、预密钥上传/计数、每设备一次性认领与耗尽、claimed 校验与消费、删除设备清除密钥材料、身份变更废弃旧预密钥；M7a 新增：群组创建/成员管理/角色白名单/按用户去重回执计数等 8 个用例；M9 新增：`sync_events` 保留清理、`read_cursor` 事件往返、V9 列存在性、会话偏好 set/get/回填、消息编辑/删除软删幂等；M11B B2 新增：V11 列与版本号、引用字段三条读路径往返（getMessage/getMessages/syncMessages）、引用目标必须同会话（共 68 个）。
+- `TestTlsIntegration`（2026-09-20 补）用真实证书与真实 TLS 连接覆盖主通道全链路（帧 → 重放保护 → 会话鉴权 → DB）与 fail-closed 反例；M11B B2 新增两条：引用消息经真实连接收发并从 `sync_messages` 回读引用字段（另一连接、另一账号），以及非法引用（字符串/负数/小数/不存在/跨会话）一律 `InvalidRequest` 且不落库。
 - `TestLocalStore` 覆盖本地加密缓存：磁盘字节级密文校验、持久化 outbox 幂等、登出语义、群字段与群 outbox、sender-key 持久化（M7b）、`markConversationRead` 未读重算与状态只前进（M9）。
 - `TestGroupE2eeCrypto`（M7b）20 个用例：Sender-Key 原语、chain ratchet、篡改/回滚/错误签名拒绝、DoS 上限（超限 iteration 拒绝）、分发与群消息 envelope 编解码、fail-closed 校验。
 - `TestSecurity` 覆盖日志脱敏、安全内存清零、TLS 证书生成与加载；M5.5 新增：nonce 首次接受/重复拒绝/空值拒绝/TTL 过期。
@@ -399,6 +401,8 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 { "type": "send_message", "toUserId": 2, "content": "{\"v\":1,\"devices\":[...]}", "contentType": "text", "clientMessageId": "<uuid>" }
 // M7b 群聊请求（conversationId > 0 走群路径；客户端正常发送为 e2ee_group 密文，envelope 同样受 ≤16384 字符上限约束）
 { "type": "send_message", "conversationId": 9, "content": "{\"v\":1,\"type\":\"group_e2ee\",...}", "contentType": "e2ee_group", "clientMessageId": "<uuid>" }
+// M11B B2：带引用（回复）的请求——replyToMessageId 指向本会话内某条既有消息
+{ "type": "send_message", "toUserId": 2, "content": "{\"v\":1,\"devices\":[...]}", "contentType": "text", "clientMessageId": "<uuid>", "replyToMessageId": 42 }
 // 响应 data
 { "messageId": 1, "conversationId": 1, "clientMessageId": "<uuid>", "status": "sent" }
 ```
@@ -418,6 +422,8 @@ M6 fail-closed 校验：`content` 必须解析为合法的 v1 envelope（见“M
 ```
 
 M7a 群消息额外携带 `senderUsername`（便于 UI 展示发送者）；群系统消息的 `contentType` 为 `system`，`content` 为结构化 JSON（见“M7a 新增：群组接口”）。
+
+M11B B2：引用（回复）消息额外携带 `replyToMessageId`（被引用消息 ID）与 `replyToSender`（被引用消息的发送者名）。**服务端绝不填充引用摘要**——被引用消息的正文对服务端是密文（私聊 envelope / 群 e2ee_group），摘要由客户端本地解密被引用消息后渲染。该两字段在**四条路径**同口径回传：实时推送、`sync_messages` 响应、`sync_events` 的 `message` 事件 payload、`send_message` 响应（仅 `replyToMessageId`）。
 
 #### 消息确认（回执）
 
@@ -794,6 +800,28 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 - **fan-out**：服务端向会话其他成员的**在线**设备直推 `TypingNotification (105)`；**不写 `sync_events`**——typing 是瞬时状态，离线补偿无意义。
 - **客户端节流**：输入框文本变化触发 `sendTyping`，C++ 侧按会话节流 4 秒（`typing=true` 才节流；`typing=false`（停止输入/发送）立即发，让对方即时消除提示）。
 - **UI**：ChatView 头部副标题显示“XX 正在输入…”（私聊）或“XX 等 N 人正在输入…”（群聊），5 秒无新信号自动隐藏（客户端 1 秒剪枝定时器）。
+
+## M11B 新增：消息回复/引用（2026-09-20）
+
+> **M11 唯一一次协议扩展**：`send_message` 新增可选 `replyToMessageId`，数据库迁移至 V11（`messages.reply_to_message_id`）；客户端 `LocalStore` 同步加列（`messages.reply_to_message_id` / `reply_to_sender` 与 `outbox.reply_to_message_id`）。多选模式、消息转发与 emoji 选择器三项无协议变更。
+
+### 请求与校验
+
+```json
+// 请求（私聊/群聊同一入口；replyToMessageId 可缺省，0 视同缺省）
+{ "type": "send_message", "toUserId": 2, "content": "...", "contentType": "text", "clientMessageId": "<uuid>", "replyToMessageId": 42 }
+```
+
+- **形态校验先于限流消费**：`replyToMessageId` 若出现必须是正整数（拒绝字符串、负数、小数与超过 2^53 的值——超出后 JSON 双精度已无法精确表示，落库会得到另一个 ID）；形态非法返回 `InvalidRequest (1000)`，不占用发消息限流额度。
+- **语义校验**：被引用消息必须存在**且属于本次发送的同一会话**，否则同样回 `InvalidRequest`（"不存在"与"不属于本会话"不区分，避免成为跨会话消息的存在性探测）。私聊路径的会话 ID 在"获取或创建会话"之后才确定，故校验落在该点之后、写库之前；群路径在成员校验之后。
+- 事务语义不变：私聊路径的消息入库与预密钥消费仍在同一事务内；被拒请求不落库。
+
+### 引用摘要的渲染边界
+
+- 服务端只存/只回 `reply_to_message_id` 与从被引用消息带出的发送者名，**不产出任何摘要文本**。
+- 客户端渲染引用块时按 `replyToMessageId` 查本地引用预览表（由已解密/已缓存的消息建立）：命中则显示"发送者名 + 摘要"，未命中（被引用消息不在当前加载页或本地缓存）显示服务端带出的发送者名 + "原消息不可见"占位。
+- 被引用消息被**编辑**时引用块摘要随之刷新（引用始终指向原消息 ID，不因编辑改指向）；被引用消息被**删除**时引用块显示"已删除的消息"占位。
+- 引用消息经 `sync_events` 离线补偿与 `sync_messages` 历史重载都保留引用字段（事件 payload 与历史响应同口径）；持久化 outbox 保留引用目标，重启后重发的回复不会退化成普通消息。
 
 ## M8 媒体、文件与对象存储（M8.1 控制面与存储地基，2026-09-10）
 

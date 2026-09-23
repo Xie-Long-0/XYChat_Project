@@ -18,6 +18,8 @@
 #include <QDateTime>
 #include <QHash>
 #include <QSet>
+
+#include <cmath>
 #include <QUuid>
 #include <QMetaObject>
 
@@ -830,6 +832,15 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         return;
     }
 
+    // M11B B2: 引用目标形态校验（与幂等键同置，跑在限流消费之前——畸形请求
+    // 不该占用发送配额）；语义校验（是否本会话消息）在各自路径拿到会话 ID 后做
+    qint64 replyToMessageId = 0;
+    if (!parseReplyTarget(request, &replyToMessageId)) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "Invalid replyToMessageId");
+        return;
+    }
+
     // M11: 发消息限流（连接级固定窗口，覆盖私聊与群聊两条分流路径），抑制刷消息/DoS。
     // 超限返回 RateLimited，客户端视为瞬时失败：保留 outbox 并短退避后自动重刷，不丢消息。
     if (!m_sendWindow.allow(QDateTime::currentSecsSinceEpoch())) {
@@ -841,7 +852,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     // M7a: 按目标分流：conversationId 走群聊明文路径，toUserId 走私聊 E2EE 路径
     const qint64 groupConvId = request.value("conversationId").toVariant().toLongLong();
     if (groupConvId > 0) {
-        processSendGroupMessage(packet, request, groupConvId, clientMessageId);
+        processSendGroupMessage(packet, request, groupConvId, clientMessageId, replyToMessageId);
         return;
     }
 
@@ -951,6 +962,17 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         return;
     }
 
+    // M11B B2: 引用目标必须属于本会话（会话在此刻才确定/创建，故校验放在此处）。
+    // 跨会话引用会被客户端按会话隔离的本地缓存查不到，且可用它探测其他会话的
+    // 消息是否存在，故一律拒绝（不区分"不存在"与"不在本会话"）
+    QString replySender;
+    if (replyToMessageId > 0
+        && !resolveReplyTarget(replyToMessageId, convId, &replySender)) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "Invalid replyToMessageId");
+        return;
+    }
+
     // M6 审查修复：消息入库与预密钥消费绑定为原子单元，
     // 避免消息已投递但预密钥悬挂在 claimed 状态
     m_db->beginTransaction();
@@ -962,7 +984,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     bool fileNotReady = false;
     const qint64 msgId = m_db->sendMessage(convId, m_authenticatedUserId, content,
                                            contentType, clientMessageId, m_currentDeviceId,
-                                           fileId, &fileNotReady);
+                                           fileId, &fileNotReady, replyToMessageId);
     if (msgId < 0) {
         m_db->rollbackTransaction();
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
@@ -996,6 +1018,12 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         // M8: fileId > 0 时接收端据此把解密后的正文当作 FileManifest 解析，
         // 而不是当普通文本渲染
         ev["fileId"] = fileId;
+        // M11B B2: 引用字段随事件流一同回放（离线重建时引用块不丢）。只带 ID 与
+        // 被引用者的用户名，正文摘要由客户端本地解密被引用消息后渲染
+        if (replyToMessageId > 0) {
+            ev["replyToMessageId"] = replyToMessageId;
+            ev["replyToSender"] = replySender;
+        }
         const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
         m_db->appendSyncEvent(targetUserId, "message", evJson);
         m_db->appendSyncEvent(m_authenticatedUserId, "message", evJson);
@@ -1010,6 +1038,10 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     notifyJson["contentType"] = contentType;
     notifyJson["createdAt"] = createdAt;
     notifyJson["fileId"] = fileId;
+    if (replyToMessageId > 0) {
+        notifyJson["replyToMessageId"] = replyToMessageId;
+        notifyJson["replyToSender"] = replySender;
+    }
 
     Packet notifyPacket;
     notifyPacket.messageType = MessageType::NewMessageNotification;
@@ -1026,6 +1058,9 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     data["clientMessageId"] = clientMessageId;
     data["status"] = "sent";
     data["fileId"] = fileId;
+    if (replyToMessageId > 0) {
+        data["replyToMessageId"] = replyToMessageId;
+    }
     sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                  "Message sent", data);
 }
@@ -1168,6 +1203,11 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
         obj["createdAt"] = m.createdAt;
         // M8: 文件关联（为 0 表示普通消息），与实时推送/sync_events 保持同一口径
         obj["fileId"] = m.fileId;
+        // M11B B2: 引用字段（同口径：只回 ID 与被引用者用户名，服务端不产出摘要）
+        if (m.replyToMessageId > 0) {
+            obj["replyToMessageId"] = m.replyToMessageId;
+            obj["replyToSender"] = m.replyToSender;
+        }
         // M9 特性栈：编辑/删除标记（离线重登经 sync_messages 重建编辑/删除状态）
         obj["deleted"] = m.deleted;
         if (!m.editedAt.isEmpty()) {
@@ -1879,7 +1919,8 @@ void RequestHandler::processFetchGroupKeysRequest(const Packet &packet, const QJ
 
 // M7a: 群消息发送（明文入库 + fan-out；E2EE 在 M7b 用 Sender Keys 补齐）
 void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonObject &request,
-                                             qint64 conversationId, const QString &clientMessageId)
+                                             qint64 conversationId, const QString &clientMessageId,
+                                             qint64 replyToMessageId)
 {
     auto conv = m_db->getConversation(conversationId);
     if (!conv.has_value()) {
@@ -2003,12 +2044,22 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
         return;
     }
 
+    // M11B B2: 引用目标必须属于本群（群会话 ID 由调用方确定，成员校验已过）。
+    // 群消息正文对服务端是密文，引用摘要同样只由客户端本地渲染
+    QString replySender;
+    if (replyToMessageId > 0
+        && !resolveReplyTarget(replyToMessageId, conversationId, &replySender)) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "Invalid replyToMessageId");
+        return;
+    }
+
     // M8: 同私聊路径，文件状态在插入语句内原子复核（群路径无事务，更依赖
     // 单语句原子性来消除与维护任务回收的竞态）
     bool fileNotReady = false;
     const qint64 msgId = m_db->sendMessage(conversationId, m_authenticatedUserId, content,
                                            contentType, clientMessageId, m_currentDeviceId,
-                                           fileId, &fileNotReady);
+                                           fileId, &fileNotReady, replyToMessageId);
     if (msgId < 0) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      fileNotReady ? ErrorCode::FileNotReady : ErrorCode::InternalError,
@@ -2035,6 +2086,11 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
     ev["createdAt"] = createdAt;
     // M8: fileId > 0 时接收端据此把解密后的正文当作 FileManifest 解析
     ev["fileId"] = fileId;
+    // M11B B2: 引用字段（只带 ID 与用户名，摘要由客户端本地解密渲染）
+    if (replyToMessageId > 0) {
+        ev["replyToMessageId"] = replyToMessageId;
+        ev["replyToSender"] = replySender;
+    }
     const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
 
     // 在线推送给除发送方外的成员（小群直推 fan-out）
@@ -2059,6 +2115,9 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
     data["clientMessageId"] = clientMessageId;
     data["status"] = "sent";
     data["fileId"] = fileId;
+    if (replyToMessageId > 0) {
+        data["replyToMessageId"] = replyToMessageId;
+    }
     sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                  "Message sent", data);
 }
@@ -2348,6 +2407,64 @@ void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJs
 
     sendResponse(packet.requestId, MessageType::DeleteMessageResponse, ErrorCode::Ok,
                  "OK", ev);
+}
+
+// M11B B2: 引用目标形态校验（纯入参检查，不触库）。
+// 缺省/null/0 表示非引用消息；接受整数，拒绝字符串、负数、小数与超出
+// 2^53 的值（超出后 JSON 双精度已无法精确表示，落库会得到另一个 ID）
+bool RequestHandler::parseReplyTarget(const QJsonObject &request, qint64 *outId)
+{
+    if (outId) {
+        *outId = 0;
+    }
+    const QJsonValue value = request.value("replyToMessageId");
+    if (value.isUndefined() || value.isNull()) {
+        return true;
+    }
+    if (!value.isDouble()) {
+        return false;
+    }
+    const double asDouble = value.toDouble();
+    // JSON 解析产不出 NaN/Inf，但 static_cast<qint64>(NaN) 是 UB，
+    // 一处 isfinite 换掉这个理论上的未定义行为
+    if (!std::isfinite(asDouble)) {
+        return false;
+    }
+    if (asDouble <= 0) {
+        // 0 视同"无引用"（客户端省略该字段，容忍显式 0）
+        return asDouble == 0;
+    }
+    const qint64 asInt = static_cast<qint64>(asDouble);
+    if (static_cast<double>(asInt) != asDouble || asDouble > 9007199254740992.0) {
+        return false;
+    }
+    if (outId) {
+        *outId = asInt;
+    }
+    return true;
+}
+
+// M11B B2: 引用目标语义校验 + 取被引用消息的发送者名。
+// "不存在"与"不属于本会话"回同一结果（调用方回同一错误码），不构成存在性探测
+bool RequestHandler::resolveReplyTarget(qint64 replyToMessageId, qint64 conversationId,
+                                        QString *outSender)
+{
+    if (outSender) {
+        outSender->clear();
+    }
+    if (!m_db->isMessageInConversation(replyToMessageId, conversationId)) {
+        return false;
+    }
+    const auto target = m_db->getMessage(replyToMessageId);
+    // 两次读之间目标被硬删除（会话整表删除的并发窗口）时按校验失败处理：
+    // 引用一条正在消失的消息没有意义
+    if (!target.has_value()) {
+        return false;
+    }
+    if (outSender) {
+        *outSender = target->senderUsername;
+    }
+    return true;
 }
 
 // M8: 文件消息的 fileId 校验（send_message 私聊/群聊两条分流路径共用）

@@ -137,6 +137,9 @@ bool DatabaseManager::runMigrations()
     if (currentVersion < 10) {
         if (!migrateToV10()) return false;
     }
+    if (currentVersion < 11) {
+        if (!migrateToV11()) return false;
+    }
 
     return true;
 }
@@ -789,6 +792,44 @@ bool DatabaseManager::migrateToV10()
     return true;
 }
 
+// M11B B2: 引用（回复）目标列。只存被引用消息的 ID：正文对服务端是密文，
+// 引用摘要由客户端本地解密后渲染（服务端不接触明文，也不做摘要回填）
+bool DatabaseManager::migrateToV11()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V11...";
+
+    bool hasReplyTo = false;
+    if (q.exec("PRAGMA table_info(messages)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "reply_to_message_id") {
+                hasReplyTo = true;
+                break;
+            }
+        }
+    }
+    // 无外键约束：被引用消息被硬删除（会话整表删除）时列留悬空 ID，
+    // 客户端查不到即渲染为"原消息不可见"。加 ON DELETE 反而会让删除路径
+    // 多一层隐式写放大，而引用本身不承载任何数据
+    if (!hasReplyTo &&
+        !q.exec("ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER")) {
+        qCritical() << "[DB] V11: Failed to add messages.reply_to_message_id:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    q.prepare("INSERT INTO schema_version (version) VALUES (11)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V11: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V11 complete";
+    return true;
+}
+
 // 用户管理
 bool DatabaseManager::userExists(const QString &username)
 {
@@ -1420,7 +1461,8 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
                                     const QString &content, const QString &contentType,
                                     const QString &clientMessageId,
                                     const QString &senderDeviceId,
-                                    qint64 fileId, bool *fileNotReady)
+                                    qint64 fileId, bool *fileNotReady,
+                                    qint64 replyToMessageId)
 {
     if (fileNotReady) {
         *fileNotReady = false;
@@ -1440,14 +1482,14 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
     if (fileId > 0) {
         q.prepare(
             "INSERT INTO messages "
-            "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id, file_id) "
-            "SELECT ?, ?, ?, ?, 'sent', ?, ?, ? "
+            "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id, file_id, reply_to_message_id) "
+            "SELECT ?, ?, ?, ?, 'sent', ?, ?, ?, ? "
             "WHERE EXISTS (SELECT 1 FROM files WHERE id = ? AND status = 'ready')");
     } else {
         q.prepare(
             "INSERT INTO messages "
-            "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id, file_id) "
-            "VALUES (?, ?, ?, ?, 'sent', ?, ?, ?)");
+            "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id, file_id, reply_to_message_id) "
+            "VALUES (?, ?, ?, ?, 'sent', ?, ?, ?, ?)");
     }
     q.addBindValue(conversationId);
     q.addBindValue(senderId);
@@ -1460,6 +1502,8 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
     // M8: file_id 为 NULL 表示普通消息，文件消息写入 files.id。
     // 绑定无效 QVariant 即 NULL（区别于 0，使 IS NULL 判定与索引都更紧凑）
     q.addBindValue(fileId > 0 ? QVariant(fileId) : QVariant());
+    // M11B B2: 同上，非引用消息存 NULL
+    q.addBindValue(replyToMessageId > 0 ? QVariant(replyToMessageId) : QVariant());
     if (fileId > 0) {
         q.addBindValue(fileId); // 守卫子查询的 files.id
     }
@@ -1531,11 +1575,15 @@ std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
     QSqlQuery q(db);
+    // M11B B2: 引用目标的发送者名一并带出（被引用正文仍是密文，服务端不产出摘要）。
+    // 被引用消息可能已被硬删除，故两级 LEFT JOIN 后回复者名为空，客户端渲染占位
     q.prepare(
         "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
         "  m.content, m.content_type, m.status, m.created_at, "
-        "  m.edited_at, m.deleted, m.file_id "
+        "  m.edited_at, m.deleted, m.file_id, m.reply_to_message_id, ru.username "
         "FROM messages m JOIN users u ON m.sender_id = u.id "
+        "LEFT JOIN messages r ON r.id = m.reply_to_message_id "
+        "LEFT JOIN users ru ON ru.id = r.sender_id "
         "WHERE m.id = ?");
     q.addBindValue(messageId);
     if (q.exec() && q.next()) {
@@ -1551,9 +1599,30 @@ std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
         mi.editedAt = q.value(8).toString();
         mi.deleted = q.value(9).toInt() != 0;
         mi.fileId = q.value(10).toLongLong();
+        mi.replyToMessageId = q.value(11).toLongLong();
+        mi.replyToSender = q.value(12).toString();
         return mi;
     }
     return std::nullopt;
+}
+
+// M11B B2: 引用目标校验。被引用消息必须存在且属于同一会话——跨会话引用会让
+// 接收方看到一个指向"别的会话里的消息"的引用块，而该消息的本地副本按会话
+// 隔离存放，永远查不到；同时这也封掉用引用 ID 探测其他会话消息存在性的路
+bool DatabaseManager::isMessageInConversation(qint64 messageId, qint64 conversationId)
+{
+    if (messageId <= 0 || conversationId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT COUNT(*) FROM messages WHERE id = ? AND conversation_id = ?");
+    q.addBindValue(messageId);
+    q.addBindValue(conversationId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt() > 0;
+    }
+    return false;
 }
 
 QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 beforeId, int limit)
@@ -1566,8 +1635,10 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
         q.prepare(
             "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
             "  m.content, m.content_type, m.status, m.created_at, "
-            "  m.edited_at, m.deleted, m.file_id "
+            "  m.edited_at, m.deleted, m.file_id, m.reply_to_message_id, ru.username "
             "FROM messages m JOIN users u ON m.sender_id = u.id "
+            "LEFT JOIN messages r ON r.id = m.reply_to_message_id "
+            "LEFT JOIN users ru ON ru.id = r.sender_id "
             "WHERE m.conversation_id = ? AND m.id < ? "
             "ORDER BY m.id DESC LIMIT ?");
         q.addBindValue(conversationId);
@@ -1577,8 +1648,10 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
         q.prepare(
             "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
             "  m.content, m.content_type, m.status, m.created_at, "
-            "  m.edited_at, m.deleted, m.file_id "
+            "  m.edited_at, m.deleted, m.file_id, m.reply_to_message_id, ru.username "
             "FROM messages m JOIN users u ON m.sender_id = u.id "
+            "LEFT JOIN messages r ON r.id = m.reply_to_message_id "
+            "LEFT JOIN users ru ON ru.id = r.sender_id "
             "WHERE m.conversation_id = ? "
             "ORDER BY m.id DESC LIMIT ?");
         q.addBindValue(conversationId);
@@ -1599,6 +1672,8 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
             mi.editedAt = q.value(8).toString();
             mi.deleted = q.value(9).toInt() != 0;
             mi.fileId = q.value(10).toLongLong();
+            mi.replyToMessageId = q.value(11).toLongLong();
+            mi.replyToSender = q.value(12).toString();
             result.prepend(mi); // 按时间正序排列
         }
     }
@@ -1613,8 +1688,10 @@ QList<MessageInfo> DatabaseManager::syncMessages(qint64 conversationId, qint64 a
     q.prepare(
         "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
         "  m.content, m.content_type, m.status, m.created_at, "
-        "  m.edited_at, m.deleted, m.file_id "
+        "  m.edited_at, m.deleted, m.file_id, m.reply_to_message_id, ru.username "
         "FROM messages m JOIN users u ON m.sender_id = u.id "
+        "LEFT JOIN messages r ON r.id = m.reply_to_message_id "
+        "LEFT JOIN users ru ON ru.id = r.sender_id "
         "WHERE m.conversation_id = ? AND m.id > ? "
         "ORDER BY m.id ASC LIMIT ?");
     q.addBindValue(conversationId);
@@ -1634,6 +1711,8 @@ QList<MessageInfo> DatabaseManager::syncMessages(qint64 conversationId, qint64 a
             mi.editedAt = q.value(8).toString();
             mi.deleted = q.value(9).toInt() != 0;
             mi.fileId = q.value(10).toLongLong();
+            mi.replyToMessageId = q.value(11).toLongLong();
+            mi.replyToSender = q.value(12).toString();
             result.append(mi);
         }
     }

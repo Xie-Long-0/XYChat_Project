@@ -16,7 +16,8 @@ Rectangle {
     signal addContactRequested(int userId)
     signal loadConversationsRequested()
     signal loadMessagesRequested(int conversationId, int afterId)
-    signal sendMessageRequested(int peerUserId, string content)
+    // M11B B2: replyToMessageId > 0 表示这是对某条消息的回复（0 为普通消息）
+    signal sendMessageRequested(int peerUserId, string content, int replyToMessageId)
     signal logoutRequested()
     signal loadContactsRequested()
     signal createGroupRequested(string name, var memberIds)
@@ -24,7 +25,7 @@ Rectangle {
     signal leaveGroupRequested(int conversationId)
     signal kickGroupMemberRequested(int conversationId, int userId)
     signal getGroupInfoRequested(int conversationId)
-    signal sendGroupMessageRequested(int conversationId, string content)
+    signal sendGroupMessageRequested(int conversationId, string content, int replyToMessageId)
     signal setConversationPrefsRequested(int conversationId, bool pinned, bool muted)
     signal editMessageRequested(int conversationId, int peerUserId, int messageId, string content)
     signal deleteMessageRequested(int messageId)
@@ -75,6 +76,18 @@ Rectangle {
     // M11A A5: 待滚动到的消息 ID 与所属会话（搜索跳转时设置，消息加载完成后执行滚动）
     property int pendingScrollMessageId: 0
     property int pendingScrollConversationId: 0
+    // M11B B1: 发起批量删除的视图键（对话框确认时才需要，放进对话框会污染其语义）
+    property string selectionViewKey: ""
+    // M11B B3: 待转发正文快照（{messageId, content}）与发起视图键
+    property var forwardPayload: []
+    property string forwardSourceKey: ""
+    // 因不可转发（文件/系统/已删除/不可解密）被跳过的条数，仅用于结果提示
+    property int forwardSkippedCount: 0
+    // M11B B3: 定向发送的追踪目标。转发在 emit 发送信号前设置这两项，
+    // MainWindow 的同步槽在 send 返回后立刻调 trackOutgoingMessage 消费它们
+    //（信号在同一调用栈内同步分发，不存在交错；用后即清，不跨调用留存）
+    property string pendingTrackKey: ""
+    property int pendingTrackConversationId: 0
 
     // P4.1: 传输横幅改为 Repeater over fileTransfer.tasks，多任务并发时每个任务
     // 独立显示“文件名 · 相位 进度% + 进度条 + 取消”。横幅置于内容区上方全宽
@@ -336,12 +349,13 @@ Rectangle {
             anchors.fill: parent
             myUserId: mainPage.myUserId
 
-            onSendMessage: function(content) {
+            onSendMessage: function(content, replyToMessageId) {
                 if (view.isGroup) {
                     if (view.conversationId > 0)
-                        mainPage.sendGroupMessageRequested(view.conversationId, content)
+                        mainPage.sendGroupMessageRequested(view.conversationId, content,
+                                                           replyToMessageId)
                 } else if (view.peerUserId > 0) {
-                    mainPage.sendMessageRequested(view.peerUserId, content)
+                    mainPage.sendMessageRequested(view.peerUserId, content, replyToMessageId)
                 }
             }
             onGroupInfoRequested: {
@@ -359,18 +373,52 @@ Rectangle {
                 confirmDeleteDialog.open()
             }
             // P2.2: failed 气泡重发——先移除失败气泡，再按当前会话类型重发
-            // （经 MainWindow 走 networkManager.sendMessage，会新建“发送中”气泡）
-            onResendRequested: function(clientMessageId, content) {
+            // （经 MainWindow 走 networkManager.sendMessage，会新建“发送中”气泡）。
+            // M11B B2: 引用目标随重发带回，避免回复静默退化成普通消息
+            onResendRequested: function(clientMessageId, content, replyToMessageId) {
                 view.removeOptimisticMessage(clientMessageId)
                 if (view.isGroup) {
                     if (view.conversationId > 0)
-                        mainPage.sendGroupMessageRequested(view.conversationId, content)
+                        mainPage.sendGroupMessageRequested(view.conversationId, content,
+                                                           replyToMessageId)
                 } else if (view.peerUserId > 0) {
-                    mainPage.sendMessageRequested(view.peerUserId, content)
+                    mainPage.sendMessageRequested(view.peerUserId, content, replyToMessageId)
                 }
             }
+            // M11B B2: 视图内的一句话提示（引用跳转未命中），统一走顶部横幅
+            onNoticeRequested: function(text) { mainPage.fileNotice = text }
             onCopyRequested: function(content) {
                 mainPage.copyToClipboard(content)
+            }
+            // M11B B1: 多选工具栏的批量删除。确认后逐条下发删除请求，服务端
+            // 按发送者校验、edit/delete 共用 20/60s 限流（超出部分失败并提示，
+            // 见 ROADMAP 已知限制）
+            onDeleteSelectedRequested: function(messageIds) {
+                if (!messageIds || messageIds.length === 0) return
+                mainPage.selectionViewKey = mainPage.keyForView(view)
+                confirmDeleteDialog.messageIds = messageIds
+                confirmDeleteDialog.titleText = "删除消息"
+                confirmDeleteDialog.bodyText = "选中的 " + messageIds.length
+                    + " 条消息将被删除，所有会话成员都将看到“消息已删除”，此操作不可撤销。是否继续？"
+                confirmDeleteDialog.open()
+            }
+            // M11B B3: 转发——打开前把正文抓成快照（对话框模态，期间选择集不再
+            // 变化；快照也让"确认后目标会话才创建视图"这类时序问题不存在）
+            onForwardSelectedRequested: function(messageIds) {
+                var payload = []
+                for (var i = 0; i < messageIds.length; i++) {
+                    var msg = view.getMessageById(messageIds[i])
+                    if (msg && view.forwardableRow(msg)) {
+                        payload.push({ messageId: messageIds[i], content: msg.content })
+                    }
+                }
+                if (payload.length === 0) return
+                mainPage.forwardPayload = payload
+                mainPage.forwardSkippedCount = messageIds.length - payload.length
+                mainPage.forwardSourceKey = mainPage.keyForView(view)
+                forwardDialog.messageIds = messageIds
+                forwardDialog.conversations = convList.conversationSummaries()
+                forwardDialog.open()
             }
             // P3.2: 转发“正在输入”信号（需已有会话 ID；新会话首条消息前无 ID，跳过）
             onTypingSignal: function(typing) {
@@ -484,6 +532,15 @@ Rectangle {
         id: confirmDeleteDialog
         onConfirmed: function(messageId) { mainPage.deleteMessageRequested(messageId) }
         onConversationConfirmed: function(conversationId) { mainPage.deleteConversationRequested(conversationId) }
+        // M11B B1: 批量删除——先退出选择模式（选择集随之清空），再逐条下发
+        onBatchConfirmed: function(messageIds) {
+            var view = mainPage.chatViews[mainPage.selectionViewKey]
+            mainPage.selectionViewKey = ""
+            if (view) view.exitSelectionMode()
+            for (var i = 0; i < messageIds.length; i++) {
+                mainPage.deleteMessageRequested(messageIds[i])
+            }
+        }
     }
 
     ImagePreviewDialog {
@@ -551,6 +608,21 @@ Rectangle {
                 mainPage.pendingScrollConversationId = conversationId
                 mainPage.openConversation(conv)
             }
+        }
+    }
+
+    // M11B B3: 转发目标选择对话框（会话快照在打开前注入）
+    ForwardDialog {
+        id: forwardDialog
+        onForwardConfirmed: function(messageIds, conversationId, isGroup, peerUserId) {
+            mainPage.performForward(conversationId, isGroup, peerUserId)
+        }
+        // 取消/关闭：丢弃快照（保留源视图的选择态，用户可能改选别的动作）。
+        // 确认路径已自行清空，这里是幂等的
+        onClosed: {
+            mainPage.forwardPayload = []
+            mainPage.forwardSourceKey = ""
+            mainPage.forwardSkippedCount = 0
         }
     }
 
@@ -661,6 +733,13 @@ Rectangle {
     //（尚无 ID）用 "p<peerUserId>"，确认后由 adoptPendingView 迁移到正式键
     function viewKeyForConversation(conversationId) { return "c" + conversationId }
     function viewKeyForPeer(peerUserId) { return "p" + peerUserId }
+    // M11B B1: 由视图自身状态反推其键（键规则与 createView 一致：群/已有会话
+    // ID 的私聊用 c<id>，首条消息发出前的私聊用 p<peerId>）
+    function keyForView(view) {
+        if (!view) return ""
+        if (view.isGroup || view.conversationId > 0) return viewKeyForConversation(view.conversationId)
+        return viewKeyForPeer(view.peerUserId)
+    }
     function viewForConversation(conversationId) { return chatViews[viewKeyForConversation(conversationId)] }
     function activeView() { return chatViews[activeViewKey] }
 
@@ -887,22 +966,83 @@ Rectangle {
         }
     }
 
-    function trackOutgoingMessage(clientMessageId, content) {
-        var view = activeView()
-        if (!view) return
-        view.appendOptimisticMessage(clientMessageId, content)
+    function trackOutgoingMessage(clientMessageId, content, replyToMessageId) {
+        // M11B B3: 目标视图/会话默认是当前活动的；转发路径在 emit 前注入
+        // 目标键（见 pendingTrackKey 的说明），此处用后即清
+        var targeted = pendingTrackKey.length > 0
+        var key = targeted ? pendingTrackKey : activeViewKey
+        var convId = pendingTrackConversationId > 0 ? pendingTrackConversationId
+                                                    : currentConversationId
+        pendingTrackKey = ""
+        pendingTrackConversationId = 0
+        var view = chatViews[key]
+        // 目标会话尚未打开（无视图）时不建视图：只为一条乐观气泡就把用户的
+        // 会话切出去/挤掉缓存的视图不值得，消息在服务端落库后，下次打开该
+        // 会话经历史同步自然出现
+        if (view) view.appendOptimisticMessage(clientMessageId, content, replyToMessageId || 0)
         if (clientMessageId && clientMessageId.length > 0) {
-            pendingSentKeys[clientMessageId] = activeViewKey
+            // 无视图时也登记：确认/失败回调靠它判断"这条在途消息该落到哪"，
+            // 不留登记会让失败回退到"标记活动视图的最早发送中气泡"——那会
+            // 误伤另一个会话的消息
+            pendingSentKeys[clientMessageId] = key
         }
-        if (currentConversationId > 0) {
+        if (convId > 0) {
             var now = new Date()
             var hh = now.getHours()
             var mm = now.getMinutes()
             var timeStr = (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm
-            convList.updateForNewMessage(currentConversationId, content, timeStr, false)
-            // M11A A4: 发送成功后清除该会话的草稿
-            delete drafts[activeViewKey]
+            convList.updateForNewMessage(convId, content, timeStr, false)
+            // M11A A4: 发送成功后清除该会话的草稿。仅限"当前会话发送"——
+            // 转发时目标会话并未被编辑，清掉它的草稿是误伤
+            if (!targeted) delete drafts[key]
         }
+    }
+
+    // M11B B3: 逐条转发。正文已在本端解密，重新经既有发送路径投递即得到目标
+    // 会话自己的 E2EE 密文（服务端无协议改动）；文件消息不在可转发子集里
+    //（需按目标会话重加密清单，见 ROADMAP 已知限制）
+    function performForward(conversationId, isGroup, peerUserId) {
+        var payload = forwardPayload
+        var skipped = forwardSkippedCount
+        var sourceKey = forwardSourceKey
+        forwardPayload = []
+        forwardSourceKey = ""
+        forwardSkippedCount = 0
+        var sourceView = chatViews[sourceKey]
+        if (sourceView) sourceView.exitSelectionMode()
+        if (payload.length === 0) return
+        if (isGroup && conversationId <= 0) return
+        if (!isGroup && peerUserId <= 0) return
+        for (var i = 0; i < payload.length; i++) {
+            sendContentTo(isGroup, isGroup ? conversationId : peerUserId,
+                          conversationId, peerUserId, payload[i].content)
+        }
+        // 提示用"正在转发"而非"已转发"：服务端确认/失败是异步到达的，
+        // 此刻只有乐观气泡进了发送队列
+        fileNotice = skipped > 0
+            ? "正在转发 " + payload.length + " 条，跳过 " + skipped + " 条（文件或无可转发内容）"
+            : "正在转发 " + payload.length + " 条消息"
+    }
+
+    // M11B B3: 向指定会话发送一条文本。与 sendMessageRequested 的差别在于目标
+    // 不一定是当前会话，乐观气泡与在途登记必须落到目标会话的视图/键上。
+    // 转发不带引用（replyToMessageId=0）：被转发正文的目标会话里没有原消息，
+    // 带上引用 ID 只会让接收端渲染出"原消息不可见"
+    function sendContentTo(isGroup, targetId, conversationId, peerUserId, content) {
+        var key = conversationId > 0 ? viewKeyForConversation(conversationId)
+                                     : viewKeyForPeer(peerUserId)
+        pendingTrackKey = key
+        pendingTrackConversationId = conversationId
+        if (isGroup) {
+            sendGroupMessageRequested(targetId, content, 0)
+        } else {
+            sendMessageRequested(targetId, content, 0)
+        }
+        // 兜底清理：发送入口在自身前置校验失败时（如群 ID 非法、sendGroupMessage
+        // 提前返回空幂等键）不会回来消费这两个值，残留会让下一条被跟踪的消息
+        // 把乐观气泡与会话预览落到这个旧目标上
+        pendingTrackKey = ""
+        pendingTrackConversationId = 0
     }
 
     function updateConversations(conversations) {
@@ -1051,6 +1191,13 @@ Rectangle {
         pendingSentKeys = ({})
         pendingScrollMessageId = 0
         pendingScrollConversationId = 0
+        // M11B: 多选/转发状态不跨账号残留
+        selectionViewKey = ""
+        forwardPayload = []
+        forwardSourceKey = ""
+        forwardSkippedCount = 0
+        pendingTrackKey = ""
+        pendingTrackConversationId = 0
         searchMode = "chat"
         showEmptyState()
         convList.reset()
