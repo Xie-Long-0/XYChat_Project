@@ -1,8 +1,8 @@
 # XYChat 架构概览
 
-> 本文档描述当前架构实态（截至 2026-09-14，M10 UI 重构与体验完善完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
+> 本文档描述当前架构实态（截至 2026-09-23，M13 退群语义与本地历史治理完成后）；历次里程碑的演进过程与修复记录见下文各记录节，完整时间线见 `docs/ROADMAP.md` 变更记录表。
 
-## 当前组件（M11B 完成后）
+## 当前组件（M13 完成后）
 
 ```text
 Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
@@ -17,7 +17,7 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
-- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善，M10 建立统一视觉系统 + 基础组件库 + 全局反馈层并将 MainPage 拆分为独立对话框），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路，M10 起接入会话整表删除（`deleteConversation`）与“正在输入”指示（`sendTyping` 每会话 4s 节流 + `typingReceived` 信号），M11A 起接入桌面通知（`desktopNotificationRequested` 信号）与本地消息搜索（`searchMessages`），M11B 起 `sendMessage`/`sendGroupMessage` 支持 `replyToMessageId` 并把它纳入持久化 outbox）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`，M10：新增 `deleteConversation` 清理本地会话与消息缓存，M11A：新增 `isConversationMuted`/`conversationDisplayName`/`conversationType`/`searchMessages` 辅助查询，M11B：消息表新增 `reply_to_message_id`/`reply_to_sender` 两列、outbox 新增 `reply_to_message_id` 列，均对存量库幂等补列）、`core/AppSettings`（M11A：统一设置管理，替代原 `ThemeSettings`，QSettings 持久化 darkMode/通知/预览/托盘偏好；M11B：新增 `recentEmojis` 最近使用表情）、`core/TrayManager`（M11A：系统托盘 `QSystemTrayIcon` 管理，最小化/恢复/退出菜单/桌面通知/点击跳转）与 `models/User`。
+- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善，M10 建立统一视觉系统 + 基础组件库 + 全局反馈层并将 MainPage 拆分为独立对话框），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互，M9 起接入会话偏好置顶/免打扰与消息编辑/删除的请求/响应/推送/sync_events 全链路，M10 起接入会话整表删除（`deleteConversation`）与“正在输入”指示（`sendTyping` 每会话 4s 节流 + `typingReceived` 信号），M11A 起接入桌面通知（`desktopNotificationRequested` 信号）与本地消息搜索（`searchMessages`），M11B 起 `sendMessage`/`sendGroupMessage` 支持 `replyToMessageId` 并把它纳入持久化 outbox，M13 起退群携带本机历史去向（`leaveGroup(conversationId, deleteLocalHistory)`）、会话列表按服务端权威对账并把"已退出但保留历史"的群会话标记为只读（`reconcileConversations` + `conversationLeft` 信号）、新增仅删本机的 `deleteLocalConversation`）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对；M9：会话缓存新增 `pinned`/`muted` 并按 pinned DESC 排序、消息缓存新增 `edited_at`/`deleted` 与 `updateMessageContent`/`markMessageDeleted`/`clearDecryptedContent`，M10：新增 `deleteConversation` 清理本地会话与消息缓存，M11A：新增 `isConversationMuted`/`conversationDisplayName`/`conversationType`/`searchMessages` 辅助查询，M11B：消息表新增 `reply_to_message_id`/`reply_to_sender` 两列、outbox 新增 `reply_to_message_id` 列，均对存量库幂等补列，**M13：会话表新增 `left_group` 列（已退出但保留历史）、新增 `conversation_clear_marks` 表（本地清空水位）与 `setConversationLeft`/`reconcileConversations`/`purgeConversation`/`conversationClearMark`**）、`core/AppSettings`（M11A：统一设置管理，替代原 `ThemeSettings`，QSettings 持久化 darkMode/通知/预览/托盘偏好；M11B：新增 `recentEmojis` 最近使用表情）、`core/TrayManager`（M11A：系统托盘 `QSystemTrayIcon` 管理，最小化/恢复/退出菜单/桌面通知/点击跳转）与 `models/User`。
 - `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包；M9 新增会话偏好/消息编辑/消息删除三个处理器；M11 前置：发消息/搜索连接级限流 RateWindow + 结构化审计日志；**M8.1 新增文件控制面五个处理器**（申请上传/续传查询/宣告完成/取消/下载票据）与 `send_message` 的 `fileId` 校验），管理 session 路由与在线状态，访问 SQLite。**M8.1 新增 `storage/`**：`IObjectStorage` 抽象与 `LocalFileStorage` 实现（由 `Server` 创建并注入各 handler，存储初始化失败则不注入，文件相关接口一律 fail-closed 回 `FileStorageFailed`）；`Server` 维护连接新增 `pruneFileUploads`（与 `pruneSyncEvents` 共用定时器）。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；`FileProtocol`（M8.1：`FileManifest` 编解码、分片数学与体积/分片/票据常量，客户端与服务端共用同一组常量以免校验口径漂移）；
@@ -128,6 +128,18 @@ M11B 按 B1 多选 → B3 转发 → B2 回复/引用 → B4 emoji 的顺序落�
 - **B4 emoji 选择器（纯 QML）**：输入区 emoji 按钮弹出 `Popup`（`objectName: "emojiPopup"`；8 列固定网格 + "最近使用"两行），插入到光标处并把焦点交还输入框；最近使用去重前置、上限 16，经 `AppSettings.recentEmojis`（QSettings，空格分隔）持久化。**面板定位有两处踩坑**（实机验收暴露后修复）：① 位置不用 `x/y` 绑定而改由 `aboutToShow`/`onOpened`/`onHeightChanged` 调 `positionEmojiPanel()` 显式计算——绑定的首次求值可能早于窗口/版式就绪（`mapToItem` 得到 0），之后依赖不再变化，面板就永久停在兜底位置；② 面板尺寸显式给出（`8 × cellSize + padding`），不依赖打开瞬间尚未抛光的内容隐式高度，否则打开会按旧高度落位、底部溢出窗口。面板挂 `Overlay.overlay`（窗口坐标系），位置夹取进窗口；网格在窗口过矮被挤压时才转为可滚动（正常尺寸不滚动）。
 - **测试**：`TestDatabaseManager` 三条（V11 列/版本、引用字段三条读路径往返、引用目标必须同会话）与 `TestTlsIntegration` 两条（真实连接收发引用消息并跨账号回读、非法引用一律拒绝且不落库）覆盖服务端协议面；`TestLocalStore` 两条（引用字段回读与部分 upsert 不清空、outbox 保留引用目标）覆盖本地缓存；QML 行为用 Qt Quick Test 覆盖（`out/tst_m11b.qml`，19 项：选择集增删/可用性判定/服务端删除后剔除/预览表随编辑删除刷新/回复目标与发送回传/失败重发带回引用/引用跳转定位/emoji 插入与上限/emoji 面板几何）。
 
+### 退群语义与本地历史治理（M13，2026-09-23）
+
+修复一处用户报告的缺陷并顺带补齐退群的本地语义：**退群后刷新会话列表，已退出的群会重新出现且无法从列表中删除**。根因是客户端把本地缓存当"只增不减"的展示源——服务端不再返回该会话（成员行已删），但对账只做 upsert 不做标记，于是任何一次缓存先行（下次登录的 `emitCachedConversations`、已读游标、会话偏好推送）都会把这条失效会话重新显示出来；而它又不是"会话"（M10 的整表删除仅成员可发起、群聊仅群主可删），右键菜单里的"删除会话"必然被服务端拒绝，形成死结。**本轮无线上协议变更、无服务端改动**（退群请求形态与踢人推送均不变，服务端早已独立拒绝非成员的一切成员态操作）。
+
+- **会话列表对账（服务端权威）**：`LocalStore::reconcileConversations` 在单事务内落库服务端返回的会话（同时**清除其"已退出"标记**——服务端仍返回即表示本端已重新成为成员，重加入由此自动复位）并把服务端**不再返回的本地群会话**标记为已退出（`left_group = 1`，顺带清零未读、置顶与免打扰：退出后未读无意义、置顶/免打扰入口已收起，不能留下无法取消的状态）。**空列表不作失权证据**——服务端 `getConversationsForUser` 在 SQL 出错时返回空列表却仍回 `Ok`，据此批量标记会让本端全体群聊误置只读；跳过标记的代价只是多留几个可写入口（服务端仍会拒绝发送），远小于误报。**私聊不参与对账**——其存续由 `conversation_deleted` 事件保证，在服务端列表缺席不代表失效。`NetworkManager::handleGetConversationsResponse` 必须 emit **对账后的本地列表**而非服务端原数组：已退出的会话服务端不再返回，按服务端数组刷新会被 `ConversationList` 当作已消失而移除，随后又被缓存先行显示出来（即本缺陷根因）。该 emit 也使会话列表只剩"本地缓存"一个来源（此前 5 处 emit 混用服务端数组与缓存），排序随之统一为本地口径 `pinned DESC, last_message_at DESC`——置顶恒在顶部（与 `applyPrefs` 的置顶重排一致）。
+- **退群的本地去向由用户选择**：`GroupInfoDialog` 的"退出群聊"不再直接退群，改由 `LeaveGroupDialog` 二选一（对齐主流 IM 的"退出 / 退出并删除聊天记录"），选择随 `leaveGroup(conversationId, deleteLocalHistory)` 登记在**在途请求多槽**（`QHash<requestId, bool>`，并发退多个群时先发那次的选择不会被后发覆盖）。响应分支：**仅退出**→ 打 `left_group` 标记并立即 emit 本地列表（会话留在列表、只读，历史完整保留）；**退出并删除记录**→ `LocalStore::purgeConversation` 清空本地缓存并记下**清空水位**后 emit `conversationDeleted`（复用 M10 的会话移除路径）。**清理失败不得谎报删除**：本地库未开或 SQLite 出错时退化为"保留历史"的只读态并回 `conversationDeleteFailed`——UI 移除条目而数据仍在正是"删了又出现"的再生路径，宁可留在列表让用户重试。
+- **清空水位（`conversation_clear_marks`）**：服务端仍保留该群历史（退群不删服务端数据），故必须记住"本地已清空到哪个消息 ID"，否则重新加入时 `sync_messages(afterId=0)` 会把用户已删除的历史原样拉回。水位取三者较大者——既有水位（多次"退出-重加入-再退出"只前进）、本地消息表最大 ID、会话行缓存的 `last_message_id`（从未打开过的会话本地没有消息行，只按前者会取到 0 而失效）；`NetworkManager::syncMessages` 经 `applyClearMarkFloor` 把服务端起拉点抬到水位（`afterId = max(afterId, mark)`），本地缓存先行展示不受影响。
+- **被移出/他端退群默认保留历史**：实时推送（`handleGroupChangedNotification`）与离线补偿（`ingestSyncEvents` 的 `group_changed`）在本端失去成员资格时打 `left_group` 标记并发 `conversationLeft` 信号，**不再像此前那样销毁会话与历史**；`MainWindow` 收到该信号只提示，聊天区照常打开但置只读。
+- **只读态（QML）**：`ChatView.readOnly` 驱动——输入区替换为提示条（"你已退出该群聊，无法发送消息" + "删除聊天记录"出口）、群信息入口收起（非成员调 `get_group_info` 必被拒）、消息气泡的回复/多选/编辑/删除收起（仅留复制）。`ConversationList` 的已退出条目预览位显示"你已退出该群聊"，右键菜单只留"删除聊天记录"（服务端整表删除对非成员必失败，改走 `deleteLocalConversation`——仅清本机、不触碰服务端），偏好项一并收起；已退出的群不作为转发目标（发不出去）。
+- **测试**：`TestLocalStore` 三条（`left_group` 往返与重加入复位、对账只标记缺席群且私聊不受影响、清空水位在重加入后仍生效且只前进）；`TestNetworkManager` 一条（`applyClearMarkFloor` 抬升起拉点、不高于水位时不回退、其他会话不受影响）；QML 行为用例 5 项（`out/tst_m13.qml`：只读态替换输入区与群信息入口、只读态传到消息气泡、已退出条目的预览与菜单只剩本机删除且路由正确、在群条目仍走服务端删除、退群对话框两个出口互不串台）。负向对照 4 项（回退只读绑定、回退删除路由、回退菜单收起、破坏对账标记）均在改回旧行为后如实失败。
+- **已知限制**：本地清空仅作用于**本机**——同一账号在另一设备上保留着该群的历史（"退出并删除记录"无法跨设备广播：服务端已在本端移除成员资格，推送无从投递），该设备会在下一次会话列表对账时把它标记为"已退出但保留历史"；重新加入后按水位同步，早于水位的本地历史不再复活，但**退出期间**他人发送的消息（ID 晚于水位）会被取回，其中群 E2EE 消息可能因 ratchet 已推进而显示为不可解密。
+
 ### 客户端本地加密持久化缓存（M6.5）
 
 - `LocalStore`（AppData/localstore，SQLite，按账号+设备隔离）：会话/消息/持久化 outbox/解密缓存/sync_events 游标；消息正文与会话预览以 AES-256-GCM 加密后落库（格式 `enc1:<iv>:<密文+标签>`），磁盘上不存在可读明文；M7a 起会话缓存额外携带群名/成员数，持久化 outbox 支持群消息目标（conversationId）。
@@ -233,6 +245,8 @@ FileTransferManager                                FileTransferManager
 V10 还为 `messages.file_id` 建 `idx_messages_file`，使“文件是否被未删除消息引用”的回收判定不全表扫描。
 
 messages 表幂等唯一约束：`UNIQUE(sender_id, sender_device_id, client_message_id)`（部分索引，仅对非空幂等键生效，存量旧数据不受影响）。
+
+**M13 无服务端 schema 变更**（退群沿用既有 `leave_group` 与成员行删除，本机历史治理全在客户端）：客户端 `LocalStore` 新增 `conversations.left_group` 列（存量库幂等补列，`1` 表示已退出但保留历史）与 `conversation_clear_marks` 表（`conversation_id` 主键 + `cleared_before_message_id` + `cleared_at`，记录本地清空水位，**不随会话行删除**——会话行被清空后水位仍要在重新加入时生效）。
 
 ## 客户端架构（M4 已落地，M4.5 完善）
 
@@ -350,9 +364,9 @@ M6 首次实现后经代码审查发现并修复：
 
 ## 下一步演进
 
-M0-M7b、M9、M8.1/M8.2/M8.3（文件与对象存储地基 + 数据面与客户端 + 多媒体元数据与预览）与 M10（UI 重构与体验完善）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
+M0-M7b、M9、M8.1/M8.2/M8.3（文件与对象存储地基 + 数据面与客户端 + 多媒体元数据与预览）、M10（UI 重构与体验完善）、M11A/M11B（桌面集成与消息交互增强）、M12（聊天流畅性与多会话体验）与 M13（退群语义与本地历史治理）已完成（明细见上文各节与 `docs/ROADMAP.md` §2 已完成能力摘要）。后续演进方向以 ROADMAP 为唯一权威来源：
 
-- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M10 明确排除项如本地消息搜索/系统托盘/桌面通知/草稿/设置页，以及 M11 稳定性与可运维）。
+- 候选任务与建议执行顺序见 `docs/ROADMAP.md` §5（M11C 群聊与布局完善、M11 稳定性与可运维、M8 遗留收尾）。
 - 集中登记的欠账与风险见 `docs/ROADMAP.md` §3（P1/P2/P3 分级）。
 
 本文档不再维护逐里程碑的演进流水账，新增架构实态变化时直接更新对应章节。

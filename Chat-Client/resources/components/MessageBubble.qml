@@ -66,6 +66,8 @@ Item {
     property string clientMessageId: ""
     property bool selectionMode: false
     property bool selected: false
+    // M13: 只读会话（已退出的群聊）——回复/多选/编辑/删除一律收起，仅留复制
+    property bool readOnly: false
 
     // M11B B2: 引用（回复）。摘要由客户端本地渲染（服务端只有密文），
     // replyToSender 是服务端回传的被引用者名——仅在本地预览表未命中时用作回退
@@ -465,8 +467,10 @@ Item {
 
                         MouseArea {
                             anchors.fill: parent
-                            cursorShape: parent.status === "failed" ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            enabled: parent.status === "failed"
+                            cursorShape: parent.status === "failed" && !messageBubble.readOnly
+                                         ? Qt.PointingHandCursor : Qt.ArrowCursor
+                            // M13: 只读会话（已退出群聊）重发必失败，不予响应
+                            enabled: parent.status === "failed" && !messageBubble.readOnly
                             onClicked: messageBubble.resendRequested()
                         }
                     }
@@ -515,8 +519,10 @@ Item {
                 Behavior on opacity { NumberAnimation { duration: Theme.animationFast } }
 
                 // M11B B2: 回复（引用）本条消息。乐观/失败气泡还没有服务端 ID，
-                // 引用它们只会得到 messageId=0 的空引用，故不可回复
+                // 引用它们只会得到 messageId=0 的空引用，故不可回复；
+                // M13: 只读会话发不出消息，回复入口同样收起
                 Rectangle {
+                    visible: !messageBubble.readOnly
                     width: 22; height: 22; radius: 11
                     opacity: messageId > 0 ? 1 : 0.4
                     color: replyMouseArea.containsMouse && messageId > 0
@@ -556,7 +562,7 @@ Item {
                 }
 
                 Rectangle {
-                    visible: isMine && !isFileMessage
+                    visible: isMine && !isFileMessage && !messageBubble.readOnly
                     width: 22; height: 22; radius: 11
                     color: editMouseArea.containsMouse ? Theme.hoverColor : "transparent"
                     MouseArea {
@@ -575,7 +581,7 @@ Item {
                 }
 
                 Rectangle {
-                    visible: isMine
+                    visible: isMine && !messageBubble.readOnly
                     width: 22; height: 22; radius: 11
                     color: deleteMouseArea.containsMouse ? Theme.hoverColor : "transparent"
                     MouseArea {
@@ -601,7 +607,9 @@ Item {
                 AppMenuItem {
                     text: "回复"
                     iconName: "reply"
-                    // 乐观/失败气泡无服务端 ID，引用它们只会得到空引用
+                    // 乐观/失败气泡无服务端 ID，引用它们只会得到空引用；
+                    // M13: 只读会话发不出消息，回复入口一并收起
+                    visible: !messageBubble.readOnly
                     enabled: messageId > 0
                     onTriggered: messageBubble.replyRequested()
                 }
@@ -616,13 +624,14 @@ Item {
                     text: "多选"
                     iconName: "checkbox-checked"
                     // 乐观气泡尚无服务端 ID，选择集按 messageId 记，故不可选
+                    visible: !messageBubble.readOnly
                     enabled: messageId > 0
                     onTriggered: messageBubble.selectionRequested()
                 }
                 AppMenuItem {
                     text: "编辑"
                     iconName: "edit"
-                    visible: isMine
+                    visible: isMine && !messageBubble.readOnly
                     enabled: !isFileMessage
                     onTriggered: messageBubble.editRequested()
                     ToolTip.visible: hovered && !enabled
@@ -631,7 +640,7 @@ Item {
                 AppMenuItem {
                     text: "删除"
                     iconName: "delete"
-                    visible: isMine
+                    visible: isMine && !messageBubble.readOnly
                     danger: true
                     onTriggered: messageBubble.deleteRequested()
                 }

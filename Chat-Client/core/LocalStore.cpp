@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
@@ -300,7 +301,12 @@ bool LocalStore::ensureSchema()
                        "name TEXT NOT NULL DEFAULT '',"
                        "member_count INTEGER NOT NULL DEFAULT 0,"
                        "pinned INTEGER NOT NULL DEFAULT 0,"
-                       "muted INTEGER NOT NULL DEFAULT 0)",
+                       "muted INTEGER NOT NULL DEFAULT 0,"
+                       "left_group INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS conversation_clear_marks ("
+                       "conversation_id INTEGER PRIMARY KEY,"
+                       "cleared_before_message_id INTEGER NOT NULL DEFAULT 0,"
+                       "cleared_at TEXT NOT NULL DEFAULT '')",
         "CREATE TABLE IF NOT EXISTS outbox ("
                        "client_message_id TEXT PRIMARY KEY,"
                        "to_user_id INTEGER NOT NULL,"
@@ -371,6 +377,14 @@ bool LocalStore::ensureSchema()
         && !query.exec("ALTER TABLE conversations "
                        "ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")) {
         qWarning() << "[LocalStore] Add conversations.muted failed:" << query.lastError().text();
+        return false;
+    }
+    // M13: 退出群聊但保留本机历史的标记列
+    if (!hasColumn("conversations", "left_group")
+        && !query.exec("ALTER TABLE conversations "
+                       "ADD COLUMN left_group INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add conversations.left_group failed:"
+                   << query.lastError().text();
         return false;
     }
     if (!hasColumn("outbox", "conversation_id")
@@ -942,8 +956,8 @@ bool LocalStore::upsertConversationRow(const QJsonObject &conv)
     query.prepare(
         "INSERT INTO conversations(conversation_id, type, peer_user_id, peer_username,"
         " last_message_enc, last_message_id, last_message_at, unread_count,"
-        " name, member_count, pinned, muted)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " name, member_count, pinned, muted, left_group)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(conversation_id) DO UPDATE SET"
         " type = excluded.type,"
         " peer_user_id = excluded.peer_user_id,"
@@ -955,7 +969,8 @@ bool LocalStore::upsertConversationRow(const QJsonObject &conv)
         " name = excluded.name,"
         " member_count = excluded.member_count,"
         " pinned = excluded.pinned,"
-        " muted = excluded.muted");
+        " muted = excluded.muted,"
+        " left_group = excluded.left_group");
     query.addBindValue(conversationId);
     query.addBindValue(text(conv, "type", "private"));
     query.addBindValue(conv.value("peerUserId").toVariant().toLongLong());
@@ -970,6 +985,10 @@ bool LocalStore::upsertConversationRow(const QJsonObject &conv)
     // M9 特性栈：会话偏好（服务端权威；缺省 false）
     query.addBindValue(conv.value("pinned").toBool() ? 1 : 0);
     query.addBindValue(conv.value("muted").toBool() ? 1 : 0);
+    // M13: “已退出但保留历史”标记。服务端会话列表是该标记的权威来源——
+    // 服务端仍返回该会话即表示本端已重新成为成员，此处清零即完成重加入复位；
+    // 服务端不再返回时由 reconcileConversations 置位
+    query.addBindValue(conv.value("leftGroup").toBool() ? 1 : 0);
     if (!query.exec()) {
         qWarning() << "[LocalStore] upsertConversation failed:" << query.lastError().text();
         return false;
@@ -986,7 +1005,8 @@ QJsonArray LocalStore::loadConversations() const
     QSqlQuery query(m_db);
     query.prepare(
         "SELECT conversation_id, type, peer_user_id, peer_username, last_message_enc,"
-        " last_message_id, last_message_at, unread_count, name, member_count, pinned, muted"
+        " last_message_id, last_message_at, unread_count, name, member_count, pinned, muted,"
+        " left_group"
         " FROM conversations ORDER BY pinned DESC, last_message_at DESC, conversation_id DESC");
     if (!query.exec()) {
         return result;
@@ -1023,6 +1043,8 @@ QJsonArray LocalStore::loadConversations() const
         conv["memberCount"] = query.value(9).toInt();
         conv["pinned"] = query.value(10).toInt() != 0;
         conv["muted"] = query.value(11).toInt() != 0;
+        // M13: 已退出但保留历史——UI 据此置为只读并禁用发送
+        conv["leftGroup"] = query.value(12).toInt() != 0;
         result.append(conv);
     }
     return result;
@@ -1112,8 +1134,8 @@ bool LocalStore::clearDecryptedContent(qint64 messageId)
     return query.exec();
 }
 
-// M10: 会话整表删除——清除该会话的全部本地缓存。顺序：先按子查询清解密
-// 缓存（依赖 messages 定位），再清消息、群 Sender Key/跳过密钥、在途 outbox，最后删会话行
+// M10: 会话整表删除——清除该会话的全部本地缓存（消息、解密缓存、
+// 会话行、群 Sender Key/跳过密钥、在途 outbox），与服务端硬删除对齐
 bool LocalStore::deleteConversation(qint64 conversationId)
 {
     if (!ensureUsableDb() || conversationId <= 0) {
@@ -1127,6 +1149,218 @@ bool LocalStore::deleteConversation(qint64 conversationId)
         qWarning() << "[LocalStore] deleteConversation without transaction:"
                    << m_db.lastError().text();
     }
+    bool ok = deleteConversationRows(conversationId);
+    // 服务端已整表删除时清空水位一并销账（purgeConversation 恰好相反：先把水位
+    // 写进同一事务再删行，故水位清理不能放进 deleteConversationRows 共用）
+    QSqlQuery markQ(m_db);
+    markQ.prepare("DELETE FROM conversation_clear_marks WHERE conversation_id = ?");
+    markQ.addBindValue(conversationId);
+    if (!markQ.exec()) {
+        qWarning() << "[LocalStore] deleteConversation clear mark failed:"
+                   << markQ.lastError().text();
+        ok = false;
+    }
+    if (!ok) {
+        if (useTransaction) {
+            m_db.rollback();
+        }
+        return false;
+    }
+    return useTransaction ? m_db.commit() : true;
+}
+
+// M13: 退出群聊但保留本机历史——只打标记，消息与会话行原样保留。
+// 顺带把未读/置顶/免打扰清零：退出后未读不再有意义，而置顶与免打扰的开关
+// 在只读会话上已收起（不能留下无法取消的状态）；重新加入时会由服务端值复位
+bool LocalStore::setConversationLeft(qint64 conversationId, bool left)
+{
+    if (!ensureUsableDb() || conversationId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    if (left) {
+        query.prepare("UPDATE conversations SET left_group = 1, unread_count = 0,"
+                      " pinned = 0, muted = 0 WHERE conversation_id = ?");
+    } else {
+        query.prepare("UPDATE conversations SET left_group = 0 WHERE conversation_id = ?");
+    }
+    query.addBindValue(conversationId);
+    return query.exec();
+}
+
+// M13: 清空该会话本地缓存，并记录“已清空到哪个消息 ID”的水位后移除会话行。
+// 服务端仍然保留该会话（退群不删服务端历史、本地清空也仅是本地行为），
+// 故重新加入时按水位同步：晚于水位的消息照常取回，已删除的本地历史不复活
+bool LocalStore::purgeConversation(qint64 conversationId)
+{
+    if (!ensureUsableDb() || conversationId <= 0) {
+        return false;
+    }
+    const bool useTransaction = m_db.transaction();
+    if (!useTransaction) {
+        qWarning() << "[LocalStore] purgeConversation without transaction:"
+                   << m_db.lastError().text();
+    }
+
+    // 水位取三者较大者，保证“清空”覆盖用户曾见过的全部消息：
+    // ① 既有水位（多次“退出-重加入-再退出”时只前进）
+    // ② 本地消息表的最大 ID
+    // ③ 会话行缓存的 last_message_id——从未打开过的会话本地没有消息行，
+    //    若只按 ② 取到 0，重新加入后会把用户已"删除"的历史重新拉回
+    qint64 watermark = conversationClearMark(conversationId);
+    QSqlQuery maxQ(m_db);
+    maxQ.prepare("SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE conversation_id = ?");
+    maxQ.addBindValue(conversationId);
+    if (maxQ.exec() && maxQ.next()) {
+        watermark = qMax(watermark, maxQ.value(0).toLongLong());
+    } else {
+        qWarning() << "[LocalStore] purgeConversation max message id failed:"
+                   << maxQ.lastError().text();
+    }
+    QSqlQuery lastQ(m_db);
+    lastQ.prepare("SELECT last_message_id FROM conversations WHERE conversation_id = ?");
+    lastQ.addBindValue(conversationId);
+    if (lastQ.exec() && lastQ.next()) {
+        watermark = qMax(watermark, lastQ.value(0).toLongLong());
+    } else {
+        qWarning() << "[LocalStore] purgeConversation last message id failed:"
+                   << lastQ.lastError().text();
+    }
+
+    bool ok = true;
+    QSqlQuery markQ(m_db);
+    markQ.prepare(
+        "INSERT INTO conversation_clear_marks(conversation_id, cleared_before_message_id, cleared_at)"
+        " VALUES (?, ?, datetime('now'))"
+        " ON CONFLICT(conversation_id) DO UPDATE SET"
+        " cleared_before_message_id = excluded.cleared_before_message_id,"
+        " cleared_at = excluded.cleared_at");
+    markQ.addBindValue(conversationId);
+    markQ.addBindValue(watermark);
+    if (!markQ.exec()) {
+        qWarning() << "[LocalStore] purgeConversation clear mark failed:"
+                   << markQ.lastError().text();
+        ok = false;
+    }
+
+    ok = deleteConversationRows(conversationId) && ok;
+    if (!ok) {
+        if (useTransaction) {
+            m_db.rollback();
+        }
+        return false;
+    }
+    return useTransaction ? m_db.commit() : true;
+}
+
+qint64 LocalStore::conversationClearMark(qint64 conversationId) const
+{
+    if (!m_open || conversationId <= 0) {
+        return 0;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT cleared_before_message_id FROM conversation_clear_marks"
+                  " WHERE conversation_id = ?");
+    query.addBindValue(conversationId);
+    if (query.exec() && query.next()) {
+        return query.value(0).toLongLong();
+    }
+    return 0;
+}
+
+// M13: 会话列表对账（服务端权威）。落库服务端返回的会话并清除其“已退出”
+// 标记（重新加入即复位），再把服务端不再返回的本地群会话标记为已退出。
+// 与本函数配套的关键点：调用方必须 emit 对账后的本地列表而非服务端原数组，
+// 否则“已退出但保留历史”的会话会被列表视为已消失而移除（本缺陷的根因）
+QList<qint64> LocalStore::reconcileConversations(const QJsonArray &convs)
+{
+    QList<qint64> newlyLeft;
+    if (!ensureUsableDb()) {
+        return newlyLeft;
+    }
+    const bool useTransaction = m_db.transaction();
+    if (!useTransaction) {
+        qWarning() << "[LocalStore] reconcileConversations without transaction:"
+                   << m_db.lastError().text();
+    }
+
+    QSet<qint64> present;
+    bool ok = true;
+    for (const QJsonValue &value : convs) {
+        const QJsonObject conv = value.toObject();
+        const qint64 id = conv.value("conversationId").toVariant().toLongLong();
+        if (id <= 0) {
+            continue;
+        }
+        present.insert(id);
+        if (!upsertConversationRow(conv)) {
+            ok = false;
+        }
+    }
+
+    // 空列表一律不作“失权”证据：服务端 `getConversationsForUser` 在 SQL 出错时
+    // 返回空列表却仍回 Ok，若据此把本地全部群标记为已退出，会造成"全体群聊突然
+    // 只读 + 逐个提示"的误报（真失权会在下一次成功刷新时被标记）。反向的误判
+    // （本地全部群都该退出却没标记）只会多留几项可写入口，且服务端仍会拒绝
+    if (convs.isEmpty()) {
+        if (useTransaction && !m_db.commit()) {
+            qWarning() << "[LocalStore] reconcileConversations commit failed:"
+                       << m_db.lastError().text();
+        }
+        return {};
+    }
+
+    // 服务端不再返回的本地群会话 = 本端已非成员（他端退群/被移出/本次修复前
+    // 遗留的失效会话）。私聊不参与：其存续由 conversation_deleted 事件保证，
+    // 在服务端列表里缺席不代表失效
+    QSqlQuery localQ(m_db);
+    if (!localQ.exec("SELECT conversation_id FROM conversations "
+                     "WHERE type = 'group' AND left_group = 0")) {
+        qWarning() << "[LocalStore] reconcileConversations local scan failed:"
+                   << localQ.lastError().text();
+        ok = false;
+    } else {
+        QList<qint64> absent;
+        while (localQ.next()) {
+            const qint64 id = localQ.value(0).toLongLong();
+            if (id > 0 && !present.contains(id)) {
+                absent.append(id);
+            }
+        }
+        for (const qint64 id : absent) {
+            QSqlQuery markQ(m_db);
+            markQ.prepare("UPDATE conversations SET left_group = 1, unread_count = 0,"
+                          " pinned = 0, muted = 0 WHERE conversation_id = ?");
+            markQ.addBindValue(id);
+            if (!markQ.exec()) {
+                qWarning() << "[LocalStore] reconcileConversations mark left failed:"
+                           << markQ.lastError().text();
+                ok = false;
+                continue;
+            }
+            newlyLeft.append(id);
+        }
+    }
+
+    if (!ok) {
+        if (useTransaction) {
+            m_db.rollback();
+        }
+        return {};
+    }
+    if (useTransaction && !m_db.commit()) {
+        qWarning() << "[LocalStore] reconcileConversations commit failed:"
+                   << m_db.lastError().text();
+        return {};
+    }
+    return newlyLeft;
+}
+
+// 清除会话全部本地行（解密缓存/消息/群密钥/outbox/会话行）。单独抽取是为了让
+// deleteConversation（整表删除）与 purgeConversation（退出并清空）共用同一份
+// 删除顺序，避免两处各写一遍而漂移；事务由调用方管理
+bool LocalStore::deleteConversationRows(qint64 conversationId)
+{
     bool ok = true;
 
     QSqlQuery dec(m_db);
@@ -1186,13 +1420,7 @@ bool LocalStore::deleteConversation(qint64 conversationId)
         ok = false;
     }
 
-    if (!ok) {
-        if (useTransaction) {
-            m_db.rollback();
-        }
-        return false;
-    }
-    return useTransaction ? m_db.commit() : true;
+    return ok;
 }
 
 // M11A A3: 检查会话是否被设为免打扰

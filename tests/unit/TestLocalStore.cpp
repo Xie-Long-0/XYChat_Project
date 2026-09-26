@@ -1018,6 +1018,152 @@ private slots:
 
         store.closeAndDestroy();
     }
+
+    // M13: 退出群聊保留历史——标记落库、会话仍在列表且只读；重新加入
+    //（服务端再次返回该会话）即由对账清除标记
+    void groupLeftFlagRoundTripsAndResetsOnRejoin()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        QJsonObject groupConv;
+        groupConv["conversationId"] = 31;
+        groupConv["type"] = "group";
+        groupConv["name"] = "项目群";
+        QVERIFY(store.upsertConversation(groupConv));
+        QVERIFY(!store.loadConversations().at(0).toObject().value("leftGroup").toBool());
+
+        // 退群保留历史：打标记后会话仍在列表，UI 据此置只读
+        QVERIFY(store.setConversationLeft(31, true));
+        const QJsonArray left = store.loadConversations();
+        QCOMPARE(left.size(), 1);
+        QVERIFY(left.at(0).toObject().value("leftGroup").toBool());
+
+        // 重新加入：服务端再次返回该会话 → 标记复位（历史列不受影响）
+        const QList<qint64> newlyLeft = store.reconcileConversations(QJsonArray{groupConv});
+        QVERIFY(newlyLeft.isEmpty());
+        const QJsonArray rejoined = store.loadConversations();
+        QCOMPARE(rejoined.size(), 1);
+        QVERIFY(!rejoined.at(0).toObject().value("leftGroup").toBool());
+
+        store.closeAndDestroy();
+    }
+
+    // M13: 会话列表对账——服务端不再返回的群标记为已退出（保留历史、不被移除），
+    // 服务端仍返回的会话保持活跃；私聊缺席不标记（存续由 conversation_deleted 事件保证）
+    void reconcileMarksAbsentGroupsLeftOnly()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        QJsonObject groupA;
+        groupA["conversationId"] = 41;
+        groupA["type"] = "group";
+        groupA["name"] = "群A";
+        QJsonObject groupB;
+        groupB["conversationId"] = 42;
+        groupB["type"] = "group";
+        groupB["name"] = "群B";
+        QJsonObject privateC;
+        privateC["conversationId"] = 43;
+        privateC["type"] = "private";
+        privateC["peerUserId"] = 7;
+        privateC["peerUsername"] = "alice";
+        QVERIFY(store.upsertConversations(QJsonArray{groupA, groupB, privateC}));
+
+        // 服务端只返回群A：群B 与本端已无成员关系 → 标记已退出；私聊缺席不标记
+        const QList<qint64> newlyLeft = store.reconcileConversations(QJsonArray{groupA});
+        QCOMPARE(newlyLeft.size(), 1);
+        QCOMPARE(newlyLeft.at(0), 42LL);
+
+        QJsonArray convs = store.loadConversations();
+        QCOMPARE(convs.size(), 3);
+        for (const QJsonValue &v : convs) {
+            const QJsonObject c = v.toObject();
+            const qint64 id = c.value("conversationId").toVariant().toLongLong();
+            if (id == 41) {
+                QVERIFY(!c.value("leftGroup").toBool());
+            } else if (id == 42) {
+                QVERIFY(c.value("leftGroup").toBool());
+            } else if (id == 43) {
+                QVERIFY(!c.value("leftGroup").toBool());
+            }
+        }
+
+        // 幂等：已标记的会话不再重复上报
+        QVERIFY(store.reconcileConversations(QJsonArray{groupA}).isEmpty());
+
+        // 服务端返回空列表**不**作失权证据：服务端 getConversationsForUser 在 SQL
+        // 出错时返回空列表却仍回 Ok，据此批量标记会让本端全体群聊误置只读
+        QVERIFY(store.reconcileConversations(QJsonArray{}).isEmpty());
+        for (const QJsonValue &v : store.loadConversations()) {
+            const QJsonObject c = v.toObject();
+            if (c.value("conversationId").toVariant().toLongLong() == 41) {
+                QVERIFY(!c.value("leftGroup").toBool());
+            }
+        }
+
+        store.closeAndDestroy();
+    }
+
+    // M13: 退出并删除记录——本地缓存清空且会话行移除，但清空水位保留；
+    // 重新加入后会话行回来而水位仍在，服务端起拉点由水位决定（已删历史不复活）
+    void purgeConversationKeepsClearMarkForRejoin()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        QJsonObject groupConv;
+        groupConv["conversationId"] = 51;
+        groupConv["type"] = "group";
+        groupConv["name"] = "项目群";
+        groupConv["lastMessage"] = "hello";
+        groupConv["lastMessageId"] = 12;
+        QVERIFY(store.upsertConversation(groupConv));
+        QVERIFY(store.upsertMessage(makeMessage(11, 51, "msg 11")));
+        QVERIFY(store.upsertMessage(makeMessage(12, 51, "msg 12")));
+        QCOMPARE(store.loadMessages(51).size(), 2);
+        QCOMPARE(store.conversationClearMark(51), 0LL);
+
+        // 清空：会话行与消息都没了，水位抬到本地已知最大消息 ID
+        QVERIFY(store.purgeConversation(51));
+        QCOMPARE(store.loadConversations().size(), 0);
+        QCOMPARE(store.loadMessages(51).size(), 0);
+        QCOMPARE(store.conversationClearMark(51), 12LL);
+
+        // 重新加入：会话行回来，水位仍在
+        store.reconcileConversations(QJsonArray{groupConv});
+        QCOMPARE(store.loadConversations().size(), 1);
+        QCOMPARE(store.conversationClearMark(51), 12LL);
+
+        // 再次清空且有更新的本地消息时水位只前进不回退（回退会让重加入
+        // 把已删历史重新拉回）
+        QVERIFY(store.upsertMessage(makeMessage(13, 51, "msg 13")));
+        QVERIFY(store.purgeConversation(51));
+        QCOMPARE(store.conversationClearMark(51), 13LL);
+
+        // 服务端整表删除路径则把水位一并销账（会话 ID 不再复用，不留残行）
+        QVERIFY(store.upsertConversation(groupConv));
+        QVERIFY(store.deleteConversation(51));
+        QCOMPARE(store.conversationClearMark(51), 0LL);
+
+        // 从未打开过的会话（本地无消息行）也要清干净：水位取会话预览里的
+        // last_message_id，否则重新加入会把用户已删除的历史重新拉回
+        QJsonObject neverOpened;
+        neverOpened["conversationId"] = 52;
+        neverOpened["type"] = "group";
+        neverOpened["name"] = "没打开过的群";
+        neverOpened["lastMessage"] = "preview";
+        neverOpened["lastMessageId"] = 77;
+        QVERIFY(store.upsertConversation(neverOpened));
+        QVERIFY(store.purgeConversation(52));
+        QCOMPARE(store.conversationClearMark(52), 77LL);
+
+        store.closeAndDestroy();
+    }
 };
 
 QTEST_GUILESS_MAIN(TestLocalStore)

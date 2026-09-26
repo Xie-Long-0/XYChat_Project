@@ -116,8 +116,9 @@ Window {
                 networkManager.inviteGroupMembers(conversationId, userIds)
             }
 
-            onLeaveGroupRequested: function(conversationId) {
-                networkManager.leaveGroup(conversationId)
+            // M13: 退群携带本机历史去向（true = 退出并删除本机记录）
+            onLeaveGroupRequested: function(conversationId, deleteLocalHistory) {
+                networkManager.leaveGroup(conversationId, deleteLocalHistory)
             }
 
             onKickGroupMemberRequested: function(conversationId, userId) {
@@ -169,6 +170,11 @@ Window {
             // P3.1: 会话整表删除
             onDeleteConversationRequested: function(conversationId) {
                 networkManager.deleteConversation(conversationId)
+            }
+
+            // M13: 已退出群会话的“删除聊天记录”（仅删本机历史，不发服务端请求）
+            onDeleteLocalConversationRequested: function(conversationId) {
+                networkManager.deleteLocalConversation(conversationId)
             }
         }
     }
@@ -293,9 +299,15 @@ Window {
             globalToast.success("群组已创建")
         }
 
-        function onGroupLeft(conversationId) {
-            mainPage.closeGroupIfCurrent(conversationId)
-            globalToast.info("已退出群聊")
+        // M13: 退群结果。删除本机记录的分支已由 conversationDeleted 处理
+        //（从列表移除并销毁视图）；保留历史的分支不销毁视图——会话仍在列表，
+        // 由本轮会话刷新把它置为只读，用户可继续查看历史
+        function onGroupLeft(conversationId, deletedLocalHistory) {
+            if (deletedLocalHistory) {
+                globalToast.info("已退出群聊并删除本机记录")
+            } else {
+                globalToast.info("已退出群聊，聊天记录已保留（只读）")
+            }
         }
 
         function onGroupInfoResult(info) {
@@ -306,14 +318,10 @@ Window {
             globalToast.error("群操作失败：" + error)
         }
 
-        // M7a: 群变更推送：被移除/目标为自己的变更需关闭当前会话
-        function onGroupChanged(payload) {
-            var changeType = payload.changeType || ""
-            var target = payload.targetUserId || 0
-            if ((changeType === "member_removed" || changeType === "member_left")
-                && target === mainWindow.myUserId) {
-                mainPage.closeGroupIfCurrent(payload.conversationId || 0)
-            }
+        // M13: 本端已非该群成员（被移出/他端退群）。不再销毁会话与历史——
+        // 会话留在列表并置只读，用户可继续查看本机历史
+        function onConversationLeft(conversationId) {
+            globalToast.info("你已不在该群聊中，聊天记录已保留（只读）")
         }
 
         // M9 特性栈：会话偏好推送（本人其他设备设置后同步）

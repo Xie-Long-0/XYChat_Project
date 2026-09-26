@@ -68,7 +68,9 @@ public:
     // M7a: 群组操作（明文群聊）
     Q_INVOKABLE void createGroup(const QString &name, const QVariantList &memberIds);
     Q_INVOKABLE void inviteGroupMembers(qint64 conversationId, const QVariantList &userIds);
-    Q_INVOKABLE void leaveGroup(qint64 conversationId);
+    // M13: 退群本地去向由用户选择——deleteLocalHistory=true 时退出后清空本机
+    // 历史（从会话列表移除），false 时保留历史（会话留列表但只读）
+    Q_INVOKABLE void leaveGroup(qint64 conversationId, bool deleteLocalHistory);
     Q_INVOKABLE void kickGroupMember(qint64 conversationId, qint64 userId);
     Q_INVOKABLE void getGroupInfo(qint64 conversationId);
     // M7a: 发送群消息（明文，返回幂等键供乐观消息跟踪）
@@ -89,6 +91,9 @@ public:
     Q_INVOKABLE void sendTyping(qint64 conversationId, bool typing = true);
     // M10: 会话整表删除（服务端硬删除；成功后清本地缓存并 emit conversationDeleted）
     Q_INVOKABLE void deleteConversation(qint64 conversationId);
+    // M13: 仅删除本机历史（不触碰服务端）——用于已退出/被移出的群会话。
+    // 清空本地缓存并记下水位移除会话行；重新加入后按水位同步，已删历史不复活
+    Q_INVOKABLE void deleteLocalConversation(qint64 conversationId);
 
     // 状态查询
     ConnectionState state() const { return m_state; }
@@ -149,7 +154,8 @@ signals:
     // M7a: 群组操作结果与推送
     void groupCreated(qint64 conversationId, const QString &name);
     void groupMembersInvited(qint64 conversationId);
-    void groupLeft(qint64 conversationId);
+    // M13: deletedLocalHistory 标识本次退群是否同时清空了本机历史（UI 提示文案用）
+    void groupLeft(qint64 conversationId, bool deletedLocalHistory);
     void groupMemberKicked(qint64 conversationId, qint64 removedUserId);
     void groupInfoResult(const QJsonObject &info);
     void groupRequestFailed(const QString &error);
@@ -167,6 +173,9 @@ signals:
     // M10：会话删除结果（本端响应或其他成员/设备推送）
     void conversationDeleted(qint64 conversationId);
     void conversationDeleteFailed(const QString &error);
+    // M13: 本端已非该群成员但本机保留历史（他端退群/被移出/对账发现失效），
+    // UI 据此提示并置会话为只读
+    void conversationLeft(qint64 conversationId);
     // M11A A3: 桌面通知请求（经 main.cpp 接线到 TrayManager::showNotification）
     // conversationId: 关联会话 ID（点击通知时回传以跳转）
     // title: 通知标题（私聊=发送者，群聊=群名）
@@ -360,6 +369,10 @@ private:
     // 由单个周期定时器统一清退并复用既有的失败信号让 UI 回退乐观态
     void trackInFlightRequest(quint64 requestId);
     void forgetInFlightRequest(quint64 requestId);
+    // M13: 服务端起拉点不得低于本地清空水位（独立成函数以便单测锁定：
+    // “退出并删除记录”后重新加入时若照旧 afterId=0 全量拉取，
+    // 已删除的本地历史会原样复活）
+    qint64 applyClearMarkFloor(qint64 conversationId, qint64 afterId) const;
     void startInFlightSweep();
     void sweepInFlightRequests();
 
@@ -419,7 +432,10 @@ private:
     // M7a: 群组请求待处理 ID
     quint64 m_pendingCreateGroupRequestId = 0;
     quint64 m_pendingInviteGroupRequestId = 0;
-    quint64 m_pendingLeaveGroupRequestId = 0;
+    // M13: 退群在途请求 requestId → 用户选择的“是否同时删除本机历史”。
+    // 多槽而非单值：并发退群（快速退多个群）时单值会被后发请求覆盖，
+    // 先发那次的选择即静默丢失（对齐 M9/M10 的在途请求多槽教训）
+    QHash<quint64, bool> m_pendingLeaveGroupRequests;
     quint64 m_pendingKickGroupRequestId = 0;
     quint64 m_pendingGetGroupInfoRequestId = 0;
     // M7b: 群 E2EE 引导状态

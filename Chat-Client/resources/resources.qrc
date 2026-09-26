@@ -66,6 +66,7 @@
         <file>dialogs/SearchDialog.qml</file>
         <file>dialogs/CreateGroupDialog.qml</file>
         <file>dialogs/GroupInfoDialog.qml</file>
+        <file>dialogs/LeaveGroupDialog.qml</file>
         <file>dialogs/InviteDialog.qml</file>
         <file>dialogs/EditMessageDialog.qml</file>
         <file>dialogs/ConfirmDeleteDialog.qml</file>

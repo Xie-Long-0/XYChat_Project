@@ -218,6 +218,9 @@ void NetworkManager::onDisconnected()
     const int pendingEditFailures = m_pendingEdits.size() + m_privateEditQueue.size();
     const int pendingDeleteFailures = m_pendingDeleteRequestIds.size();
     const int pendingConvDeleteFailures = m_pendingDeleteConversationRequests.size();
+    // M13: 在途退群请求随连接失效——服务端未处理（成员资格未变），如实上报
+    // 失败让 UI 提示，本地不做任何清理（本地清理只应由成功响应驱动）
+    const int pendingLeaveFailures = m_pendingLeaveGroupRequests.size();
     m_pendingEdits.clear();
     // M8.2: 中止在途传输并清零已登记的清单密钥（含文件密钥，不得跨会话驻留）。
     // 登出与断线是两条独立路径，两处都必须清（同 M9 编辑泵的教训）
@@ -237,6 +240,7 @@ void NetworkManager::onDisconnected()
         m_inFlightSweepTimer->stop();
     }
     m_lastTypingSentMs.clear();
+    m_pendingLeaveGroupRequests.clear();
     for (int i = 0; i < pendingEditFailures; ++i) {
         emit messageEditFailed("Connection lost");
     }
@@ -245,6 +249,9 @@ void NetworkManager::onDisconnected()
     }
     for (int i = 0; i < pendingConvDeleteFailures; ++i) {
         emit conversationDeleteFailed("Connection lost");
+    }
+    for (int i = 0; i < pendingLeaveFailures; ++i) {
+        emit groupRequestFailed("Connection lost");
     }
     setState(ConnectionState::Disconnected);
 
@@ -810,6 +817,7 @@ void NetworkManager::resetAuthState()
         m_inFlightSweepTimer->stop();
     }
     m_lastTypingSentMs.clear();
+    m_pendingLeaveGroupRequests.clear();
     XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
     m_identityKey = {};
     for (auto &pk : m_localPrekeys) {
@@ -2506,6 +2514,16 @@ void NetworkManager::deleteConversation(qint64 conversationId)
     sendPacket(packet);
 }
 
+// M13: 服务端起拉点不得低于本地清空水位（见头文件说明）
+qint64 NetworkManager::applyClearMarkFloor(qint64 conversationId, qint64 afterId) const
+{
+    if (conversationId <= 0 || !m_localStore.isOpen()) {
+        return afterId;
+    }
+    const qint64 mark = m_localStore.conversationClearMark(conversationId);
+    return mark > afterId ? mark : afterId;
+}
+
 // M3: 同步消息
 void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int limit)
 {
@@ -2526,6 +2544,11 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     }
 
     if (m_state != ConnectionState::Authenticated) return;
+
+    // M13: 本地已清空的会话（“退出并删除记录”后重新加入）把服务端起拉点抬到
+    // 清空水位：afterId=0 的全量加载若照旧从头发起，已删除的本地历史会在重新
+    // 加入后原样复活。晚于水位的消息（清空之后新产生的）照常取回
+    afterId = applyClearMarkFloor(conversationId, afterId);
 
     QJsonObject json;
     json["type"] = "sync_messages";
@@ -2615,9 +2638,30 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
                 }
             }
         }
-        // M12: 整表一次事务提交（逐条提交会为每个会话付一次 fsync）
-        m_localStore.upsertConversations(conversations);
-        emit conversationsResult(conversations);
+        // M13: 会话列表对账（服务端权威）——落库服务端会话并清除其“已退出”
+        // 标记（重新加入即复位），同时把服务端不再返回的本地群会话标记为
+        // “已退出但保留历史”（他端退群/被移出/本轮修复前遗留的失效会话）。
+        // 关键：emit 必须用对账后的**本地列表**而非服务端原数组——已退出的
+        // 会话服务端不再返回，若按服务端数组刷新，它会被列表当作已消失移除，
+        // 随后任何一次缓存先行（登录、已读游标、会话偏好）又把它显示出来，
+        // 表现为“退群刷新后群又出现且无法删除”（本缺陷根因）
+        QList<qint64> newlyLeft;
+        if (m_localStore.isOpen()) {
+            newlyLeft = m_localStore.reconcileConversations(conversations);
+        }
+        for (const qint64 leftId : newlyLeft) {
+            emit conversationLeft(leftId);
+        }
+        QJsonArray merged;
+        if (m_localStore.isOpen()) {
+            merged = m_localStore.loadConversations();
+        }
+        // 本地落库/读取失败（磁盘满、SQLite 故障）时退回服务端原数组：
+        // 缓存是展示层缓存，它坏掉不该让列表比服务端还空
+        if (merged.isEmpty() && !conversations.isEmpty()) {
+            merged = conversations;
+        }
+        emit conversationsResult(merged);
     }
 }
 
@@ -2997,6 +3041,12 @@ void NetworkManager::sweepInFlightRequests()
         if (m_pendingDeleteConversationRequests.contains(requestId)) {
             m_pendingDeleteConversationRequests.remove(requestId);
             emit conversationDeleteFailed("Request timed out");
+        }
+        // M13: 在途退群超时——服务端未处理（成员资格未变），如实上报失败；
+        // 本地不做清理（本地清理只由成功响应驱动）
+        if (m_pendingLeaveGroupRequests.contains(requestId)) {
+            m_pendingLeaveGroupRequests.remove(requestId);
+            emit groupRequestFailed("Request timed out");
         }
         // 消息页同步请求没有对应失败信号：登记项本身就是唯一要回收的资源。
         // 清掉后该会话下次激活会重新请求（视图保留 lastMessageId），
@@ -3610,6 +3660,8 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
 
     // P1-3: 离线成员变更补偿集合（去重后批次结束统一触发 healing）
     QSet<qint64> healConvs;
+    // M13: 离线期间本端失去成员资格的群（他端退群/被移出）——批次结束统一通知 UI
+    QSet<qint64> leftConvs;
 
     for (const QJsonValue &value : events) {
         const QJsonObject event = value.toObject();
@@ -3664,8 +3716,13 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
                 || (changeType == "member_left" && operatorId == m_userId);
             if (convId > 0 && membershipChanged) {
                 if (selfRemoved) {
+                    // M13: 离线期间他端退群/被移出——默认保留本机历史（只读）
                     m_groupSenderKeys.remove(convId);
                     healConvs.remove(convId);
+                    if (m_localStore.isOpen()) {
+                        m_localStore.setConversationLeft(convId, true);
+                        leftConvs.insert(convId);
+                    }
                 } else {
                     healConvs.insert(convId);
                 }
@@ -3727,6 +3784,15 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
     // P1-3: 触发离线补偿的 Sender-Key healing（去重后逐群，受单发槽位约束由队列推进）
     for (qint64 convId : std::as_const(healConvs)) {
         healGroupSenderKey(convId);
+    }
+
+    // M13: 离线期间的失权变更同样要落到 UI（会话置只读并提示），
+    // 否则本批事件标记了“已退出”而列表仍是旧态
+    if (!leftConvs.isEmpty()) {
+        for (qint64 convId : std::as_const(leftConvs)) {
+            emit conversationLeft(convId);
+        }
+        emit conversationsResult(m_localStore.loadConversations());
     }
 
     // 游标单调前进
@@ -3813,7 +3879,7 @@ void NetworkManager::inviteGroupMembers(qint64 conversationId, const QVariantLis
     sendPacket(packet);
 }
 
-void NetworkManager::leaveGroup(qint64 conversationId)
+void NetworkManager::leaveGroup(qint64 conversationId, bool deleteLocalHistory)
 {
     if (m_state != ConnectionState::Authenticated) return;
 
@@ -3826,7 +3892,8 @@ void NetworkManager::leaveGroup(qint64 conversationId)
     packet.messageType = MessageType::LeaveGroupRequest;
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    m_pendingLeaveGroupRequestId = packet.requestId;
+    m_pendingLeaveGroupRequests.insert(packet.requestId, deleteLocalHistory);
+    trackInFlightRequest(packet.requestId);
     sendPacket(packet);
 }
 
@@ -3910,8 +3977,10 @@ void NetworkManager::handleInviteGroupMembersResponse(const Packet &packet)
 
 void NetworkManager::handleLeaveGroupResponse(const Packet &packet)
 {
-    if (packet.requestId != m_pendingLeaveGroupRequestId) return;
-    m_pendingLeaveGroupRequestId = 0;
+    const auto pending = m_pendingLeaveGroupRequests.constFind(packet.requestId);
+    if (pending == m_pendingLeaveGroupRequests.constEnd()) return;
+    const bool deleteLocalHistory = pending.value();
+    m_pendingLeaveGroupRequests.erase(pending);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
@@ -3921,6 +3990,12 @@ void NetworkManager::handleLeaveGroupResponse(const Packet &packet)
 
     const qint64 conversationId =
         response.value("data").toObject().value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        // 服务端必回传该字段；缺失属异常响应，如实上报而不是静默当成功
+        //（在途登记已消费，本地不做任何清理——成员资格以服务端为准）
+        emit groupRequestFailed("Malformed leave group response");
+        return;
+    }
     // P1-3: 本端退群，清除内存与本地 sender key（chain key / Ed25519 私钥），先 wipe 再移除
     auto keyIt = m_groupSenderKeys.find(conversationId);
     if (keyIt != m_groupSenderKeys.end()) {
@@ -3931,8 +4006,59 @@ void NetworkManager::handleLeaveGroupResponse(const Packet &packet)
     if (m_localStore.isOpen()) {
         m_localStore.removeSenderKeysForGroup(conversationId);
     }
+
+    // M13: 退群的本地去向由用户在退出前选择。
+    // - 删除历史：清空本机缓存并记下水位后从列表移除（服务端历史不受影响，
+    //   重新加入时按水位同步，已删除的本地历史不复活）
+    // - 保留历史：仅打“已退出”标记，会话留在列表但只读；重新加入时对账
+    //   会清除该标记，历史完整保留
+    // 清理失败（本地库未开/SQLite 出错）时按“保留历史”收尾：绝不能让 UI
+    // 以为已删除而数据仍在——那正是“删了又出现”的再生路径，用户可在会话
+    // 列表重试删除
+    if (deleteLocalHistory) {
+        const bool purged = m_localStore.isOpen()
+            && m_localStore.purgeConversation(conversationId);
+        if (purged) {
+            emit conversationDeleted(conversationId);
+        } else {
+            qWarning() << "[NetMgr] leave group local purge failed, keep history:"
+                       << conversationId;
+            if (m_localStore.isOpen()) {
+                m_localStore.setConversationLeft(conversationId, true);
+                emit conversationsResult(m_localStore.loadConversations());
+            }
+            emit conversationDeleteFailed("Failed to delete local history");
+        }
+    } else if (m_localStore.isOpen()) {
+        m_localStore.setConversationLeft(conversationId, true);
+        // 立即用本地列表刷新（不等服务端响应）：会话仍应留在列表且置只读
+        emit conversationsResult(m_localStore.loadConversations());
+    }
     getConversations();
-    emit groupLeft(conversationId);
+    emit groupLeft(conversationId, deleteLocalHistory);
+}
+
+// M13: 仅删除本机历史（不触碰服务端），用于已退出/被移出的群会话。
+// 清空本地缓存并把水位抬到本地已知最大消息 ID，随后从列表移除
+void NetworkManager::deleteLocalConversation(qint64 conversationId)
+{
+    if (conversationId <= 0) {
+        return;
+    }
+    auto keyIt = m_groupSenderKeys.find(conversationId);
+    if (keyIt != m_groupSenderKeys.end()) {
+        SecureMemory::wipe(keyIt->chainKey);
+        SecureMemory::wipe(keyIt->privateSigningKey);
+        m_groupSenderKeys.erase(keyIt);
+    }
+    // 清理失败不得谎报删除：否则 UI 移除条目而数据仍在，下次登录又会因
+    // 缓存先行重新出现（同类缺陷的再生路径）
+    if (!m_localStore.isOpen() || !m_localStore.purgeConversation(conversationId)) {
+        qWarning() << "[NetMgr] deleteLocalConversation failed:" << conversationId;
+        emit conversationDeleteFailed("Failed to delete local history");
+        return;
+    }
+    emit conversationDeleted(conversationId);
 }
 
 void NetworkManager::handleKickGroupMemberResponse(const Packet &packet)
@@ -3987,6 +4113,12 @@ void NetworkManager::handleGroupChangedNotification(const Packet &packet)
         if (selfRemoved) {
             // 本端已非成员：清除内存 sender key（对方轮换后旧密钥无法解密新消息）
             m_groupSenderKeys.remove(convId);
+            // M13: 被移出/他端退群默认保留本机历史——打“已退出”标记并让会话
+            // 留在列表（只读），不再像此前那样把会话与历史一并销毁
+            if (m_localStore.isOpen()) {
+                m_localStore.setConversationLeft(convId, true);
+            }
+            emit conversationLeft(convId);
         } else {
             healGroupSenderKey(convId);
         }

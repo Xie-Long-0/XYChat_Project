@@ -16,6 +16,8 @@ Rectangle {
     signal conversationPrefsRequested(int conversationId, bool pinned, bool muted)
     signal markReadRequested(int conversationId)
     signal deleteConversationRequested(int conversationId)
+    // M13: 已退出群聊的“删除聊天记录”（仅删本机历史，不触碰服务端）
+    signal deleteLocalConversationRequested(int conversationId)
 
     // M4.5: 当前选中会话索引（修复原先错误的判断条件）
     property int selectedIndex: -1
@@ -210,18 +212,23 @@ Rectangle {
                 AppMenuItem {
                     text: model.pinned === true ? "取消置顶" : "置顶会话"
                     iconName: "pin"
+                    // M13: 已退出的会话只剩历史可读，置顶/免打扰/标记已读都无意义
+                    //（服务端会以非成员拒绝），一律收起
+                    visible: model.leftGroup !== true
                     onTriggered: conversationList.conversationPrefsRequested(
                         model.conversationId, model.pinned !== true, model.muted === true)
                 }
                 AppMenuItem {
                     text: model.muted === true ? "取消免打扰" : "开启免打扰"
                     iconName: model.muted === true ? "bell" : "mute"
+                    visible: model.leftGroup !== true
                     onTriggered: conversationList.conversationPrefsRequested(
                         model.conversationId, model.pinned === true, model.muted !== true)
                 }
                 AppMenuItem {
                     text: "标记为已读"
                     iconName: "check"
+                    visible: model.leftGroup !== true
                     onTriggered: conversationList.markReadRequested(model.conversationId)
                 }
                 // 分隔线同样要主题化：Basic 的 MenuSeparator 取 palette.mid（系统浅色），
@@ -234,10 +241,18 @@ Rectangle {
                     }
                 }
                 AppMenuItem {
-                    text: "删除会话"
+                    // M13: 已退出的会话本端已非成员，服务端会拒绝整表删除
+                    //（群聊仅群主可删）——改为只删本机历史，语义与文案同步
+                    text: model.leftGroup === true ? "删除聊天记录" : "删除会话"
                     iconName: "delete"
                     danger: true
-                    onTriggered: conversationList.deleteConversationRequested(model.conversationId)
+                    onTriggered: {
+                        if (model.leftGroup === true) {
+                            conversationList.deleteLocalConversationRequested(model.conversationId)
+                        } else {
+                            conversationList.deleteConversationRequested(model.conversationId)
+                        }
+                    }
                 }
             }
 
@@ -332,7 +347,10 @@ Rectangle {
 
                         Label {
                             Layout.fillWidth: true
-                            text: model.lastMessage || ""
+                            // M13: 已退出但保留历史的群——预览位改为退出提示
+                            //（历史可读，角标与预览不再更新）
+                            text: model.leftGroup === true ? "你已退出该群聊"
+                                                          : (model.lastMessage || "")
                             font.pixelSize: Theme.fontSizeSmall
                             color: delegateItem.isSelected ? Theme.selectedConversationSecondaryColor : Theme.textSecondary
                             elide: Text.ElideRight
@@ -456,7 +474,9 @@ Rectangle {
                 unreadCount: conv.unreadCount || 0,
                 // M9 特性栈：会话偏好（置顶/免打扰）
                 pinned: conv.pinned === true,
-                muted: conv.muted === true
+                muted: conv.muted === true,
+                // M13: 已退出但保留历史（只读，右键菜单只剩删除聊天记录）
+                leftGroup: conv.leftGroup === true
             }
             var pos = findIndexByConversationId(convId)
             if (pos >= 0) {
@@ -505,7 +525,8 @@ Rectangle {
                 peerUserId: c.peerUserId || 0,
                 peerUsername: c.peerUsername || "",
                 displayName: c.displayName || "",
-                memberCount: c.memberCount || 0
+                memberCount: c.memberCount || 0,
+                leftGroup: c.leftGroup === true
             })
         }
         return out

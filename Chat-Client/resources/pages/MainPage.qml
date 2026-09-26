@@ -22,7 +22,7 @@ Rectangle {
     signal loadContactsRequested()
     signal createGroupRequested(string name, var memberIds)
     signal inviteGroupMembersRequested(int conversationId, var userIds)
-    signal leaveGroupRequested(int conversationId)
+    signal leaveGroupRequested(int conversationId, bool deleteLocalHistory)
     signal kickGroupMemberRequested(int conversationId, int userId)
     signal getGroupInfoRequested(int conversationId)
     signal sendGroupMessageRequested(int conversationId, string content, int replyToMessageId)
@@ -30,6 +30,8 @@ Rectangle {
     signal editMessageRequested(int conversationId, int peerUserId, int messageId, string content)
     signal deleteMessageRequested(int messageId)
     signal deleteConversationRequested(int conversationId)
+    // M13: 只删本机历史（已退出/被移出的群会话，不触碰服务端）
+    signal deleteLocalConversationRequested(int conversationId)
     signal markConversationReadRequested(int conversationId)
     signal typingRequested(int conversationId, bool typing)
     // M12.4: 切到已打开的会话（未重新加载）时上报，供外层补发已读回执
@@ -230,6 +232,16 @@ Rectangle {
                     confirmDeleteDialog.bodyText = "删除后该会话及其所有消息将永久消失，此操作不可撤销。是否继续？"
                     confirmDeleteDialog.open()
                 }
+                // M13: 已退出的群会话——只删本机记录，无需服务端往返，
+                // 但仍要确认一次（本机历史不可恢复）
+                onDeleteLocalConversationRequested: function(conversationId) {
+                    confirmDeleteDialog.messageId = 0
+                    confirmDeleteDialog.localOnly = true
+                    confirmDeleteDialog.conversationId = conversationId
+                    confirmDeleteDialog.titleText = "删除聊天记录"
+                    confirmDeleteDialog.bodyText = "将清空本机保存的该群聊全部聊天记录（服务端与其他成员不受影响），此操作不可撤销。是否继续？"
+                    confirmDeleteDialog.open()
+                }
             }
 
             Rectangle {
@@ -387,6 +399,11 @@ Rectangle {
             }
             // M11B B2: 视图内的一句话提示（引用跳转未命中），统一走顶部横幅
             onNoticeRequested: function(text) { mainPage.fileNotice = text }
+            // M13: 只读会话的“删除聊天记录”（仅删本机历史）
+            onDeleteLocalHistoryRequested: {
+                if (view.conversationId > 0)
+                    mainPage.deleteLocalConversationRequested(view.conversationId)
+            }
             onCopyRequested: function(content) {
                 mainPage.copyToClipboard(content)
             }
@@ -417,7 +434,13 @@ Rectangle {
                 mainPage.forwardSkippedCount = messageIds.length - payload.length
                 mainPage.forwardSourceKey = mainPage.keyForView(view)
                 forwardDialog.messageIds = messageIds
-                forwardDialog.conversations = convList.conversationSummaries()
+                // M13: 已退出的群发不出消息，不作为转发目标
+                var summaries = convList.conversationSummaries()
+                var targets = []
+                for (var t = 0; t < summaries.length; t++) {
+                    if (summaries[t].leftGroup !== true) targets.push(summaries[t])
+                }
+                forwardDialog.conversations = targets
                 forwardDialog.open()
             }
             // P3.2: 转发“正在输入”信号（需已有会话 ID；新会话首条消息前无 ID，跳过）
@@ -505,7 +528,8 @@ Rectangle {
             inviteDialog.conversationId = mainPage.currentConversationId
             inviteDialog.open()
         }
-        onLeaveRequested: function(conversationId) { mainPage.leaveGroupRequested(conversationId) }
+        // M13: 退群改由二选一对话框承接（仅退出 / 退出并删除记录）
+        onLeaveRequested: function(conversationId) { mainPage.showLeaveGroupChoice(conversationId) }
         onKickRequested: function(conversationId, userId) { mainPage.kickGroupMemberRequested(conversationId, userId) }
         onRefreshRequested: function(conversationId) { mainPage.getGroupInfoRequested(conversationId) }
     }
@@ -528,10 +552,25 @@ Rectangle {
         }
     }
 
+    // M13: 退群前的本机历史去向选择
+    LeaveGroupDialog {
+        id: leaveGroupDialog
+        onLeaveOnlyConfirmed: function(conversationId) {
+            mainPage.leaveGroupRequested(conversationId, false)
+        }
+        onLeaveAndDeleteConfirmed: function(conversationId) {
+            mainPage.leaveGroupRequested(conversationId, true)
+        }
+    }
+
     ConfirmDeleteDialog {
         id: confirmDeleteDialog
         onConfirmed: function(messageId) { mainPage.deleteMessageRequested(messageId) }
         onConversationConfirmed: function(conversationId) { mainPage.deleteConversationRequested(conversationId) }
+        // M13: 仅删本机历史（已退出的群会话）
+        onLocalConversationConfirmed: function(conversationId) {
+            mainPage.deleteLocalConversationRequested(conversationId)
+        }
         // M11B B1: 批量删除——先退出选择模式（选择集随之清空），再逐条下发
         onBatchConfirmed: function(messageIds) {
             var view = mainPage.chatViews[mainPage.selectionViewKey]
@@ -906,12 +945,16 @@ Rectangle {
             view.chatTitle = title
             view.groupMemberCount = isGroup ? (conv.memberCount || 0) : 0
             view.hasConversation = true
+            // M13: 已退出的群会话打开即只读
+            view.readOnly = conv.leftGroup === true
             // P2.3: 注入未读数，供首屏 setMessages 放置未读分隔线
             view.unreadCount = conv.unreadCount || 0
             loadMessagesRequested(convId, 0)
         } else if (view.isGroup) {
             // 复用视图不重载：只把列表带回来的最新成员数补上
             view.groupMemberCount = conv.memberCount || view.groupMemberCount
+            // M13: 只读态同样按最新列表复位（重加入后应恢复可发送）
+            view.readOnly = conv.leftGroup === true
         }
         currentConversationType = isGroup ? "group" : "private"
         currentPeerUserId = isGroup ? 0 : view.peerUserId
@@ -1047,6 +1090,8 @@ Rectangle {
 
     function updateConversations(conversations) {
         convList.updateConversations(conversations)
+        // M13: 已退出/被移出的群会话在列表刷新时同步为只读（重新加入则复位）
+        syncViewReadOnly(conversations)
         if (currentConversationId > 0) {
             convList.setSelectedByConversationId(currentConversationId)
             for (var i = 0; i < conversations.length; i++) {
@@ -1223,14 +1268,32 @@ Rectangle {
         setActiveView(key, conversationId)
     }
 
-    function closeGroupIfCurrent(conversationId) {
-        // 退群/被移出：该群视图（可能正被其它视图替代而处于隐藏态）随会话失效
-        var key = viewKeyForConversation(conversationId)
-        var wasActive = (activeViewKey === key)
-        destroyView(key)
-        if (wasActive) showEmptyState()
-        convList.beginLoading()
-        loadConversationsRequested()
+    // M13: 退群二选一（仅退出 / 退出并删除记录）。群名取自会话列表，
+    // 用于对话框文案；列表里没有该会话时退化为通用文案
+    function showLeaveGroupChoice(conversationId) {
+        var conv = convList.getConversation(convList.findIndexByConversationId(conversationId))
+        leaveGroupDialog.conversationId = conversationId
+        leaveGroupDialog.groupName = conv ? (conv.displayName || "") : ""
+        leaveGroupDialog.open()
+    }
+
+    // M13: 会话列表变化时同步各视图的只读态（已退出/被移出的群会话保留历史但
+    // 不可发送）。只按列表里出现的会话更新：列表里已消失的会话由删除路径
+    // 销毁视图，此处不动，避免把"已删除"误判成"可发送"
+    function syncViewReadOnly(conversations) {
+        var keys = Object.keys(chatViews)
+        for (var i = 0; i < keys.length; i++) {
+            var view = chatViews[keys[i]]
+            if (!view || view.conversationId <= 0) continue
+            for (var j = 0; j < conversations.length; j++) {
+                var conv = conversations[j]
+                if (!conv || conv.conversationId === undefined) continue
+                if ((conv.conversationId || 0) == view.conversationId) {
+                    view.readOnly = conv.leftGroup === true
+                    break
+                }
+            }
+        }
     }
 
     function applyConversationPrefs(conversationId, pinned, muted) { convList.applyPrefs(conversationId, pinned, muted) }

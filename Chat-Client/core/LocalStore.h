@@ -110,6 +110,23 @@ public:
     // 会话行、群 Sender Key/跳过密钥、在途 outbox），与服务端硬删除对齐
     bool deleteConversation(qint64 conversationId);
 
+    // M13: 退出群聊的两种本地去向。
+    // - 保留历史（left=true）：只打“已退出”标记，会话仍留在列表但只读，
+    //   消息缓存不动；重新加入时由对账清除该标记，历史完整保留
+    // - 删除历史：见 purgeConversation
+    bool setConversationLeft(qint64 conversationId, bool left);
+    // 清空该会话本地缓存并记录清空水位后移除会话行。服务端仍保留会话
+    //（退群不删服务端历史），故重新加入时按水位同步——晚于水位的消息照常
+    // 取回，已删除的本地历史不会复活
+    bool purgeConversation(qint64 conversationId);
+    // 本地清空水位（该会话本地已清空到哪个消息 ID 之前；无记录返回 0）
+    qint64 conversationClearMark(qint64 conversationId) const;
+    // 会话列表对账（服务端权威）：落库给定会话并清除其“已退出”标记，
+    // 同时把服务端不再返回的本地群会话标记为已退出（他端退群/被移出/
+    // 本次修复前遗留的失效会话）。返回本轮新标记为已退出的会话 ID。
+    // 私聊不在对账范围：其存续由 conversation_deleted 事件保证，缺席不代表失效
+    QList<qint64> reconcileConversations(const QJsonArray &convs);
+
     // M11A A3: 桌面通知辅助查询
     // 检查会话是否被设为免打扰（muted）
     bool isConversationMuted(qint64 conversationId) const;
@@ -177,6 +194,9 @@ private:
     // 行级 upsert：假定连接已就绪，供单条与批量两条路径共用
     bool upsertMessageRow(const QJsonObject &msg);
     bool upsertConversationRow(const QJsonObject &conv);
+    // 清除会话全部本地行（解密缓存/消息/群密钥/outbox/会话行）：
+    // deleteConversation 与 purgeConversation 共用，事务由调用方管理
+    bool deleteConversationRows(qint64 conversationId);
     // M7a: 列存在性检查（存量库幂等补列）
     bool hasColumn(const QString &table, const QString &column) const;
     bool ensureStorageKey(const QString &username, const QString &deviceId);

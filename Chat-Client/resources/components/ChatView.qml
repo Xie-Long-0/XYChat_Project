@@ -17,6 +17,9 @@ Rectangle {
     property int conversationId: 0
     property bool isGroup: false
     property int groupMemberCount: 0
+    // M13: 已退出/被移出群聊但本机保留历史——输入区替换为只读提示条，
+    // 群信息入口与消息级操作（回复/编辑/删除/多选）一并收起
+    property bool readOnly: false
 
     // P2.3: 当前会话未读数（MainPage 打开会话时注入，用于放置未读分隔线）
     property int unreadCount: 0
@@ -62,6 +65,8 @@ Rectangle {
     signal forwardSelectedRequested(var messageIds)
     // M11B B2: 需要向用户提示的一句话（引用跳转未命中时用）
     signal noticeRequested(string text)
+    // M13: 只读会话的“删除聊天记录”（仅删本机历史，不触碰服务端）
+    signal deleteLocalHistoryRequested()
 
     // M11B B1: 多选模式。选择集按 messageId 记（乐观气泡无服务端 ID，不参与多选），
     // 变更时整表重新赋值以驱动 delegate 与工具栏绑定重算（与 typingUsers 同口径）
@@ -204,12 +209,13 @@ Rectangle {
                 }
             }
 
-            // M7a: 群信息按钮（打开群成员/管理对话框）
+            // M7a: 群信息按钮（打开群成员/管理对话框）。M13: 已退出群聊时收起
+            //（非成员调 get_group_info 会被服务端拒绝，入口留着只是无效报错）
             Rectangle {
                 id: groupInfoBtn
                 width: 36; height: 36
                 radius: 18
-                visible: isGroup
+                visible: isGroup && !chatView.readOnly
                 color: groupInfoMouse.containsMouse ? Theme.hoverColor : "transparent"
 
                 MouseArea {
@@ -385,7 +391,8 @@ Rectangle {
         anchors.top: groupBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.bottom: messageInput.top
+        // M13: 只读会话的底部让位给提示条（输入框此时不可见）
+        anchors.bottom: chatView.readOnly ? readOnlyBar.top : messageInput.top
         anchors.topMargin: Theme.spacingSmall
         anchors.bottomMargin: Theme.spacingSmall
         clip: true
@@ -496,6 +503,8 @@ Rectangle {
                 // M11B B1: 多选模式与选中态（选择集在 ChatView 上，气泡只渲染）
                 selectionMode: chatView.selectionMode
                 selected: chatView.selectedIds[model.messageId] === true
+                // M13: 已退出群聊的历史只读——回复/多选/编辑/删除一并收起
+                readOnly: chatView.readOnly
                 // M8.2: 文件消息的脱敏展示与下载/保存交互
                 isFileMessage: model.isFileMessage === true
                 fileName: model.fileName || ""
@@ -708,13 +717,13 @@ Rectangle {
         onTriggered: chatView.pruneTyping()
     }
 
-    // 消息输入框
+    // 消息输入框（M13: 已退出的群聊不给输入口，改由下方只读提示条替代）
     MessageInput {
         id: messageInput
         anchors.bottom: parent.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        visible: hasConversation
+        visible: hasConversation && !chatView.readOnly
         maxLength: isGroup ? 16384 : 4096
         // M11B B2: 引用条（正在回复谁）
         replyInfo: chatView.replyTarget
@@ -735,6 +744,47 @@ Rectangle {
         onTypingActivity: chatView.typingSignal(true)
     }
 
+    // M13: 只读提示条（已退出/被移出的群聊）。历史可读、不可发送；
+    // 提供“删除聊天记录”作为会话列表之外的第二个出口（仅删本机历史）
+    Rectangle {
+        id: readOnlyBar
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 56
+        color: Theme.inputBackground
+        visible: hasConversation && chatView.readOnly
+
+        Rectangle {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 1
+            color: Theme.separatorColor
+        }
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: Theme.spacingLarge
+            anchors.rightMargin: Theme.spacingLarge
+            spacing: Theme.spacingMedium
+
+            Label {
+                Layout.fillWidth: true
+                text: "你已退出该群聊，无法发送消息"
+                font.pixelSize: Theme.fontSizeBody
+                color: Theme.textSecondary
+                elide: Text.ElideRight
+            }
+
+            AppButton {
+                text: "删除聊天记录"
+                variant: "flat"
+                onClicked: chatView.deleteLocalHistoryRequested()
+            }
+        }
+    }
+
     // M11B B2: 引用跳转后的短暂高亮（1.5s 后自动清除）
     Timer {
         id: highlightTimer
@@ -747,7 +797,8 @@ Rectangle {
     Rectangle {
         id: jumpToBottomFab
         anchors.right: parent.right
-        anchors.bottom: messageInput.top
+        // M13: 只读会话下方是提示条，FAB 随之抬高
+        anchors.bottom: chatView.readOnly ? readOnlyBar.top : messageInput.top
         anchors.rightMargin: Theme.spacingLarge
         anchors.bottomMargin: Theme.spacingMedium
         width: 44
@@ -1535,6 +1586,13 @@ Rectangle {
         if (messageId > 0) {
             toggleSelection(messageId)
         }
+    }
+
+    // M13: 只读会话不给发送口，也不该留着多选工具栏（其删除/转发必失败）。
+    // 只读态可能在多选进行中翻转（如多选期间被移出群聊），故在此强制退出
+    onReadOnlyChanged: {
+        if (readOnly && selectionMode) exitSelectionMode()
+        if (readOnly) cancelReply()
     }
 
     function exitSelectionMode() {

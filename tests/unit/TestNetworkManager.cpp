@@ -1129,6 +1129,174 @@ private slots:
 
         nm.m_localStore.closeAndDestroy();
     }
+
+    // M13: “退出并删除记录”后重新加入时，服务端起拉点必须由本地清空水位抬升——
+    // 否则 afterId=0 的全量加载会把已删除的历史原样拉回本地（用户看到的
+    // 是"删了又回来"）。水位不高于请求起点时不回退，非该会话不受影响
+    void clearMarkRaisesSyncFloorAfterRejoin()
+    {
+        const QString user =
+            "floor_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+
+        NetworkManager nm;
+        // 本地库未打开：原样返回（不得因水位查询失败而改动请求）
+        QCOMPARE(nm.applyClearMarkFloor(7, 0), 0LL);
+        QCOMPARE(nm.applyClearMarkFloor(7, 100), 100LL);
+
+        QVERIFY(nm.m_localStore.open(user, "dev0"));
+        // 无水位记录：不改动
+        QCOMPARE(nm.applyClearMarkFloor(7, 0), 0LL);
+
+        // 构造「退出并删除记录」的现场：本地有到 messageId=12 的消息，
+        // 清空后会话行与消息都没了，水位停在 12
+        QJsonObject conv;
+        conv["conversationId"] = 7;
+        conv["type"] = "group";
+        conv["name"] = "项目群";
+        QVERIFY(nm.m_localStore.upsertConversation(conv));
+        QJsonObject msg;
+        msg["messageId"] = 12;
+        msg["conversationId"] = 7;
+        msg["senderId"] = 2;
+        msg["senderUsername"] = "bob";
+        msg["content"] = "before leave";
+        msg["contentType"] = "text";
+        msg["status"] = "delivered";
+        msg["createdAt"] = "2026-09-23T00:00:00Z";
+        QVERIFY(nm.m_localStore.upsertMessage(msg));
+        QVERIFY(nm.m_localStore.purgeConversation(7));
+        QCOMPARE(nm.m_localStore.conversationClearMark(7), 12LL);
+
+        // 重新加入后全量加载（afterId=0）抬到水位；已高过水位时不回退
+        QCOMPARE(nm.applyClearMarkFloor(7, 0), 12LL);
+        QCOMPARE(nm.applyClearMarkFloor(7, 20), 20LL);
+        // 其他会话不受该水位影响
+        QCOMPARE(nm.applyClearMarkFloor(8, 0), 0LL);
+
+        nm.m_localStore.closeAndDestroy();
+    }
+
+    // M13: 已退出的群会话必须留在（对账后本地合并的）会话列表里并带 leftGroup
+    // 标记——服务端不再返回它，若按服务端数组刷新，UI 会把它当作已消失而移除，
+    // 随后任何一次缓存先行又把它显示回来（"退群后刷新又出现且无法删除"的原始缺陷）
+    void conversationsResultKeepsLeftConversationsVisible()
+    {
+        const QString user =
+            "m13_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+
+        NetworkManager nm;
+        nm.m_userId = 7;
+        QVERIFY(nm.m_localStore.open(user, "dev0"));
+
+        QJsonObject groupA;
+        groupA["conversationId"] = 61;
+        groupA["type"] = "group";
+        groupA["name"] = "还在的群";
+        groupA["lastMessage"] = "hi";
+        groupA["lastMessageId"] = 5;
+        QJsonObject groupB;
+        groupB["conversationId"] = 62;
+        groupB["type"] = "group";
+        groupB["name"] = "已退出的群";
+        groupB["lastMessage"] = "bye";
+        groupB["lastMessageId"] = 6;
+        QVERIFY(nm.m_localStore.upsertConversations(QJsonArray{groupA, groupB}));
+
+        QSignalSpy leftSpy(&nm, &NetworkManager::conversationLeft);
+        QSignalSpy listSpy(&nm, &NetworkManager::conversationsResult);
+
+        // 服务端只返回 A（B 已退出）：B 应被标记为已退出且仍在列表中
+        nm.m_pendingGetConversationsRequestId = 77;
+        Packet packet;
+        packet.messageType = MessageType::GetConversationsResponse;
+        packet.requestId = 77;
+        QJsonObject resp;
+        resp["code"] = static_cast<int>(ErrorCode::Ok);
+        QJsonObject data;
+        data["conversations"] = QJsonArray{groupA};
+        resp["data"] = data;
+        packet.payload = payloadBytes(resp);
+        nm.handleGetConversationsResponse(packet);
+
+        QCOMPARE(leftSpy.count(), 1);
+        QCOMPARE(leftSpy.at(0).at(0).toLongLong(), 62LL);
+
+        QCOMPARE(listSpy.count(), 1);
+        const QJsonArray emitted = listSpy.at(0).at(0).toJsonArray();
+        QCOMPARE(emitted.size(), 2);
+        bool sawLeft = false;
+        for (const QJsonValue &v : emitted) {
+            const QJsonObject c = v.toObject();
+            if (c.value("conversationId").toVariant().toLongLong() == 62) {
+                sawLeft = true;
+                QVERIFY(c.value("leftGroup").toBool());
+            }
+        }
+        QVERIFY(sawLeft);
+
+        nm.m_localStore.closeAndDestroy();
+    }
+
+    // M13: 并发退群的在途登记按 requestId 多槽——先发那次的选择不得被后发覆盖
+    //（单槽实现下"先发的那次删除/保留"会静默按后发的选择执行）
+    void concurrentLeaveRequestsKeepOwnChoice()
+    {
+        const QString user =
+            "m13c_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+
+        NetworkManager nm;
+        nm.m_userId = 7;
+        QVERIFY(nm.m_localStore.open(user, "dev0"));
+
+        QJsonObject groupA;
+        groupA["conversationId"] = 71;
+        groupA["type"] = "group";
+        groupA["name"] = "群A";
+        QJsonObject groupB;
+        groupB["conversationId"] = 72;
+        groupB["type"] = "group";
+        groupB["name"] = "群B";
+        QVERIFY(nm.m_localStore.upsertConversations(QJsonArray{groupA, groupB}));
+
+        // 先发 11 选“仅退出（保留历史）”，后发 22 选“退出并删除记录”
+        nm.m_pendingLeaveGroupRequests.insert(11, false);
+        nm.m_pendingLeaveGroupRequests.insert(22, true);
+
+        QSignalSpy deletedSpy(&nm, &NetworkManager::conversationDeleted);
+        QSignalSpy groupLeftSpy(&nm, &NetworkManager::groupLeft);
+
+        const auto leaveResponse = [](quint64 requestId, qint64 conversationId) {
+            Packet p;
+            p.messageType = MessageType::LeaveGroupResponse;
+            p.requestId = requestId;
+            QJsonObject r;
+            r["code"] = static_cast<int>(ErrorCode::Ok);
+            QJsonObject d;
+            d["conversationId"] = conversationId;
+            r["data"] = d;
+            p.payload = payloadBytes(r);
+            return p;
+        };
+
+        // 乱序：先回后发的 22 → 只有群B 被清空（群A 不受影响）
+        nm.handleLeaveGroupResponse(leaveResponse(22, 72));
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(deletedSpy.at(0).at(0).toLongLong(), 72LL);
+        QCOMPARE(groupLeftSpy.at(0).at(1).toBool(), true);
+        QCOMPARE(nm.m_localStore.loadConversations().size(), 1);
+
+        // 再回先发的 11 → 群A 按“保留历史”置只读，历史仍在
+        nm.handleLeaveGroupResponse(leaveResponse(11, 71));
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(groupLeftSpy.count(), 2);
+        QCOMPARE(groupLeftSpy.at(1).at(1).toBool(), false);
+        const QJsonArray rest = nm.m_localStore.loadConversations();
+        QCOMPARE(rest.size(), 1);
+        QCOMPARE(rest.at(0).toObject().value("conversationId").toVariant().toLongLong(), 71LL);
+        QVERIFY(rest.at(0).toObject().value("leftGroup").toBool());
+
+        nm.m_localStore.closeAndDestroy();
+    }
 };
 
 QTEST_GUILESS_MAIN(TestNetworkManager)
