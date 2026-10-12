@@ -521,11 +521,12 @@ Rectangle {
         onLoadContactsRequested: { mainPage.loadContactsRequested() }
     }
 
-    GroupInfoDialog {
-        id: groupInfoDialog
+    // M11C C1: 群信息改由右侧抽屉承接（替代弹出对话框），非模态可边聊边看
+    GroupInfoDrawer {
+        id: groupInfoDrawer
         myUserId: mainPage.myUserId
         onInviteClicked: {
-            inviteDialog.conversationId = mainPage.currentConversationId
+            inviteDialog.conversationId = groupInfoDrawer.convId
             inviteDialog.open()
         }
         // M13: 退群改由二选一对话框承接（仅退出 / 退出并删除记录）
@@ -962,6 +963,14 @@ Rectangle {
         currentGroupMemberCount = isGroup ? (view.groupMemberCount || 0) : 0
         convList.setSelectedByConversationId(convId)
         setActiveView(key, convId)
+        // M11C C1: 抽屉打开时跟随会话切换——目标是活跃在群则换载其群信息，
+        // 私聊或已退出的群没有群信息可看，直接收起
+        if (groupInfoDrawer.opened) {
+            if (isGroup && conv.leftGroup !== true)
+                getGroupInfoRequested(convId)
+            else
+                groupInfoDrawer.close()
+        }
     }
 
     function openChatWithUser(userId, username) {
@@ -985,6 +994,9 @@ Rectangle {
         currentGroupMemberCount = 0
         convList.selectedIndex = -1
         setActiveView(key, 0)
+        // M11C C1: 待绑定私聊没有经过 openConversation，抽屉不会自动换载——
+        // 直接收起，避免继续展示并可操作上一个群的信息
+        groupInfoDrawer.close()
     }
 
     // M12.4: 发送确认（原 bindNewConversation + confirmMessage 合一）。先按幂等键
@@ -1227,7 +1239,29 @@ Rectangle {
     }
 
     function showContacts(contacts) { createGroupDialog.showContacts(contacts) }
-    function showGroupInfo(info) { groupInfoDialog.showInfo(info) }
+    // M11C C1: 结果异步返回时用户可能已切走——只展示当前会话的群信息，
+    // 不为已离开的会话弹开抽屉；已退出（被移出）的群没有群信息入口，
+    // 迟到的响应不得把抽屉重新打开
+    function showGroupInfo(info) {
+        var convId = info.conversationId || 0
+        if (convId !== mainPage.currentConversationId) return
+        var idx = convList.findIndexByConversationId(convId)
+        var conv = idx >= 0 ? convList.getConversation(idx) : null
+        if (conv && conv.leftGroup === true) return
+        groupInfoDrawer.showInfo(info)
+    }
+
+    // M11C C1: 群变更推送或本人邀请/移除成功后，抽屉原地刷新成员与群名
+    function refreshGroupInfoIfOpen(conversationId) {
+        if (groupInfoDrawer.opened && groupInfoDrawer.convId === conversationId)
+            getGroupInfoRequested(conversationId)
+    }
+
+    // M11C C1: 退群/被移出/会话删除时收起对应的群信息抽屉
+    function closeGroupInfo(conversationId) {
+        if (groupInfoDrawer.opened && groupInfoDrawer.convId === conversationId)
+            groupInfoDrawer.close()
+    }
 
     function resetUi() {
         var keys = Object.keys(chatViews)
@@ -1244,6 +1278,7 @@ Rectangle {
         pendingTrackKey = ""
         pendingTrackConversationId = 0
         searchMode = "chat"
+        groupInfoDrawer.close()
         showEmptyState()
         convList.reset()
     }
@@ -1302,6 +1337,7 @@ Rectangle {
     // 其视图一并销毁；若为当前打开的会话则回到空态
     function handleConversationDeleted(conversationId) {
         convList.removeConversation(conversationId)
+        closeGroupInfo(conversationId)
         var key = viewKeyForConversation(conversationId)
         var wasActive = (activeViewKey === key)
         destroyView(key)

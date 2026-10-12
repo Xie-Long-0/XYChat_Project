@@ -21,6 +21,8 @@
         <file>components/EmptyState.qml</file>
         <file>components/LoadingIndicator.qml</file>
         <file>components/NetworkStatusBar.qml</file>
+        <file>components/GroupInfoPanel.qml</file>
+        <file>components/GroupInfoDrawer.qml</file>
         <file>theme/Theme.qml</file>
         <file>theme/qmldir</file>
         <file>icons/close.svg</file>
@@ -65,7 +67,6 @@
         <file>components/QWKButton.qml</file>
         <file>dialogs/SearchDialog.qml</file>
         <file>dialogs/CreateGroupDialog.qml</file>
-        <file>dialogs/GroupInfoDialog.qml</file>
         <file>dialogs/LeaveGroupDialog.qml</file>
         <file>dialogs/InviteDialog.qml</file>
         <file>dialogs/EditMessageDialog.qml</file>

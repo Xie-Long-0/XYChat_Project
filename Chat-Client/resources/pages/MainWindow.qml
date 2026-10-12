@@ -303,6 +303,7 @@ Window {
         //（从列表移除并销毁视图）；保留历史的分支不销毁视图——会话仍在列表，
         // 由本轮会话刷新把它置为只读，用户可继续查看历史
         function onGroupLeft(conversationId, deletedLocalHistory) {
+            mainPage.closeGroupInfo(conversationId)
             if (deletedLocalHistory) {
                 globalToast.info("已退出群聊并删除本机记录")
             } else {
@@ -321,7 +322,22 @@ Window {
         // M13: 本端已非该群成员（被移出/他端退群）。不再销毁会话与历史——
         // 会话留在列表并置只读，用户可继续查看本机历史
         function onConversationLeft(conversationId) {
+            mainPage.closeGroupInfo(conversationId)
             globalToast.info("你已不在该群聊中，聊天记录已保留（只读）")
+        }
+
+        // M11C C1: 群变更推送（成员增删/角色/群名）与本人邀请/移除成功后，
+        // 打开中的群信息抽屉原地刷新——非模态常开期间内容是唯一滞后的展示面
+        function onGroupChanged(payload) {
+            mainPage.refreshGroupInfoIfOpen(payload.conversationId || 0)
+        }
+
+        function onGroupMembersInvited(conversationId) {
+            mainPage.refreshGroupInfoIfOpen(conversationId)
+        }
+
+        function onGroupMemberKicked(conversationId, removedUserId) {
+            mainPage.refreshGroupInfoIfOpen(conversationId)
         }
 
         // M9 特性栈：会话偏好推送（本人其他设备设置后同步）
