@@ -244,6 +244,12 @@ private:
     // M10：会话整表删除（响应 + 推送）
     void handleDeleteConversationResponse(const XYChat::Protocol::Packet &packet);
     void handleConversationDeletedNotification(const XYChat::Protocol::Packet &packet);
+    // M13 加固：跨设备清空（sync_events conversation_cleared 与实时推送共用）。
+    // 清 sender key + 本地缓存并按服务端水位记 mark；*hadLocalConversation 回传
+    // 本机是否确有会话行（决定要不要通知 UI 移除 / 提示）
+    bool purgeClearedConversation(qint64 conversationId, qint64 serverWatermark,
+                                  bool *hadLocalConversation);
+    void handleConversationClearedNotification(const XYChat::Protocol::Packet &packet);
     // M9 特性栈：会话偏好本地应用（响应/推送/事件共用）
     void applyConversationPrefs(qint64 conversationId, bool pinned, bool muted);
     quint64 sendEditMessageRequest(qint64 messageId, qint64 conversationId,
@@ -373,6 +379,10 @@ private:
     // “退出并删除记录”后重新加入时若照旧 afterId=0 全量拉取，
     // 已删除的本地历史会原样复活）
     qint64 applyClearMarkFloor(qint64 conversationId, qint64 afterId) const;
+    // M11C C2: 在线/最后活跃是瞬时值、不落本地缓存；任何"从缓存重发会话列表"
+    // 的路径（读游标、会话偏好、退群、跨设备清空等）都必须把最近一次服务端
+    // 下发的 presence 快照盖回去，否则会整表抹掉列表里的在线状态
+    QJsonArray withPresenceOverlay(const QJsonArray &conversations) const;
     void startInFlightSweep();
     void sweepInFlightRequests();
 
@@ -380,6 +390,12 @@ private:
     QSslSocket *m_sslSocket;
     QTimer *m_heartbeatTimer;
     QTimer *m_reconnectTimer;
+    // M11C C2: 在线状态没有推送通道（服务端按请求返回），认证期间周期性重拉
+    // 会话列表刷新 online/lastActiveAt；未认证/断线/登出时停止
+    QTimer *m_presenceRefreshTimer = nullptr;
+    // conversationId -> {online, lastActiveAt}，最近一次 get_conversations 的服务端
+    // 快照；只活在内存里（不落库），供缓存重发路径回填
+    QHash<qint64, QJsonObject> m_presenceByConversation;
     XYChat::Protocol::PacketCodec m_codec;
     ConnectionState m_state = ConnectionState::Disconnected;
     quint64 m_nextRequestId = 1;

@@ -117,13 +117,21 @@ public:
     bool setConversationLeft(qint64 conversationId, bool left);
     // 清空该会话本地缓存并记录清空水位后移除会话行。服务端仍保留会话
     //（退群不删服务端历史），故重新加入时按水位同步——晚于水位的消息照常
-    // 取回，已删除的本地历史不会复活
-    bool purgeConversation(qint64 conversationId);
+    // 取回，已删除的本地历史不会复活。
+    // serverWatermark：他端“退出并删除”时服务端记下的水位（sync_events
+    // conversation_cleared 携带）；0 表示仅按本地数据取水位
+    bool purgeConversation(qint64 conversationId, qint64 serverWatermark = 0);
     // 本地清空水位（该会话本地已清空到哪个消息 ID 之前；无记录返回 0）
     qint64 conversationClearMark(qint64 conversationId) const;
+    // 会话行是否存在（跨设备清空时用于区分“本机确有数据”与“早已清掉”，
+    // 后者不应再向 UI 发删除事件/提示）
+    bool conversationExists(qint64 conversationId) const;
     // 会话列表对账（服务端权威）：落库给定会话并清除其“已退出”标记，
     // 同时把服务端不再返回的本地群会话标记为已退出（他端退群/被移出/
     // 本次修复前遗留的失效会话）。返回本轮新标记为已退出的会话 ID。
+    // 重新加入（left_group 由 1 复位为 0）时把同步下限抬到服务端当前的
+    // lastMessageId：缺席期间的消息不再回捞（群 E2EE ratchet 已推进，
+    // 多数不可解密），本地原有历史不受影响。
     // 私聊不在对账范围：其存续由 conversation_deleted 事件保证，缺席不代表失效
     QList<qint64> reconcileConversations(const QJsonArray &convs);
 

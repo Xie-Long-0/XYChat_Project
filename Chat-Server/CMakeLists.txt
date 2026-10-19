@@ -41,6 +41,7 @@ set(HEADERS
     core/Server.h
     core/RequestHandler.h
     core/NonceCache.h
+    core/OnlineRegistry.h
     core/RateWindow.h
     database/DatabaseManager.h
     storage/IObjectStorage.h

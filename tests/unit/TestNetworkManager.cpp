@@ -1297,6 +1297,193 @@ private slots:
 
         nm.m_localStore.closeAndDestroy();
     }
+
+    // M13 加固: 他端“退出并删除记录”经账号级 sync_events 补偿——本机清空本地
+    // 缓存并按服务端水位记录清空 mark；重放同一事件不重复通知 UI；已清空的
+    // 会话再收到失权事件不得补发“历史已保留”的只读提示
+    void syncEventConversationClearedPurgesLocally()
+    {
+        const QString user =
+            "m13x_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+
+        NetworkManager nm;
+        nm.m_userId = 7;
+        QVERIFY(nm.m_localStore.open(user, "dev0"));
+
+        QJsonObject conv;
+        conv["conversationId"] = 81;
+        conv["type"] = "group";
+        conv["name"] = "跨设备清空群";
+        conv["lastMessageId"] = 12;
+        QVERIFY(nm.m_localStore.upsertConversation(conv));
+        QJsonObject msg;
+        msg["messageId"] = 12;
+        msg["conversationId"] = 81;
+        msg["senderId"] = 2;
+        msg["senderUsername"] = "bob";
+        msg["content"] = "to be cleared";
+        msg["contentType"] = "text";
+        msg["status"] = "delivered";
+        msg["createdAt"] = "2026-09-30T00:00:00Z";
+        QVERIFY(nm.m_localStore.upsertMessage(msg));
+        QCOMPARE(nm.m_localStore.loadMessages(81).size(), 1);
+
+        QSignalSpy deletedSpy(&nm, &NetworkManager::conversationDeleted);
+        QSignalSpy listSpy(&nm, &NetworkManager::conversationsResult);
+        QSignalSpy leftSpy(&nm, &NetworkManager::conversationLeft);
+
+        QJsonObject payload;
+        payload["conversationId"] = 81;
+        payload["clearedBeforeMessageId"] = 40;
+        QJsonObject cleared;
+        cleared["type"] = "conversation_cleared";
+        cleared["payload"] = payload;
+
+        nm.ingestSyncEvents(QJsonArray{cleared}, 101, false);
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(deletedSpy.at(0).at(0).toLongLong(), 81LL);
+        QCOMPARE(listSpy.count(), 1);
+        QVERIFY(!nm.m_localStore.conversationExists(81));
+        QCOMPARE(nm.m_localStore.loadMessages(81).size(), 0);
+        // 服务端水位高于本地已知最大消息（12）：mark 取 40，重加入不复活
+        QCOMPARE(nm.m_localStore.conversationClearMark(81), 40LL);
+
+        // 重放（下次登录会重读账号事件流）不重复通知
+        nm.ingestSyncEvents(QJsonArray{cleared}, 102, false);
+        QCOMPARE(deletedSpy.count(), 1);
+        QCOMPARE(listSpy.count(), 1);
+
+        // 已清空的会话再收到失权事件：不补发“已退出但保留历史”的提示
+        QJsonObject changedPayload;
+        changedPayload["conversationId"] = 81;
+        changedPayload["changeType"] = "member_left";
+        changedPayload["operatorId"] = 7;
+        changedPayload["targetUserId"] = 7;
+        QJsonObject changed;
+        changed["type"] = "group_changed";
+        changed["payload"] = changedPayload;
+        nm.ingestSyncEvents(QJsonArray{changed}, 103, false);
+        QCOMPARE(leftSpy.count(), 0);
+
+        // 同批“清空 → 又被邀请回群”：旧历史仍清空，但不发会话删除通知
+        //（成员资格仍在；会话行由下一次列表对账恢复并抬同步下限）
+        QJsonObject regained;
+        regained["conversationId"] = 82;
+        regained["type"] = "group";
+        regained["name"] = "清空后回群";
+        regained["lastMessageId"] = 15;
+        QVERIFY(nm.m_localStore.upsertConversation(regained));
+        QJsonObject cleared2;
+        cleared2["type"] = "conversation_cleared";
+        QJsonObject payload2;
+        payload2["conversationId"] = 82;
+        payload2["clearedBeforeMessageId"] = 30;
+        cleared2["payload"] = payload2;
+        QJsonObject addedPayload;
+        addedPayload["conversationId"] = 82;
+        addedPayload["changeType"] = "member_added";
+        addedPayload["targetUserId"] = 7;
+        QJsonObject added;
+        added["type"] = "group_changed";
+        added["payload"] = addedPayload;
+        const int deletedBefore = deletedSpy.count();
+        nm.ingestSyncEvents(QJsonArray{cleared2, added}, 104, false);
+        QCOMPARE(deletedSpy.count(), deletedBefore);
+        QVERIFY(!nm.m_localStore.conversationExists(82));
+        QCOMPARE(nm.m_localStore.conversationClearMark(82), 30LL);
+
+        // 实时推送路径：本人其他设备发起清空 → 本机清空并通知；
+        // 发起设备与通知的 originDeviceId 相同 → 忽略（响应路径已处理）
+        nm.m_localDeviceId = "dev0";
+        QJsonObject liveConv;
+        liveConv["conversationId"] = 83;
+        liveConv["type"] = "group";
+        liveConv["name"] = "实时清空";
+        liveConv["lastMessageId"] = 9;
+        QVERIFY(nm.m_localStore.upsertConversation(liveConv));
+        const auto clearedNotification = [](qint64 convId, const QString &originDevice) {
+            Packet p;
+            p.messageType = MessageType::ConversationClearedNotification;
+            p.requestId = 0;
+            QJsonObject payload;
+            payload["conversationId"] = convId;
+            payload["clearedBeforeMessageId"] = 42;
+            payload["originDeviceId"] = originDevice;
+            p.payload = payloadBytes(payload);
+            return p;
+        };
+        nm.handleConversationClearedNotification(clearedNotification(83, "other-device"));
+        QCOMPARE(deletedSpy.count(), deletedBefore + 1);
+        QCOMPARE(deletedSpy.at(deletedSpy.count() - 1).at(0).toLongLong(), 83LL);
+        QVERIFY(!nm.m_localStore.conversationExists(83));
+
+        const int deletedAfterLive = deletedSpy.count();
+        QVERIFY(nm.m_localStore.upsertConversation(liveConv));
+        nm.handleConversationClearedNotification(clearedNotification(83, "dev0"));
+        QCOMPARE(deletedSpy.count(), deletedAfterLive);
+        QVERIFY(nm.m_localStore.conversationExists(83));
+
+        nm.m_localStore.closeAndDestroy();
+    }
+
+    // M11C C2 回归：切换会话会触发已读游标并"从本地缓存重发会话列表"。
+    // 在线状态刻意不落库，重发前必须回填最近一次服务端快照——否则一次切会话
+    // 就会把列表里的在线绿点全部抹掉（用户报告的缺陷）
+    void presenceSurvivesCacheResendAfterReadCursor()
+    {
+        const QString user =
+            "presence_" + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
+
+        NetworkManager nm;
+        nm.m_userId = 7;
+        QVERIFY(nm.m_localStore.open(user, "dev0"));
+
+        QJsonObject privateConv;
+        privateConv["conversationId"] = 91;
+        privateConv["type"] = "private";
+        privateConv["peerUserId"] = 8;
+        privateConv["peerUsername"] = "bob";
+        QVERIFY(nm.m_localStore.upsertConversation(privateConv));
+
+        // 服务端响应携带在线状态 → 链路层缓存该快照
+        QJsonObject serverConv = privateConv;
+        serverConv["online"] = true;
+        serverConv["lastActiveAt"] = "2026-10-19 08:00:00";
+        nm.m_pendingGetConversationsRequestId = 55;
+        Packet packet;
+        packet.messageType = MessageType::GetConversationsResponse;
+        packet.requestId = 55;
+        QJsonObject response;
+        response["code"] = static_cast<int>(ErrorCode::Ok);
+        QJsonObject data;
+        data["conversations"] = QJsonArray{serverConv};
+        response["data"] = data;
+        packet.payload = payloadBytes(response);
+
+        QSignalSpy listSpy(&nm, &NetworkManager::conversationsResult);
+        nm.handleGetConversationsResponse(packet);
+        QCOMPARE(listSpy.count(), 1);
+        const QJsonArray initial = listSpy.at(0).at(0).toJsonArray();
+        QCOMPARE(initial.size(), 1);
+        QVERIFY(initial.at(0).toObject().value("online").toBool());
+
+        // 切会话 → 已读游标 → 缓存重发：在线状态与时间戳必须保留
+        nm.applyReadCursor(91, 5);
+        QCOMPARE(listSpy.count(), 2);
+        const QJsonArray resent = listSpy.at(1).at(0).toJsonArray();
+        QCOMPARE(resent.size(), 1);
+        QVERIFY(resent.at(0).toObject().value("online").toBool());
+        QCOMPARE(resent.at(0).toObject().value("lastActiveAt").toString(),
+                 QString("2026-10-19 08:00:00"));
+
+        // 会话偏好推送同样走缓存重发
+        nm.applyConversationPrefs(91, true, false);
+        const QJsonArray prefs = listSpy.at(listSpy.count() - 1).at(0).toJsonArray();
+        QCOMPARE(prefs.size(), 1);
+        QVERIFY(prefs.at(0).toObject().value("online").toBool());
+
+        nm.m_localStore.closeAndDestroy();
+    }
 };
 
 QTEST_GUILESS_MAIN(TestNetworkManager)

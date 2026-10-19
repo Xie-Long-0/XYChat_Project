@@ -279,6 +279,8 @@ Rectangle {
                     name: model.displayName
                     size: Theme.avatarSize
                     isGroup: model.type === "group"
+                    // M11C C2: 私聊会话头像右下角显示在线绿点（群聊无在线概念）
+                    online: model.type !== "group" && model.online === true
                 }
 
                 // 信息区域

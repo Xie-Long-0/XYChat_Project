@@ -42,12 +42,22 @@ NetworkManager::NetworkManager(QObject *parent) :
     m_heartbeatTimer(new QTimer(this)),
     m_reconnectTimer(new QTimer(this)),
     m_tokenRenewTimer(new QTimer(this)),
+    m_presenceRefreshTimer(new QTimer(this)),
     m_fileTransfer(new XYChat::Client::FileTransferManager(this))
 {
     m_heartbeatTimer->setInterval(30000);
     m_reconnectTimer->setInterval(3000);
     m_reconnectTimer->setSingleShot(true);
     m_tokenRenewTimer->setSingleShot(true);
+    // M11C C2: 在线/最后活跃是服务端随 get_conversations 下发的瞬时状态，
+    // 没有推送通道——不周期性重拉的话，对方上下线的变化要等到用户下一次
+    // 手动刷新或群操作才可见。60 秒一次整表刷新对小型部署可接受
+    m_presenceRefreshTimer->setInterval(60000);
+    connect(m_presenceRefreshTimer, &QTimer::timeout, this, [this]() {
+        if (m_state == ConnectionState::Authenticated && !m_sessionToken.isEmpty()) {
+            getConversations();
+        }
+    });
 
     connect(m_sslSocket, &QSslSocket::connected, this, &NetworkManager::onConnected);
     connect(m_sslSocket, &QSslSocket::disconnected, this, &NetworkManager::onDisconnected);
@@ -174,6 +184,9 @@ void NetworkManager::onDisconnected()
     const bool shouldRelogin = m_reconnectEnabled && !m_pendingUsername.isEmpty();
 
     m_heartbeatTimer->stop();
+    if (m_presenceRefreshTimer) {
+        m_presenceRefreshTimer->stop();
+    }
     // P2: 连接断开时清在途续期请求并停续期定时器（重连重登后由登录响应重新调度）
     if (m_tokenRenewTimer) {
         m_tokenRenewTimer->stop();
@@ -581,6 +594,10 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::ConversationDeletedNotification:
         handleConversationDeletedNotification(packet);
         break;
+    // M13 加固: 本人其他设备的跨设备清空（实时推送）
+    case MessageType::ConversationClearedNotification:
+        handleConversationClearedNotification(packet);
+        break;
     // M8.2: 文件控制面响应（数据面走 HTTP，不经此处）
     case MessageType::FileUploadCreateResponse:
         handleFileUploadCreateResponse(packet);
@@ -635,6 +652,7 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         // 任务立即回失败而不是静默排队
         m_fileTransfer->setBaseUrl(data.value("fileTransferBaseUrl").toString());
         setState(ConnectionState::Authenticated);
+        m_presenceRefreshTimer->start();
         emit sessionChanged();
         emit loginSuccessful();
         // M6.5: 打开本地加密缓存（加载持久化 outbox、立即展示缓存会话、游标增量同步）
@@ -764,6 +782,9 @@ void NetworkManager::resetAuthState()
     if (m_tokenRenewTimer) {
         m_tokenRenewTimer->stop();
     }
+    if (m_presenceRefreshTimer) {
+        m_presenceRefreshTimer->stop();
+    }
     m_pendingTokenRenewRequestId = 0;
     m_sessionExpiresAtSecs = 0;
     m_userId = 0;
@@ -776,6 +797,8 @@ void NetworkManager::resetAuthState()
     m_fetchKeysTargetUserId = 0;
     m_fetchBackoffUntil.clear();
     m_serverPrekeyRemaining = -1;
+    // M11C C2: 在线状态快照不跨账号残留
+    m_presenceByConversation.clear();
     m_decryptCache.clear();
     m_decryptCacheLoaded = false;
     m_pendingFetchGroupKeysRequestId = 0;
@@ -2524,6 +2547,30 @@ qint64 NetworkManager::applyClearMarkFloor(qint64 conversationId, qint64 afterId
     return mark > afterId ? mark : afterId;
 }
 
+// M11C C2: 把最近一次服务端下发的 presence 快照盖到会话数组上。本地缓存不含
+// 在线状态，任何"从缓存重发列表"的路径都要经此回填，否则一次读游标/偏好刷新
+// 就会把 UI 里的在线绿点全部抹掉
+QJsonArray NetworkManager::withPresenceOverlay(const QJsonArray &conversations) const
+{
+    if (m_presenceByConversation.isEmpty()) {
+        return conversations;
+    }
+    QJsonArray result;
+    for (const QJsonValue &value : conversations) {
+        QJsonObject conv = value.toObject();
+        if (conv.value("type").toString() == "private") {
+            const auto it = m_presenceByConversation.constFind(
+                conv.value("conversationId").toVariant().toLongLong());
+            if (it != m_presenceByConversation.constEnd()) {
+                conv["online"] = it->value("online");
+                conv["lastActiveAt"] = it->value("lastActiveAt");
+            }
+        }
+        result.append(conv);
+    }
+    return result;
+}
+
 // M3: 同步消息
 void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int limit)
 {
@@ -2661,32 +2708,23 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
         if (merged.isEmpty() && !conversations.isEmpty()) {
             merged = conversations;
         }
-        // M11C C2: 最后活跃/在线是瞬时状态，刻意不进本地缓存——缓存里的"在线"
-        // 在下次启动时会变成上一次会话的陈旧值。此处按 conversationId 把服务端
-        // 的这两个字段盖到合并后的列表上，使缓存优先的展示路径也能拿到它
-        QHash<qint64, QJsonObject> presenceByConv;
+        // M11C C2: 用本轮服务端响应重建 presence 快照（先清后填，避免已删除的
+        // 会话残留旧值），并立即盖到合并列表上。快照同时供其他"从缓存重发列表"
+        // 的路径回填——读游标/会话偏好/退群等都会重发缓存列表，不盖回就会在
+        // 切换会话（触发已读回执）时整表抹掉在线绿点
+        m_presenceByConversation.clear();
         for (const QJsonValue &value : std::as_const(conversations)) {
             const QJsonObject conv = value.toObject();
             if (conv.value("type").toString() != "private") {
                 continue;
             }
-            presenceByConv.insert(conv.value("conversationId").toVariant().toLongLong(), conv);
+            QJsonObject presence;
+            presence["online"] = conv.value("online");
+            presence["lastActiveAt"] = conv.value("lastActiveAt");
+            m_presenceByConversation.insert(
+                conv.value("conversationId").toVariant().toLongLong(), presence);
         }
-        if (!presenceByConv.isEmpty()) {
-            for (QJsonValueRef value : merged) {
-                const QJsonObject cached = value.toObject();
-                const auto it = presenceByConv.constFind(
-                    cached.value("conversationId").toVariant().toLongLong());
-                if (it == presenceByConv.constEnd()) {
-                    continue;
-                }
-                QJsonObject withPresence = cached;
-                withPresence["online"] = it->value("online");
-                withPresence["lastActiveAt"] = it->value("lastActiveAt");
-                value = withPresence;
-            }
-        }
-        emit conversationsResult(merged);
+        emit conversationsResult(withPresenceOverlay(merged));
     }
 }
 
@@ -3532,7 +3570,7 @@ void NetworkManager::applyReadCursor(qint64 conversationId, qint64 readMessageId
     if (m_localStore.isOpen()) {
         m_localStore.markConversationRead(conversationId, readMessageId, m_userId);
         // 会话列表未读角标已变，重新 emit 缓存会话刷新侧边栏
-        emit conversationsResult(m_localStore.loadConversations());
+        emit conversationsResult(withPresenceOverlay(m_localStore.loadConversations()));
     }
     emit readCursorAdvanced(conversationId, readMessageId);
 }
@@ -3673,7 +3711,7 @@ void NetworkManager::emitCachedConversations()
     const QJsonArray cached = m_localStore.loadConversations();
     if (!cached.isEmpty()) {
         // 立即展示上一会话周期的会话列表，随后服务端数据到达时刷新
-        emit conversationsResult(cached);
+        emit conversationsResult(withPresenceOverlay(cached));
     }
 }
 
@@ -3687,6 +3725,13 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
     QSet<qint64> healConvs;
     // M13: 离线期间本端失去成员资格的群（他端退群/被移出）——批次结束统一通知 UI
     QSet<qint64> leftConvs;
+    // M13 加固: 他端“退出并删除记录”的跨设备清空——本机确实还有数据时才通知
+    // UI 移除；发起设备自己早已清过，重放本事件不应再弹删除提示
+    QSet<qint64> clearedConvs;
+    // 同批事件里“又被邀请回群”的会话：清空仍生效（旧历史删除），但不向 UI
+    // 发会话删除通知（成员资格仍在；会话行由下一次列表对账恢复）
+    QSet<qint64> rejoinedConvs;
+    bool purgeFailed = false;
 
     for (const QJsonValue &value : events) {
         const QJsonObject event = value.toObject();
@@ -3739,18 +3784,41 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
             const bool selfRemoved =
                 (changeType == "member_removed" && targetUserId == m_userId)
                 || (changeType == "member_left" && operatorId == m_userId);
+            // 同批“又被邀请回群”：用于抑制随后（按 seq 应在前面）的清空事件对
+            // UI 发出的会话删除通知，见批次末的 clearedConvs 过滤
+            if (convId > 0 && changeType == "member_added" && targetUserId == m_userId) {
+                rejoinedConvs.insert(convId);
+            }
             if (convId > 0 && membershipChanged) {
                 if (selfRemoved) {
-                    // M13: 离线期间他端退群/被移出——默认保留本机历史（只读）
+                    // M13: 离线期间他端退群/被移出——默认保留本机历史（只读）。
+                    // 若会话已被“退出并删除”事件清掉（同一账号的事件流里两条
+                    // 事件可能同批或跨批到达），不再补打标记与提示
                     m_groupSenderKeys.remove(convId);
                     healConvs.remove(convId);
-                    if (m_localStore.isOpen()) {
+                    if (m_localStore.isOpen() && m_localStore.conversationExists(convId)) {
                         m_localStore.setConversationLeft(convId, true);
                         leftConvs.insert(convId);
                     }
                 } else {
                     healConvs.insert(convId);
                 }
+            }
+        } else if (type == "conversation_cleared") {
+            // M13 加固: 本人其他设备“退出并删除记录”的跨设备补偿。退群后已非
+            // 成员，实时推送无从投递，故由服务端写账号级事件；这里按事件携带的
+            // 服务端水位清空本地缓存（水位取最大值，防止随后重加入把已删历史拉回）
+            const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
+            const qint64 serverWatermark =
+                payload.value("clearedBeforeMessageId").toVariant().toLongLong();
+            bool existed = false;
+            if (purgeClearedConversation(convId, serverWatermark, &existed)) {
+                leftConvs.remove(convId);
+                if (existed) {
+                    clearedConvs.insert(convId);
+                }
+            } else if (convId > 0) {
+                purgeFailed = true;
             }
         } else if (type == "conversation_prefs") {
             // M9 特性栈：离线期间的会话偏好变更补偿（本人其他设备设置）
@@ -3811,13 +3879,34 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
         healGroupSenderKey(convId);
     }
 
+    // M13 加固: 跨设备清空的会话从列表与视图中移除（复用会话删除路径）。
+    // clearedConvs 只收“本机确有数据”的会话，重放本事件不会重复提示；
+    // 同一批里又被邀请回群的会话只清历史、不删会话（成员资格仍在）
+    bool notifiedCleared = false;
+    for (qint64 convId : std::as_const(clearedConvs)) {
+        if (rejoinedConvs.contains(convId)) {
+            continue;
+        }
+        emit conversationDeleted(convId);
+        notifiedCleared = true;
+    }
+
     // M13: 离线期间的失权变更同样要落到 UI（会话置只读并提示），
     // 否则本批事件标记了“已退出”而列表仍是旧态
     if (!leftConvs.isEmpty()) {
         for (qint64 convId : std::as_const(leftConvs)) {
             emit conversationLeft(convId);
         }
-        emit conversationsResult(m_localStore.loadConversations());
+    }
+    if (!leftConvs.isEmpty() || notifiedCleared) {
+        emit conversationsResult(withPresenceOverlay(m_localStore.loadConversations()));
+    }
+
+    // 清空失败（SQLite 出错）不得前进游标：草稿/删除意图会随下次同步重放；
+    // 前进即永久丢失。其余已应用的事件重放均幂等
+    if (purgeFailed) {
+        qWarning() << "[NetMgr] conversation_cleared purge failed; keep sync cursor for retry";
+        return;
     }
 
     // 游标单调前进
@@ -3911,6 +4000,10 @@ void NetworkManager::leaveGroup(qint64 conversationId, bool deleteLocalHistory)
     QJsonObject json;
     json["type"] = "leave_group";
     json["conversationId"] = conversationId;
+    // M13 加固: 把“删除本机记录”的意图随退群请求上报，服务端据此向本账号
+    // 的 sync_events 写 conversation_cleared——退群后成员资格已不存在，
+    // 推送无从投递，只有账号级事件能让本人的其他设备同步清空
+    json["deleteHistory"] = deleteLocalHistory;
     addReplayProtection(json);
 
     Packet packet;
@@ -4050,14 +4143,14 @@ void NetworkManager::handleLeaveGroupResponse(const Packet &packet)
                        << conversationId;
             if (m_localStore.isOpen()) {
                 m_localStore.setConversationLeft(conversationId, true);
-                emit conversationsResult(m_localStore.loadConversations());
+                emit conversationsResult(withPresenceOverlay(m_localStore.loadConversations()));
             }
             emit conversationDeleteFailed("Failed to delete local history");
         }
     } else if (m_localStore.isOpen()) {
         m_localStore.setConversationLeft(conversationId, true);
         // 立即用本地列表刷新（不等服务端响应）：会话仍应留在列表且置只读
-        emit conversationsResult(m_localStore.loadConversations());
+        emit conversationsResult(withPresenceOverlay(m_localStore.loadConversations()));
     }
     getConversations();
     emit groupLeft(conversationId, deleteLocalHistory);
@@ -4211,7 +4304,7 @@ void NetworkManager::applyConversationPrefs(qint64 conversationId, bool pinned, 
     }
     if (m_localStore.isOpen()) {
         m_localStore.setConversationPrefs(conversationId, pinned, muted);
-        emit conversationsResult(m_localStore.loadConversations());
+        emit conversationsResult(withPresenceOverlay(m_localStore.loadConversations()));
     }
     emit conversationPrefsChanged(conversationId, pinned, muted);
 }
@@ -4262,6 +4355,59 @@ void NetworkManager::handleDeleteConversationResponse(const Packet &packet)
         m_localStore.deleteConversation(conversationId);
     }
     emit conversationDeleted(conversationId);
+}
+
+// M13 加固: 跨设备清空的本地落盘（sync_events 补偿与实时推送共用）。
+// 返回 false 表示本地库不可用或清理失败；hadLocalConversation 回传清理前
+// 本机是否确有会话行（决定要不要通知 UI 移除/提示）
+bool NetworkManager::purgeClearedConversation(qint64 conversationId, qint64 serverWatermark,
+                                              bool *hadLocalConversation)
+{
+    if (hadLocalConversation) {
+        *hadLocalConversation = false;
+    }
+    if (conversationId <= 0 || !m_localStore.isOpen()) {
+        return false;
+    }
+    auto keyIt = m_groupSenderKeys.find(conversationId);
+    if (keyIt != m_groupSenderKeys.end()) {
+        SecureMemory::wipe(keyIt->chainKey);
+        SecureMemory::wipe(keyIt->privateSigningKey);
+        m_groupSenderKeys.erase(keyIt);
+    }
+    m_localStore.removeSenderKeysForGroup(conversationId);
+    if (hadLocalConversation) {
+        *hadLocalConversation = m_localStore.conversationExists(conversationId);
+    }
+    if (!m_localStore.purgeConversation(conversationId, serverWatermark)) {
+        qWarning() << "[NetMgr] purge cleared conversation failed:" << conversationId;
+        return false;
+    }
+    return true;
+}
+
+// M13 加固: 本人其他在线设备的跨设备清空（实时推送版本）。离线设备由
+// sync_events 的 conversation_cleared 补偿；发起设备按 originDeviceId 忽略
+void NetworkManager::handleConversationClearedNotification(const Packet &packet)
+{
+    const QJsonObject data = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        return;
+    }
+    // 本事件只投递给操作者本人账号（不涉及其他成员），故按设备 ID 去重即可
+    const QString originDeviceId = data.value("originDeviceId").toString();
+    if (!originDeviceId.isEmpty() && originDeviceId == m_localDeviceId) {
+        return;
+    }
+    bool existed = false;
+    if (purgeClearedConversation(
+            conversationId,
+            data.value("clearedBeforeMessageId").toVariant().toLongLong(), &existed)
+        && existed) {
+        emit conversationDeleted(conversationId);
+        emit conversationsResult(withPresenceOverlay(m_localStore.loadConversations()));
+    }
 }
 
 // M10: 会话删除推送（其他成员删除，或本人其他设备删除）。发起设备去重后

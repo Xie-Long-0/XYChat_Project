@@ -8,12 +8,14 @@
 #include <QElapsedTimer>
 
 #include <atomic>
+#include <memory>
 
 #include "protocol/PacketCodec.h"
 #include "RateWindow.h"
 
 class DatabaseManager;
 class NonceCache;
+class OnlineRegistry;
 struct FileRecord;
 namespace XYChat::Server { class IObjectStorage; }
 
@@ -40,6 +42,15 @@ public:
 
     // M5.5: 设置全局 nonce 缓存（由 Server 在 start() 前调用）
     void setNonceCache(NonceCache *cache);
+
+    // M11C C2 加固: 设置连接级在线注册表（由 Server 在 start() 前调用）。
+    // 登录成功/登出/续期/断开时同步维护，get_conversations 读取真实在线状态。
+    // 用 shared_ptr 共享所有权：handler 线程可能晚于 Server 对象结束，
+    // 值成员会留下悬垂指针
+    void setOnlineRegistry(std::shared_ptr<OnlineRegistry> registry)
+    {
+        m_onlineRegistry = std::move(registry);
+    }
 
     // M8: 设置对象存储（由 Server 在 start() 前调用，存储初始化成功才会注入）。
     // 为空时所有文件请求一律回 FileStorageFailed，不让文件消息静默退化成文本消息
@@ -206,6 +217,8 @@ private:
 
     // 数据库（每个线程使用独立连接名）
     DatabaseManager *m_db = nullptr;
+    // M11C C2 加固: 连接级在线注册表（跨线程共享，内部加锁）
+    std::shared_ptr<OnlineRegistry> m_onlineRegistry;
 
     // 限流常量
     static constexpr int MaxFailedLoginsPerIP = 10;

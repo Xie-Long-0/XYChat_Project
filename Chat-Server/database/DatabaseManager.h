@@ -49,9 +49,9 @@ struct ConversationInfo
     // 对于一对一会话，记录对方信息
     qint64 peerUserId = 0;
     QString peerUsername;
-    // C2: 对方最近一次活跃时间与"在线"判定（取自 sessions.last_active_at）。
-    // 在线为启发式：ping 无需认证、不刷新活跃时间，故空闲但已连接的客户端
-    // 不计为在线——见 ROADMAP §3 登记项
+    // C2: 对方最近一次活跃时间与"最近活跃"判定（取自 sessions.last_active_at）。
+    // 该判定是启发式：ping 无需认证、不刷新活跃时间，故只能反映"最近有真实请求"。
+    // 真实在线状态由 RequestHandler 用 OnlineRegistry 与之取或后下发
     QString peerLastActiveAt;
     bool peerOnline = false;
     QString lastMessage;
@@ -257,6 +257,9 @@ public:
     bool updateMemberReadCursor(qint64 conversationId, qint64 userId, qint64 messageId);
 
     // M5.5: 同步事件流
+    // M13 加固: 会话当前最大消息 ID——“退出并删除本机记录”时作为跨设备清空水位，
+    // 保证其他设备与重新加入后的同步下限不会低于该值
+    qint64 conversationMessageWatermark(qint64 conversationId) const;
     qint64 appendSyncEvent(qint64 userId, const QString &eventType, const QString &payloadJson);
     QList<SyncEventInfo> getSyncEvents(qint64 userId, qint64 afterSeq, int limit = 200);
     // M9: sync_events 保留清理与落后检测

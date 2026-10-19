@@ -18,7 +18,6 @@ Item {
     signal inviteClicked()
     signal leaveRequested(int conversationId)
     signal kickRequested(int conversationId, int userId)
-    signal refreshRequested(int conversationId)
 
     implicitWidth: Theme.rightPanelWidth
 
@@ -168,10 +167,9 @@ Item {
                         text: "移除"
                         variant: "flat"
                         font.pixelSize: Theme.fontSizeCaption
-                        onClicked: {
-                            root.kickRequested(root.convId, model.userId)
-                            root.refreshRequested(root.convId)
-                        }
+                        // 刷新交给 MainPage 的合并请求（响应/广播驱动）——
+                        // 这里再发一条乐观刷新会让一次踢人打三次 get_group_info
+                        onClicked: root.kickRequested(root.convId, model.userId)
                     }
                 }
             }

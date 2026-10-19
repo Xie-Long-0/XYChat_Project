@@ -20,12 +20,15 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSslSocket>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QUuid>
 
 #include "core/RequestHandler.h"
 #include "core/Server.h"
+#include "database/DatabaseManager.h"
 
 #include "Packet.h"
 #include "PacketCodec.h"
@@ -152,6 +155,33 @@ private:
         return {};
     }
 
+    // 等待一条不带 requestId 的服务端推送（如 ConversationClearedNotification）
+public:
+    QJsonObject waitForNotification(MessageType type, int timeoutMs = 5000)
+    {
+        QDeadlineTimer deadline(timeoutMs);
+        Packet packet;
+        while (!deadline.hasExpired()) {
+            while (m_codec.nextPacket(packet) == PacketCodec::DecodeStatus::PacketReady) {
+                if (packet.messageType == type) {
+                    return QJsonDocument::fromJson(packet.payload).object();
+                }
+            }
+            // 推送路由经 Server 主线程（队列连接转发到 handler），测试主线程
+            // 必须泵事件，否则消息永远停在队列里
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            // 已有可读数据时 waitForReadyRead 会立即返回 false（它只等“新”数据），
+            // 必须先看 bytesAvailable，否则缓冲里的推送永远读不出来
+            if (m_socket.bytesAvailable() > 0 || m_socket.waitForReadyRead(20)) {
+                m_codec.appendData(m_socket.readAll());
+            }
+        }
+        qWarning() << "[TestTlsIntegration] timeout waiting for notification"
+                   << static_cast<int>(type);
+        return {};
+    }
+
+private:
     QSslSocket m_socket;
     PacketCodec m_codec;
     QString m_token;
@@ -175,6 +205,8 @@ private slots:
 
     void serverRefusesPlaintextStartWithoutTls();
     void encryptedRoundTripAcrossTwoUsersAndConnections();
+    void idleAuthenticatedConnectionStaysOnline();
+    void leaveGroupWithDeleteRecordsCrossDeviceClear();
     void replyToMessageRoundTripOverChannel();
     void replyTargetValidationRejectsBadReferences();
     void clientWithoutCaRejectsHandshake();
@@ -273,6 +305,280 @@ void TestTlsIntegration::encryptedRoundTripAcrossTwoUsersAndConnections()
     QCOMPARE(users.at(0).toObject().value("username").toString(), QString("tls_bob"));
 
     alice.close();
+    bob.close();
+}
+
+// M11C C2 加固：在线判定必须反映"当前仍有已认证连接"，而不是只看最近活跃时间。
+// 把 bob 的 sessions.last_active_at 拨到 1 小时前（等价于"连着但不操作"），
+// alice 的 get_conversations 仍应看到 bob 在线；bob 断开后应转为离线。
+// 反向断言（断开后为离线）同时覆盖注册表的摘除路径
+void TestTlsIntegration::idleAuthenticatedConnectionStaysOnline()
+{
+    TlsTestClient alice;
+    QVERIFY(alice.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(alice.registerUser("presence_alice", "test123456")), int(ErrorCode::Ok));
+    const QJsonObject loginA = alice.login("presence_alice", "test123456", "presence-dev-a");
+    QCOMPARE(codeOf(loginA), int(ErrorCode::Ok));
+    const qint64 aliceId = loginA.value("data").toObject().value("userId").toVariant().toLongLong();
+    QVERIFY(aliceId > 0);
+
+    TlsTestClient bob;
+    QVERIFY(bob.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(bob.registerUser("presence_bob", "test123456")), int(ErrorCode::Ok));
+    const QJsonObject loginB = bob.login("presence_bob", "test123456", "presence-dev-b");
+    QCOMPARE(codeOf(loginB), int(ErrorCode::Ok));
+    const qint64 bobId = loginB.value("data").toObject().value("userId").toVariant().toLongLong();
+    QVERIFY(bobId > 0);
+
+    // 建一条私聊会话（在线字段只对私聊回填），并把握手时的活跃时间拨老
+    {
+        DatabaseManager db("tls_presence_setup");
+        QVERIFY(db.initialize());
+        QVERIFY(db.getOrCreatePrivateConversation(aliceId, bobId) > 0);
+    }
+    // 把 bob 的所有 session 活跃时间拨老，排除 120s 启发式兜底的干扰
+    auto backdateBobSessions = [this, bobId]() -> bool {
+        bool ok = false;
+        {
+            QSqlDatabase probe = QSqlDatabase::addDatabase("QSQLITE", "tls_presence_probe");
+            probe.setDatabaseName(m_dir->path() + "/db/chatapp.db");
+            if (!probe.open()) {
+                return false;
+            }
+            QSqlQuery backdate(probe);
+            backdate.prepare(
+                "UPDATE sessions SET last_active_at = datetime('now','-1 hour') WHERE user_id = ?");
+            backdate.addBindValue(bobId);
+            ok = backdate.exec();
+            probe.close();
+        }
+        QSqlDatabase::removeDatabase("tls_presence_probe");
+        return ok;
+    };
+    QVERIFY(backdateBobSessions());
+
+    auto bobOnlineForAlice = [&alice, bobId]() -> int {
+        const QJsonObject response =
+            alice.request(MessageType::GetConversationsRequest, "get_conversations", {});
+        if (codeOf(response) != int(ErrorCode::Ok)) {
+            return -1;
+        }
+        const QJsonArray conversations =
+            response.value("data").toObject().value("conversations").toArray();
+        for (const QJsonValue &value : conversations) {
+            const QJsonObject conversation = value.toObject();
+            if (conversation.value("peerUserId").toVariant().toLongLong() == bobId) {
+                return conversation.value("online").toBool() ? 1 : 0;
+            }
+        }
+        return -1;
+    };
+
+    QCOMPARE(bobOnlineForAlice(), 1);
+
+    // 续期会更换 sessionId：注册表必须同步换登记。续期创建的会话活跃时间是
+    // "现在"，重新拨老以排除启发式兜底——若旧登记未摘除，断开后它仍会显示在线
+    const QJsonObject renewed =
+        bob.request(MessageType::TokenRenewRequest, "renew_token", {});
+    QCOMPARE(codeOf(renewed), int(ErrorCode::Ok));
+    QVERIFY(backdateBobSessions());
+    QCOMPARE(bobOnlineForAlice(), 1);
+
+    // 断开 bob：服务端在 handler 线程处理断开并摘除登记，轮询等待其生效。
+    // 活跃时间仍是一小时前，故此时只有注册表摘除才能让结果变为离线
+    bob.close();
+    QDeadlineTimer deadline(5000);
+    int online = 1;
+    while (!deadline.hasExpired()) {
+        online = bobOnlineForAlice();
+        if (online == 0) {
+            break;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    QCOMPARE(online, 0);
+
+    alice.close();
+}
+
+// M13 加固：退出并删除本机记录必须跨设备生效。退群后已非成员，成员态推送
+// 无从投递，故服务端向本人账号写 conversation_cleared（携带会话当前最大消息 ID）；
+// 本人其他设备据此清空本地并记录水位。无删除意图的退群不写该事件。
+// 同时验证 deleteHistory 的形态校验先于任何副作用（非布尔 → InvalidRequest）
+void TestTlsIntegration::leaveGroupWithDeleteRecordsCrossDeviceClear()
+{
+    TlsTestClient alice;
+    QVERIFY(alice.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(alice.registerUser("clear_alice", "test123456")), int(ErrorCode::Ok));
+    const QJsonObject loginA =
+        alice.login("clear_alice", "test123456", "clear-dev-a");
+    QVERIFY(!loginA.value("data").toObject().value("token").toString().isEmpty());
+    const qint64 aliceId =
+        loginA.value("data").toObject().value("userId").toVariant().toLongLong();
+    QVERIFY(aliceId > 0);
+
+    TlsTestClient bob;
+    QVERIFY(bob.connectTo(m_port, m_caPath));
+    QCOMPARE(codeOf(bob.registerUser("clear_bob", "test123456")), int(ErrorCode::Ok));
+    QVERIFY(!bob.login("clear_bob", "test123456", "clear-dev-b")
+                 .value("data").toObject().value("token").toString().isEmpty());
+
+    // 本人第二台设备：用于断言“退出并删除记录”的实时推送（不只靠下次登录补拉）
+    TlsTestClient aliceSecond;
+    QVERIFY(aliceSecond.connectTo(m_port, m_caPath));
+    QVERIFY(!aliceSecond.login("clear_alice", "test123456", "clear-dev-a2")
+                 .value("data").toObject().value("token").toString().isEmpty());
+
+    // 测试线程同时是 Server 的主线程：登录信号经队列连接回到这里，需泵一次
+    // 事件循环把它处理完，否则 messageForUser 路由不到第二台设备
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+
+    const QJsonObject search = alice.request(MessageType::SearchUsersRequest, "search_users",
+                                             { { "query", "clear_bob" } });
+    QCOMPARE(codeOf(search), int(ErrorCode::Ok));
+    const qint64 bobId = search.value("data").toObject().value("users").toArray()
+                             .at(0).toObject().value("userId").toVariant().toLongLong();
+    QVERIFY(bobId > 0);
+
+    auto createGroup = [&alice, bobId](const QString &name) -> qint64 {
+        const QJsonObject created = alice.request(
+            MessageType::CreateGroupRequest, "create_group",
+            { { "name", name }, { "memberIds", QJsonArray{ bobId } } });
+        if (codeOf(created) != int(ErrorCode::Ok)) {
+            return 0;
+        }
+        return created.value("data").toObject()
+                       .value("conversationId").toVariant().toLongLong();
+    };
+
+    const qint64 groupDelete = createGroup("clear-group-1");
+    QVERIFY(groupDelete > 0);
+    const qint64 groupKeep = createGroup("clear-group-2");
+    QVERIFY(groupKeep > 0);
+    const qint64 groupKick = createGroup("clear-group-3");
+    QVERIFY(groupKick > 0);
+
+    // 被踢路径不得写 conversation_cleared（该事件只属于“主动退出并删除记录”）
+    const QJsonObject kicked = alice.request(
+        MessageType::KickGroupMemberRequest, "kick_group_member",
+        { { "conversationId", groupKick }, { "userId", bobId } });
+    QCOMPARE(codeOf(kicked), int(ErrorCode::Ok));
+    const QJsonObject bobEvents =
+        bob.request(MessageType::SyncEventsRequest, "sync_events", { { "afterSeq", 0 } });
+    QCOMPARE(codeOf(bobEvents), int(ErrorCode::Ok));
+    for (const QJsonValue &value :
+         bobEvents.value("data").toObject().value("events").toArray()) {
+        const QJsonObject event = value.toObject();
+        if (event.value("type").toString() != "conversation_cleared") {
+            continue;
+        }
+        QVERIFY(event.value("payload").toObject()
+                    .value("conversationId").toVariant().toLongLong() != groupKick);
+    }
+
+    const QJsonObject sent = alice.request(MessageType::SendMessageRequest, "send_message",
+                                           { { "conversationId", groupDelete },
+                                             { "content", "history to be deleted" },
+                                             { "contentType", "text" },
+                                             { "clientMessageId", "clear-cm-1" } });
+    QCOMPARE(codeOf(sent), int(ErrorCode::Ok));
+    const qint64 watermarkSource = sent.value("data").toObject()
+                                        .value("messageId").toVariant().toLongLong();
+    QVERIFY(watermarkSource > 0);
+
+    // 形态校验：deleteHistory 不是布尔 → 拒绝且不产生副作用（仍可在随后合法退群）
+    const QJsonObject malformed = alice.request(
+        MessageType::LeaveGroupRequest, "leave_group",
+        { { "conversationId", groupDelete }, { "deleteHistory", "yes" } });
+    QCOMPARE(codeOf(malformed), int(ErrorCode::InvalidRequest));
+
+    // 退群前会话确实在列表中（避免“列表为空也通过”的空洞断言）
+    auto conversationPresent = [&alice](qint64 convId) -> bool {
+        const QJsonObject response = alice.request(
+            MessageType::GetConversationsRequest, "get_conversations", {});
+        if (codeOf(response) != int(ErrorCode::Ok)) {
+            return false;
+        }
+        for (const QJsonValue &value :
+             response.value("data").toObject().value("conversations").toArray()) {
+            if (value.toObject().value("conversationId").toVariant().toLongLong() == convId) {
+                return true;
+            }
+        }
+        return false;
+    };
+    QVERIFY(conversationPresent(groupDelete));
+
+    // 推送路由依赖 Server 主线程把两台的登录信号（队列连接）处理完；
+    // 测试线程即主线程，平时由事件循环推进。按 session 数等待——onlineUserIds
+    // 只到用户粒度，无法区分第二台设备是否已登记
+    QDeadlineTimer routeDeadline(2000);
+    while (!routeDeadline.hasExpired() && m_server->onlineSessionCount() < 3) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    // alice 两台设备 + bob 一条连接
+    QCOMPARE(m_server->onlineSessionCount(), 3);
+
+    const QJsonObject leftWithDelete = alice.request(
+        MessageType::LeaveGroupRequest, "leave_group",
+        { { "conversationId", groupDelete }, { "deleteHistory", true } });
+    QCOMPARE(codeOf(leftWithDelete), int(ErrorCode::Ok));
+
+    // 本人第二台设备应立即收到 ConversationClearedNotification（实时推送），
+    // 且发起设备 ID 可用于其自行忽略
+    const QJsonObject liveClear =
+        aliceSecond.waitForNotification(MessageType::ConversationClearedNotification);
+    QCOMPARE(liveClear.value("conversationId").toVariant().toLongLong(), groupDelete);
+    QCOMPARE(liveClear.value("originDeviceId").toString(), QString("clear-dev-a"));
+    QVERIFY(liveClear.value("clearedBeforeMessageId").toVariant().toLongLong()
+            >= watermarkSource);
+
+    // 本人的账号事件流必须出现 conversation_cleared，水位不低于删除前的最后消息
+    const QJsonObject syncAfterDelete =
+        alice.request(MessageType::SyncEventsRequest, "sync_events", { { "afterSeq", 0 } });
+    QCOMPARE(codeOf(syncAfterDelete), int(ErrorCode::Ok));
+    const QJsonArray events =
+        syncAfterDelete.value("data").toObject().value("events").toArray();
+    qint64 clearedSeq = 0;
+    qint64 clearedWatermark = -1;
+    for (const QJsonValue &value : events) {
+        const QJsonObject event = value.toObject();
+        if (event.value("type").toString() != "conversation_cleared") {
+            continue;
+        }
+        const QJsonObject payload = event.value("payload").toObject();
+        if (payload.value("conversationId").toVariant().toLongLong() == groupDelete) {
+            clearedSeq = event.value("seq").toVariant().toLongLong();
+            clearedWatermark = payload.value("clearedBeforeMessageId").toVariant().toLongLong();
+        }
+    }
+    QVERIFY2(clearedSeq > 0, "缺少 conversation_cleared 事件");
+    // 水位是退群时刻该会话的最大消息 ID：群主退群会先写一条 owner_transferred
+    // 系统消息，故可能大于删除前的最后一条普通消息；断言只要求覆盖它
+    QVERIFY(clearedWatermark >= watermarkSource);
+
+    // 退群后会话不再出现在本人列表中
+    QVERIFY(!conversationPresent(groupDelete));
+
+    // 无删除意图的退群不写 conversation_cleared（保留历史由本机自行决定）
+    const QJsonObject leftKeep = alice.request(
+        MessageType::LeaveGroupRequest, "leave_group", { { "conversationId", groupKeep } });
+    QCOMPARE(codeOf(leftKeep), int(ErrorCode::Ok));
+    const QJsonObject syncAfterKeep =
+        alice.request(MessageType::SyncEventsRequest, "sync_events", { { "afterSeq", clearedSeq } });
+    QCOMPARE(codeOf(syncAfterKeep), int(ErrorCode::Ok));
+    for (const QJsonValue &value :
+         syncAfterKeep.value("data").toObject().value("events").toArray()) {
+        const QJsonObject event = value.toObject();
+        if (event.value("type").toString() != "conversation_cleared") {
+            continue;
+        }
+        QVERIFY(event.value("payload").toObject()
+                    .value("conversationId").toVariant().toLongLong() != groupKeep);
+    }
+
+    alice.close();
+    aliceSecond.close();
     bob.close();
 }
 

@@ -170,6 +170,8 @@ void Server::onSocketAccepted(qintptr socketDescriptor)
     }
     // M5.5: 传递全局 nonce 缓存
     handler->setNonceCache(&m_nonceCache);
+    // M11C C2 加固: 传递连接级在线注册表（handler 在各自线程同步维护）
+    handler->setOnlineRegistry(m_onlineRegistry);
     // M8: 传递对象存储（未就绪时为 nullptr，handler 对文件请求 fail-closed）
     handler->setObjectStorage(m_objectStorage.get());
     // M8.2: 传递数据面基地址（未启动时为空，登录响应不下发该字段，

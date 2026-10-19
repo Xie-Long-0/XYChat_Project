@@ -1164,6 +1164,97 @@ private slots:
 
         store.closeAndDestroy();
     }
+
+    // M13 加固: 重新加入时把同步下限抬到服务端当前 lastMessageId——缺席期间的
+    // 消息（ratchet 已推进、大多不可解密）不再回捞；本地既有历史不受影响。
+    // 服务端水位参数用于跨设备清空：本机可能从未渲染过那些消息
+    void rejoinRaisesSyncFloorAndKeepsExistingHistory()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        // 退群保留历史的现场：本地有到 10 的消息，会话被标记为已退出
+        QJsonObject groupConv;
+        groupConv["conversationId"] = 61;
+        groupConv["type"] = "group";
+        groupConv["name"] = "项目群";
+        groupConv["lastMessageId"] = 10;
+        QVERIFY(store.upsertConversation(groupConv));
+        QVERIFY(store.upsertMessage(makeMessage(10, 61, "before leave")));
+        QVERIFY(store.setConversationLeft(61, true));
+        QVERIFY(store.conversationExists(61));
+        QCOMPARE(store.conversationClearMark(61), 0LL);
+
+        // 重新加入：服务端返回同一会话且最后一条消息已到 50 —— 同步下限抬到 50，
+        // 本地既有历史行与 left 标记按重加入语义处理
+        QJsonObject rejoined = groupConv;
+        rejoined["lastMessageId"] = 50;
+        QVERIFY(store.reconcileConversations(QJsonArray{rejoined}).isEmpty());
+        QCOMPARE(store.conversationClearMark(61), 50LL);
+        QCOMPARE(store.loadMessages(61).size(), 1);
+        const QJsonArray convs = store.loadConversations();
+        QCOMPARE(convs.size(), 1);
+        QVERIFY(!convs.at(0).toObject().value("leftGroup").toBool());
+
+        // 再次刷新（非重加入）不重复抬高：水位只在 left→活跃 的跳变时写入
+        QJsonObject later = groupConv;
+        later["lastMessageId"] = 70;
+        QVERIFY(store.reconcileConversations(QJsonArray{later}).isEmpty());
+        QCOMPARE(store.conversationClearMark(61), 50LL);
+
+        // 从未退出过的会话不写水位（新群成员仍按既有口径获取历史）。
+        // 服务端列表同时带上已有群，避免把它当作“缺席”而标记为已退出
+        QJsonObject freshGroup;
+        freshGroup["conversationId"] = 62;
+        freshGroup["type"] = "group";
+        freshGroup["name"] = "新群";
+        freshGroup["lastMessageId"] = 80;
+        QVERIFY(store.reconcileConversations(QJsonArray{later, freshGroup}).isEmpty());
+        QCOMPARE(store.conversationClearMark(62), 0LL);
+
+        // 行已不在但水位仍在（离线期间“退出并删除 → 又被邀请”）：仍按重加入
+        // 抬下限；服务端未读数包含水位以下、永远不会再取回的消息，须清零
+        QJsonObject goneConv;
+        goneConv["conversationId"] = 64;
+        goneConv["type"] = "group";
+        goneConv["name"] = "清空后再被邀请";
+        goneConv["lastMessageId"] = 20;
+        QVERIFY(store.upsertConversation(goneConv));
+        QVERIFY(store.purgeConversation(64, 40));
+        QCOMPARE(store.conversationClearMark(64), 40LL);
+        QVERIFY(!store.conversationExists(64));
+        QJsonObject rejoinGone = goneConv;
+        rejoinGone["lastMessageId"] = 60;
+        rejoinGone["unreadCount"] = 5;
+        QVERIFY(store.reconcileConversations(
+                    QJsonArray{later, freshGroup, rejoinGone}).isEmpty());
+        QCOMPARE(store.conversationClearMark(64), 60LL);
+        QVERIFY(store.conversationExists(64));
+        for (const QJsonValue &v : store.loadConversations()) {
+            const QJsonObject c = v.toObject();
+            if (c.value("conversationId").toVariant().toLongLong() == 64) {
+                QCOMPARE(c.value("unreadCount").toInt(), 0);
+            }
+        }
+
+        // 跨设备清空的服务端水位参与取最大值：本地最大消息 10，事件水位 40
+        QJsonObject cleared = groupConv;
+        cleared["conversationId"] = 63;
+        cleared["lastMessageId"] = 10;
+        QVERIFY(store.upsertConversation(cleared));
+        QVERIFY(store.upsertMessage(makeMessage(10, 63, "local copy")));
+        QVERIFY(store.purgeConversation(63, 40));
+        QCOMPARE(store.conversationClearMark(63), 40LL);
+        QVERIFY(!store.conversationExists(63));
+
+        // 已有更高水位时不回退
+        QVERIFY(store.upsertConversation(cleared));
+        QVERIFY(store.purgeConversation(63, 30));
+        QCOMPARE(store.conversationClearMark(63), 40LL);
+
+        store.closeAndDestroy();
+    }
 };
 
 QTEST_GUILESS_MAIN(TestLocalStore)

@@ -213,6 +213,9 @@ Rectangle {
                 name: peerUsername
                 size: Theme.avatarSizeSmall
                 isGroup: chatView.isGroup
+                // M11C C2: 私聊头像是"在线状态"的第一落点（绿点），
+                // 文案（在线/最后在线 …）在同一行的标题下方
+                online: !chatView.isGroup && chatView.peerOnline
                 visible: hasConversation
             }
 

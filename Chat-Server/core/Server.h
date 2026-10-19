@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "NonceCache.h"
+#include "OnlineRegistry.h"
 #include "database/DatabaseManager.h"
 #include "storage/IObjectStorage.h"
 #include "http/FileHttpService.h"
@@ -67,6 +68,8 @@ public:
     // 在线用户管理
     int onlineUserCount() const;
     QSet<qint64> onlineUserIds() const;
+    // 当前已登记路由的在线会话数（多设备时一个用户可对应多个 session）
+    int onlineSessionCount() const { return m_sessionHandlers.size(); }
 
 private slots:
     void onSocketAccepted(qintptr socketDescriptor);
@@ -90,6 +93,12 @@ private:
 
     // M5.5: 全局 nonce 缓存（各连接共享，TTL 去重）
     NonceCache m_nonceCache;
+
+    // M11C C2 加固: 连接级在线注册表（各 handler 线程共享，内部加锁）。
+    // 区别于 m_onlineSessions（主线程路由用），本表由 handler 同步维护，
+    // 供 get_conversations 读取"当前有已认证连接"的真实在线状态。
+    // shared_ptr：handler 线程可能晚于 Server 对象结束
+    std::shared_ptr<OnlineRegistry> m_onlineRegistry = std::make_shared<OnlineRegistry>();
 
     // M8: 对象存储（本地文件系统实现，各连接共享）。初始化失败时保持为空，
     // handler 据此对文件请求 fail-closed，不拖垮纯文本聊天能力

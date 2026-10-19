@@ -28,7 +28,6 @@ Drawer {
     signal inviteClicked()
     signal leaveRequested(int conversationId)
     signal kickRequested(int conversationId, int userId)
-    signal refreshRequested(int conversationId)
 
     background: Rectangle {
         color: Theme.windowBackground
@@ -49,7 +48,6 @@ Drawer {
         onInviteClicked: root.inviteClicked()
         onLeaveRequested: function(conversationId) { root.leaveRequested(conversationId) }
         onKickRequested: function(conversationId, userId) { root.kickRequested(conversationId, userId) }
-        onRefreshRequested: function(conversationId) { root.refreshRequested(conversationId) }
     }
 
     // M11C C3: 只负责填充内容，开场由调用方决定——宽屏走常驻右栏（不使用本抽屉），

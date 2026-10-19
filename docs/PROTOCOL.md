@@ -102,6 +102,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `103` | `TypingRequest` | “正在输入”请求（M10：仅会话成员可发，连接级限流 10/10s 防刷屏） |
 | `104` | `TypingResponse` | “正在输入”响应（M10：`success`，仅确认已受理） |
 | `105` | `TypingNotification` | “正在输入”通知（服务端推送，M10：fan-out 到会话其他**在线**成员，携带 `conversationId`+`senderId`+`senderUsername`+`typing`；瞬时状态**不写 `sync_events`**、无需离线补偿；requestId=0） |
+| `106` | `ConversationClearedNotification` | 跨设备清空通知（服务端推送，M13 加固：本人“退出并删除本机记录”后发往**操作者本人账号**的全部在线会话，payload `{conversationId, clearedBeforeMessageId, originDeviceId}`；发起设备按 `originDeviceId` 自行忽略；离线设备由 `sync_events` 的 `conversation_cleared` 补偿；requestId=0） |
 
 > **M10 协议号说明**：原规划拟用 `82-87`，但该区间已被 M9（会话偏好/消息编辑删除 `81-89`）占用、`90-99` 属 M8 文件控制面，故 M10 两项新能力顺延至 `100-105`。
 
@@ -394,7 +395,11 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 { "conversations": [{ "conversationId": 1, "type": "private", "peerUserId": 2, "peerUsername": "bob", "lastMessage": "...", "unreadCount": 0, "lastActiveAt": "2026-10-15 08:12:33", "online": true }] }
 ```
 
-**M11C C2 新增（private 会话）**：`lastActiveAt` 为对方最近一次活跃时间，`online` 为是否在线。二者取自既有 `sessions.last_active_at`（无迁移、无新表），**不随缓存持久化**（客户端拿到后只作瞬时展示）。`online` 是**启发式**：`last_active_at` 落在服务端阈值（120 秒）内即视为在线；由于心跳（ping）按设计无需认证、不刷新活跃时间，**空闲但已连接的客户端会显示为离线**。群会话不携带这两个字段（无 peer 概念）。
+**M11C C2 新增（private 会话）**：`lastActiveAt` 为对方最近一次活跃时间，`online` 为是否在线。二者取自既有 `sessions.last_active_at`（无迁移、无新表），**不随缓存持久化**（客户端拿到后只作瞬时展示）。`online` 的判定为**连接级注册表优先**：服务端维护"当前有已认证连接"的账号集合（登录登记、登出/断开摘除），连着但不操作的客户端也算在线；`sessions.last_active_at` 的 120 秒阈值仅作兜底（覆盖刚断开不久的情形）。二者取或——注册表只补"连而未动"，不会把已断开的人判成在线。群会话不携带这两个字段（无 peer 概念）。
+
+**重加入同步下限**：`get_conversations` 同时返回每个会话的 `lastMessageId`。客户端在"已退出（保留历史）→ 服务端再次返回该会话"的重加入跳变上，把该会话的本地同步下限抬到当时的 `lastMessageId`——缺席期间的消息不再回捞（群 E2EE ratchet 已推进，多数不可解密），本地既有历史不受影响；新加入的群不设下限（沿用既有历史口径）。
+
+**在线状态刷新**：没有 presence 推送，客户端在认证期间每 60 秒重拉一次 `get_conversations` 以刷新 `online`/`lastActiveAt`（复用既有端点，无协议变更）；断线/登出即停止。UI 落点为会话列表私聊头像绿点与私聊头部头像绿点 + "在线 / 最后在线 …"文案。
 
 #### 发送消息
 
@@ -465,7 +470,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```
 
 - 事件流按账号维度严格递增（`seq`），客户端保存 `lastSeq` 游标做增量拉取（参考 Telegram 差分同步模型）。
-- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）、`read_cursor`（M9：已读者自身读游标，payload `{conversationId, readMessageId}`，供其其他设备同步未读角标与消息已读态）、`conversation_prefs`（M9：会话偏好变更，payload `{conversationId, pinned, muted}`）、`message_edited`（M9：消息编辑，payload 含 `messageId`/`conversationId`/**`senderId`**/`originDeviceId`/重新加密的 `content`/`contentType`/`editedAt`）、`message_deleted`（M9：消息删除，payload `{messageId, conversationId, senderId, originDeviceId, deletedAt}`）。
+- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）、`read_cursor`（M9：已读者自身读游标，payload `{conversationId, readMessageId}`，供其其他设备同步未读角标与消息已读态）、`conversation_prefs`（M9：会话偏好变更，payload `{conversationId, pinned, muted}`）、`message_edited`（M9：消息编辑，payload 含 `messageId`/`conversationId`/**`senderId`**/`originDeviceId`/重新加密的 `content`/`contentType`/`editedAt`）、`message_deleted`（M9：消息删除，payload `{messageId, conversationId, senderId, originDeviceId, deletedAt}`）、`conversation_deleted`（M10：会话整表删除，payload `{conversationId, operatorId, originDeviceId, deletedAt}`，通知全体前成员含操作者本人其他设备）、`conversation_cleared`（M13 加固：本人“退出并删除本机记录”的跨设备补偿，payload `{conversationId, clearedBeforeMessageId}`；接收端清空本地缓存并按该水位写入同步下限，重放幂等、已清空时不再提示）。
   - **`senderId` 为群聊解密的必需字段**（2026-09-09 补）：`e2ee_group` 密文靠（群, 发送者 userId, 发送者 deviceId, keyId）四元组定位本地 Sender Key，缺 `senderId` 即无法解密；为兼容修复前已落库的旧事件，客户端在 `senderId` 缺失时会按（群, 设备, keyId）反查发送者。
   - **`originDeviceId`** 为发起该操作的本端设备 ID；实时推送与离线补偿两路径均覆盖操作者本人（保障其名下其他设备实时一致）。接收端须**同时比对 `senderId == 本端 userId` 且 `originDeviceId == 本端 deviceId`** 才忽略，避免发起设备回显自身操作。注意：`deviceId` 为机器级标识（`QSysInfo::machineUniqueId`），同机多账号共享，仅比对 `deviceId` 会把同机其他账号误判为“本设备”而丢事件（2026-09-09 修正）。
 - M9 保留清理：服务端按 30 天保留期每小时清理过期 `sync_events`（`sync_meta` 表记录清理水位线 `pruned_below_seq`）；设备游标落后于水位线（`0 < afterSeq < prunedBelowSeq`）时响应 `needsFullSync=true` + `fullSyncSeq`，客户端重置游标并全量重拉会话（`get_conversations`）与消息（`sync_messages` 从 messages 表补齐，不受事件清理影响）。
@@ -608,12 +613,14 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 
 ```json
 // 请求
-{ "type": "leave_group", "conversationId": 9 }
+{ "type": "leave_group", "conversationId": 9, "deleteHistory": true }
 // 响应 data
 { "conversationId": 9 }
 ```
 
-已落地语义（降级策略）：群主退群时若仍有其他成员，群主身份自动转让给最早入群的成员（产生 `owner_transferred` 系统消息与通知）；退出者本人不再接收后续群消息与变更通知。
+- `deleteHistory`（可选，**M13 加固新增**）：缺省 / `false` = 仅退出，本机历史由客户端自行保留（只读）；`true` = 同时清空本人本机历史。该字段只影响**本人账号**的本地数据，不影响服务端历史与其他成员。非布尔值返回 `InvalidRequest`（形态校验先于查库与退群，畸形请求不产生副作用）。
+- `deleteHistory=true` 时，服务端在退群成功后向**操作者本人**的账号 `sync_events` 写入 `conversation_cleared` 事件（payload `{conversationId, clearedBeforeMessageId}`，后者取会话当前最大消息 ID），并向操作者本人账号的**全部在线会话**推送 `ConversationClearedNotification (106)`（payload 额外带 `originDeviceId`，发起设备据此忽略；其他在线设备立即清空，离线设备由 `sync_events` 补偿）。退群后本端已非成员，成员态推送无从投递——账号级事件/推送是让本人其他设备同步清空的唯一通道。事件写入失败不回滚退群、也不回错误（只记警告），其他设备最坏保留历史。
+- 已落地语义（降级策略）：群主退群时若仍有其他成员，群主身份自动转让给最早入群的成员（产生 `owner_transferred` 系统消息与通知）；退出者本人不再接收后续群消息与变更通知。
 
 ### 移除成员（kick_group_member）
 

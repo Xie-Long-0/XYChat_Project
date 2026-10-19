@@ -106,6 +106,7 @@ enum class MessageType : quint16
     TypingRequest = 103,
     TypingResponse = 104,
     TypingNotification = 105,              // 服务端推送：会话成员正在输入（fan-out，不写 sync_events）
+    ConversationClearedNotification = 106, // 服务端推送：本人其他设备同步清空会话历史（退出并删除记录）
 };
 
 enum class ErrorCode : int

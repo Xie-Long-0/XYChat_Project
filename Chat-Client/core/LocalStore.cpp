@@ -1191,7 +1191,7 @@ bool LocalStore::setConversationLeft(qint64 conversationId, bool left)
 // M13: 清空该会话本地缓存，并记录“已清空到哪个消息 ID”的水位后移除会话行。
 // 服务端仍然保留该会话（退群不删服务端历史、本地清空也仅是本地行为），
 // 故重新加入时按水位同步：晚于水位的消息照常取回，已删除的本地历史不复活
-bool LocalStore::purgeConversation(qint64 conversationId)
+bool LocalStore::purgeConversation(qint64 conversationId, qint64 serverWatermark)
 {
     if (!ensureUsableDb() || conversationId <= 0) {
         return false;
@@ -1202,12 +1202,13 @@ bool LocalStore::purgeConversation(qint64 conversationId)
                    << m_db.lastError().text();
     }
 
-    // 水位取三者较大者，保证“清空”覆盖用户曾见过的全部消息：
+    // 水位取四者较大者，保证“清空”覆盖用户曾见过的全部消息：
     // ① 既有水位（多次“退出-重加入-再退出”时只前进）
     // ② 本地消息表的最大 ID
     // ③ 会话行缓存的 last_message_id——从未打开过的会话本地没有消息行，
     //    若只按 ② 取到 0，重新加入后会把用户已"删除"的历史重新拉回
-    qint64 watermark = conversationClearMark(conversationId);
+    // ④ 他端“退出并删除”时服务端记录的水位——本机可能从未渲染过那些消息
+    qint64 watermark = qMax(conversationClearMark(conversationId), serverWatermark);
     QSqlQuery maxQ(m_db);
     maxQ.prepare("SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE conversation_id = ?");
     maxQ.addBindValue(conversationId);
@@ -1268,6 +1269,18 @@ qint64 LocalStore::conversationClearMark(qint64 conversationId) const
     return 0;
 }
 
+// 会话行是否存在（跨设备清空事件用于判断本机是否真的还有数据要清）
+bool LocalStore::conversationExists(qint64 conversationId) const
+{
+    if (!m_open || conversationId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("SELECT 1 FROM conversations WHERE conversation_id = ?");
+    query.addBindValue(conversationId);
+    return query.exec() && query.next();
+}
+
 // M13: 会话列表对账（服务端权威）。落库服务端返回的会话并清除其“已退出”
 // 标记（重新加入即复位），再把服务端不再返回的本地群会话标记为已退出。
 // 与本函数配套的关键点：调用方必须 emit 对账后的本地列表而非服务端原数组，
@@ -1293,8 +1306,68 @@ QList<qint64> LocalStore::reconcileConversations(const QJsonArray &convs)
             continue;
         }
         present.insert(id);
+
+        // 重加入检测：服务端重新返回该会话即表示本端再次成为成员。两种现场都算：
+        // ① 本地行仍在且 left_group=1（仅退出、保留历史）；
+        // ② 本地行已不在但清空水位仍在（离线期间“退出并删除 → 又被邀请”）。
+        // 若是重加入，把同步下限抬到服务端当前最后一条消息 ID——缺席期间的群消息
+        // ratchet 已推进，回捞大多不可解密（M13 遗留窗口）；本地既有历史行不受影响
+        bool rowExists = false;
+        bool wasLeft = false;
+        {
+            QSqlQuery prevQ(m_db);
+            prevQ.prepare("SELECT left_group FROM conversations WHERE conversation_id = ?");
+            prevQ.addBindValue(id);
+            if (prevQ.exec()) {
+                if (prevQ.next()) {
+                    rowExists = true;
+                    wasLeft = prevQ.value(0).toInt() != 0;
+                }
+            } else {
+                qWarning() << "[LocalStore] reconcileConversations read left flag failed:"
+                           << prevQ.lastError().text();
+                ok = false;
+            }
+        }
+        const qint64 existingMark = conversationClearMark(id);
+        const bool rejoined = wasLeft || (!rowExists && existingMark > 0);
+
         if (!upsertConversationRow(conv)) {
             ok = false;
+            continue;
+        }
+
+        if (rejoined) {
+            const qint64 rejoinFloor = conv.value("lastMessageId").toVariant().toLongLong();
+            if (rejoinFloor > 0) {
+                QSqlQuery markQ(m_db);
+                markQ.prepare(
+                    "INSERT INTO conversation_clear_marks"
+                    " (conversation_id, cleared_before_message_id, cleared_at)"
+                    " VALUES (?, ?, datetime('now'))"
+                    " ON CONFLICT(conversation_id) DO UPDATE SET"
+                    " cleared_before_message_id = MAX("
+                    "  conversation_clear_marks.cleared_before_message_id,"
+                    "  excluded.cleared_before_message_id),"
+                    " cleared_at = excluded.cleared_at");
+                markQ.addBindValue(id);
+                markQ.addBindValue(rejoinFloor);
+                if (!markQ.exec()) {
+                    qWarning() << "[LocalStore] reconcileConversations rejoin floor failed:"
+                               << markQ.lastError().text();
+                    ok = false;
+                }
+            }
+            // 服务端的未读数按读游标统计，包含缺席期间的消息；这些消息已在下限
+            // 之下、不会再取回，必须清零，否则角标永远点不掉
+            QSqlQuery unreadQ(m_db);
+            unreadQ.prepare("UPDATE conversations SET unread_count = 0 WHERE conversation_id = ?");
+            unreadQ.addBindValue(id);
+            if (!unreadQ.exec()) {
+                qWarning() << "[LocalStore] reconcileConversations reset unread failed:"
+                           << unreadQ.lastError().text();
+                ok = false;
+            }
         }
     }
 

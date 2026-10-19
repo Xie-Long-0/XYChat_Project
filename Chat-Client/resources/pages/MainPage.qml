@@ -391,7 +391,6 @@ Rectangle {
                 onInviteClicked: mainPage.openGroupInviteDialog()
                 onLeaveRequested: function(conversationId) { mainPage.showLeaveGroupChoice(conversationId) }
                 onKickRequested: function(conversationId, userId) { mainPage.kickGroupMemberRequested(conversationId, userId) }
-                onRefreshRequested: function(conversationId) { mainPage.getGroupInfoRequested(conversationId) }
             }
         }
     }
@@ -576,11 +575,23 @@ Rectangle {
         // M13: 退群改由二选一对话框承接（仅退出 / 退出并删除记录）
         onLeaveRequested: function(conversationId) { mainPage.showLeaveGroupChoice(conversationId) }
         onKickRequested: function(conversationId, userId) { mainPage.kickGroupMemberRequested(conversationId, userId) }
-        onRefreshRequested: function(conversationId) { mainPage.getGroupInfoRequested(conversationId) }
         // M11C C3: 用户自行关闭（Esc / 面板关闭按钮）时同步意图状态。用 aboutToHide
         // 而非 closed：后者要等收起动画结束才发，期间若已重新点开就会被误清；宽屏下
         // close() 只是"换成常驻右栏"的中间动作，不该清掉意图
         onAboutToHide: if (!mainPage.wideLayout) mainPage.groupInfoOpen = false
+    }
+
+    // 群信息刷新的合并窗口：一次踢人/邀请会同时触发操作响应与群变更广播
+    // （服务端广播不排除操作者本端），此前叠加面板的乐观刷新共三次 get_group_info。
+    // 去抖后同一阵发的多次触发合并为一次，最终状态一致且不再浪费请求
+    Timer {
+        id: groupInfoRefreshTimer
+        interval: 150
+        repeat: false
+        onTriggered: {
+            if (mainPage.groupInfoOpen && mainPage.groupInfoConvId > 0)
+                mainPage.getGroupInfoRequested(mainPage.groupInfoConvId)
+        }
     }
 
     InviteDialog {
@@ -1027,10 +1038,14 @@ Rectangle {
         // M11C C1/C3: 群信息面板开着时跟随会话切换——目标是活跃在群则换载其
         // 群信息，私聊或已退出的群没有群信息可看，直接收起
         if (mainPage.groupInfoOpen) {
-            if (isGroup && conv.leftGroup !== true)
+            if (isGroup && conv.leftGroup !== true) {
+                // 切换群时丢弃上一群的待发刷新，避免去抖 Timer 迟到后对同一群
+                // 再补一次重复请求
+                groupInfoRefreshTimer.stop()
                 getGroupInfoRequested(convId)
-            else
+            } else {
                 mainPage.closeGroupInfoPanel()
+            }
         }
     }
 
@@ -1327,6 +1342,7 @@ Rectangle {
     // M11C C3: 关闭群信息面板（抽屉 / 常驻右栏的关闭按钮、退群等路径共用）
     function closeGroupInfoPanel() {
         mainPage.groupInfoOpen = false
+        groupInfoRefreshTimer.stop()
         if (groupInfoDrawer.opened) groupInfoDrawer.close()
     }
 
@@ -1338,10 +1354,11 @@ Rectangle {
         inviteDialog.open()
     }
 
-    // M11C C1: 群变更推送或本人邀请/移除成功后，面板原地刷新成员与群名
+    // M11C C1: 群变更推送或本人邀请/移除成功后，面板原地刷新成员与群名。
+    // 经去抖 Timer 合并，同一阵发只发一次 get_group_info
     function refreshGroupInfoIfOpen(conversationId) {
         if (mainPage.groupInfoOpen && mainPage.groupInfoConvId === conversationId)
-            getGroupInfoRequested(conversationId)
+            groupInfoRefreshTimer.restart()
     }
 
     // M11C C1: 退群/被移出/会话删除时收起对应的群信息面板

@@ -1378,9 +1378,10 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
     // 填充 peer / 群组信息
     for (auto &ci : result) {
         if (ci.type == "private") {
-            // C2: 一并回填对方的最后活跃时间与在线判定。在线与否交给 SQLite 判定
+            // C2: 一并回填对方的最后活跃时间与"最近活跃"判定。后者交给 SQLite 判定
             // （last_active_at 由 datetime('now') 写入，与 C++ 侧 ISODate 不同格式，
-            // 在 SQL 里比对可避免两侧格式漂移）
+            // 在 SQL 里比对可避免两侧格式漂移）。真实在线（有已认证连接）由
+            // RequestHandler 用 OnlineRegistry 与之取或后下发
             QSqlQuery peerQ(db);
             peerQ.prepare(
                 "SELECT cm2.user_id, u.username, "
@@ -1411,6 +1412,23 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
     }
 
     return result;
+}
+
+// M13 加固: 会话当前最大消息 ID（“退出并删除本机记录”的跨设备清空水位）
+qint64 DatabaseManager::conversationMessageWatermark(qint64 conversationId) const
+{
+    if (conversationId <= 0) {
+        return 0;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT COALESCE(MAX(id), 0) FROM messages WHERE conversation_id = ?");
+    q.addBindValue(conversationId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toLongLong();
+    }
+    qWarning() << "[DB] conversationMessageWatermark failed:" << q.lastError().text();
+    return 0;
 }
 
 std::optional<ConversationInfo> DatabaseManager::getConversation(qint64 conversationId)

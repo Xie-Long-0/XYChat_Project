@@ -1,5 +1,6 @@
 #include "RequestHandler.h"
 #include "NonceCache.h"
+#include "OnlineRegistry.h"
 #include "database/DatabaseManager.h"
 #include "E2eeCrypto.h"
 #include "EncryptionManager.h"
@@ -164,6 +165,11 @@ void RequestHandler::run()
     // 连接断开时，清理 session
     if (m_currentSessionId > 0) {
         emit userLoggedOut(m_authenticatedUserId, m_currentSessionId);
+        // M11C C2 加固: 断线路径同步摘除在线登记（登出路径可能已摘过一次，
+        // removeSession 按 sessionId 幂等）
+        if (m_onlineRegistry) {
+            m_onlineRegistry->removeSession(m_authenticatedUserId, m_currentSessionId);
+        }
     }
 
     delete m_sendWorker.exchange(nullptr);
@@ -468,7 +474,17 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
     // 记录成功审计
     m_db->recordLoginAttempt(user.id, ipAddr, true);
 
-    // 更新认证状态
+    // 更新认证状态。同一连接再次登录时先作废旧 session：否则旧 token/session
+    // 仍然有效（安全面），且在线登记会永久残留（注册表按 sessionId 摘除，
+    // 旧 ID 再无人清理）
+    if (m_currentSessionId > 0) {
+        const qint64 previousUser = m_authenticatedUserId;
+        m_db->deleteSession(m_currentSessionId);
+        if (m_onlineRegistry) {
+            m_onlineRegistry->removeSession(previousUser, m_currentSessionId);
+        }
+        emit userLoggedOut(previousUser, m_currentSessionId);
+    }
     m_authenticatedUserId = user.id;
     m_currentSessionId = sessionId;
     m_currentDeviceId = deviceId;
@@ -488,6 +504,11 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
     }
 
     emit userLoggedIn(user.id, sessionId, deviceId);
+    // M11C C2 加固: 登录成功即登记在线（同步登记，保证本次连接后续的
+    // get_conversations 立即能看到同账号/对方的真实在线状态）
+    if (m_onlineRegistry) {
+        m_onlineRegistry->addSession(user.id, sessionId);
+    }
 
     sendResponse(packet.requestId, MessageType::LoginResponse, ErrorCode::Ok,
                  "OK", data);
@@ -560,6 +581,10 @@ void RequestHandler::processLogoutRequest(const Packet &packet)
 
     m_db->deleteSession(sessionId);
     emit userLoggedOut(userId, sessionId);
+    // M11C C2 加固: 主动登出即摘除在线登记（连接可能继续存活到客户端断开）
+    if (m_onlineRegistry) {
+        m_onlineRegistry->removeSession(userId, sessionId);
+    }
 
     QJsonObject data;
     sendResponse(packet.requestId, MessageType::LogoutResponse, ErrorCode::Ok,
@@ -608,6 +633,11 @@ void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonO
 
     // 删除旧 session，创建新 session
     m_db->deleteSession(oldSessionId);
+    // M11C C2 加固: 续期会更换 sessionId——旧登记必须先摘除，否则断线时
+    // 只摘新 ID，旧条目永久残留（账号被长期误判在线且注册表持续膨胀）
+    if (m_onlineRegistry) {
+        m_onlineRegistry->removeSession(userId, oldSessionId);
+    }
 
     const QString ipAddr = m_socket->peerAddress().toString();
     const qint64 newSessionId = m_db->createSession(userId, m_currentDeviceId, newTokenHash, ipAddr);
@@ -618,6 +648,9 @@ void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonO
     }
 
     m_currentSessionId = newSessionId;
+    if (m_onlineRegistry) {
+        m_onlineRegistry->addSession(userId, newSessionId);
+    }
 
     QJsonObject data;
     data["token"] = newToken;
@@ -679,6 +712,10 @@ void RequestHandler::processTerminateSessionRequest(const Packet &packet, const 
 
     m_db->deleteSession(resolvedSessionId);
     emit userLoggedOut(m_authenticatedUserId, resolvedSessionId);
+    // M11C C2 加固: 被终止的会话（可能是本人的另一台设备）同步摘除在线登记
+    if (m_onlineRegistry) {
+        m_onlineRegistry->removeSession(m_authenticatedUserId, resolvedSessionId);
+    }
     emit sessionTerminated(resolvedSessionId);
 
     QJsonObject data;
@@ -792,6 +829,9 @@ void RequestHandler::processGetContactsRequest(const Packet &packet)
 void RequestHandler::processGetConversationsRequest(const Packet &packet)
 {
     auto conversations = m_db->getConversationsForUser(m_authenticatedUserId);
+    // M11C C2 加固: 在线判定以连接级注册表为准（空闲但已认证的连接也算在线）；
+    // 数据库的 120s 活跃启发式保留为兜底，覆盖刚断开不久的情形。逐 peer 查询
+    // 避免每次列表都复制全部在线用户集合（O(N) 且持全局锁）
 
     QJsonArray convArray;
     for (const auto &c : conversations) {
@@ -812,9 +852,11 @@ void RequestHandler::processGetConversationsRequest(const Packet &packet)
             obj["name"] = c.name;
             obj["memberCount"] = c.memberCount;
         } else {
-            // C2: 私聊回填对方最后活跃时间与在线状态（在线为启发式，见 DatabaseManager）
+            // C2: 私聊回填对方最后活跃时间与在线状态
             obj["lastActiveAt"] = c.peerLastActiveAt;
-            obj["online"] = c.peerOnline;
+            obj["online"] = c.peerOnline
+                || (c.peerUserId > 0 && m_onlineRegistry
+                    && m_onlineRegistry->isOnline(c.peerUserId));
         }
         convArray.append(obj);
     }
@@ -1690,6 +1732,17 @@ void RequestHandler::processLeaveGroupRequest(const Packet &packet, const QJsonO
                      ErrorCode::InvalidRequest, "Invalid conversationId");
         return;
     }
+    // M13 加固: 可选的本机历史去向（仅本账号语义；缺省 = 保留历史）。
+    // 形态校验先于任何查库，畸形请求不产生副作用
+    bool deleteHistory = false;
+    if (request.contains("deleteHistory")) {
+        if (!request.value("deleteHistory").isBool()) {
+            sendResponse(packet.requestId, MessageType::LeaveGroupResponse,
+                         ErrorCode::InvalidRequest, "deleteHistory must be a boolean");
+            return;
+        }
+        deleteHistory = request.value("deleteHistory").toBool();
+    }
     auto conv = m_db->getConversation(convId);
     if (!conv.has_value() || conv->type != "group") {
         sendResponse(packet.requestId, MessageType::LeaveGroupResponse,
@@ -1732,6 +1785,34 @@ void RequestHandler::processLeaveGroupRequest(const Packet &packet, const QJsonO
     }
 
     qDebug() << "[Handler] User" << m_authenticatedUserId << "left group" << convId;
+
+    // M13 加固: 用户选择了“退出并删除本机记录”。退群后已非成员，成员态推送
+    // 无从投递，只有账号级 sync_events 能让本人其他设备同步清空；水位取会话
+    // 当前最大消息 ID，其他设备本地库随事件清空并记录同一水位。事件写入失败
+    // 不改变退群结论（退群已成功），只记警告——其他设备最坏只是保留历史
+    if (deleteHistory) {
+        QJsonObject clearedPayload;
+        clearedPayload["conversationId"] = convId;
+        clearedPayload["clearedBeforeMessageId"] = m_db->conversationMessageWatermark(convId);
+        const qint64 seq = m_db->appendSyncEvent(
+            m_authenticatedUserId, "conversation_cleared",
+            QString::fromUtf8(
+                QJsonDocument(clearedPayload).toJson(QJsonDocument::Compact)));
+        if (seq <= 0) {
+            qWarning() << "[Handler] Failed to record conversation_cleared for"
+                       << m_authenticatedUserId << "conv" << convId;
+        }
+        // 本人其他在线设备实时清空（离线设备由上面的 sync_events 补偿）。
+        // 发起设备按 originDeviceId 自行忽略
+        QJsonObject notifyPayload = clearedPayload;
+        notifyPayload["originDeviceId"] = m_currentDeviceId;
+        Packet notifyPacket;
+        notifyPacket.messageType = MessageType::ConversationClearedNotification;
+        notifyPacket.requestId = 0;
+        notifyPacket.payload =
+            QJsonDocument(notifyPayload).toJson(QJsonDocument::Compact);
+        emit messageForUser(m_authenticatedUserId, PacketCodec::encode(notifyPacket));
+    }
 
     // 系统消息与变更通知面向剩余成员（退出者本人不再接收）
     QJsonObject sysPayload;
