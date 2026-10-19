@@ -811,6 +811,10 @@ void RequestHandler::processGetConversationsRequest(const Packet &packet)
         if (c.type == "group") {
             obj["name"] = c.name;
             obj["memberCount"] = c.memberCount;
+        } else {
+            // C2: 私聊回填对方最后活跃时间与在线状态（在线为启发式，见 DatabaseManager）
+            obj["lastActiveAt"] = c.peerLastActiveAt;
+            obj["online"] = c.peerOnline;
         }
         convArray.append(obj);
     }

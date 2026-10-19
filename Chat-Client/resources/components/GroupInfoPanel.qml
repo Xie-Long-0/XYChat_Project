@@ -20,7 +20,7 @@ Item {
     signal kickRequested(int conversationId, int userId)
     signal refreshRequested(int conversationId)
 
-    implicitWidth: 340
+    implicitWidth: Theme.rightPanelWidth
 
     function showInfo(info) {
         convId = info.conversationId || 0

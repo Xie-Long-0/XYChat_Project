@@ -16,6 +16,11 @@ Drawer {
     // 未填充（convId=0）时禁止从右缘拖出空抽屉——此时邀请/退出都作用于 0 号会话
     interactive: panel.convId > 0
     width: panel.implicitWidth
+    // 顶边让开自定义标题栏：无边框窗口的标题栏承载拖拽与窗口控制按钮（最小化/
+    // 最大化/关闭），抽屉若从 y=0 铺满整个窗口高度会连带把它们盖住。Popup 默认
+    // 以窗口 overlay 为父（坐标系即整个窗口），故显式给出纵向范围
+    y: Theme.titleBarHeight
+    height: parent ? parent.height - Theme.titleBarHeight : 0
 
     property int myUserId: 0
     readonly property int convId: panel.convId
@@ -47,8 +52,9 @@ Drawer {
         onRefreshRequested: function(conversationId) { root.refreshRequested(conversationId) }
     }
 
+    // M11C C3: 只负责填充内容，开场由调用方决定——宽屏走常驻右栏（不使用本抽屉），
+    // 窄屏才 open()。抽屉若自行 open()，宽屏下会被"填充"意外拉出来
     function showInfo(info) {
         panel.showInfo(info)
-        if (!opened) open()
     }
 }

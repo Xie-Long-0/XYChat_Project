@@ -11,8 +11,8 @@ Window {
     id: mainWindow
     // M4.5 修复：作为独立根窗口由 main.cpp 加载，供其按 objectName 查找并注入登录窗口
     objectName: "mainWindow"
-    width: 1000
-    height: 650
+    width: 1180
+    height: 720
     minimumWidth: 700
     minimumHeight: 450
     visible: false

@@ -476,7 +476,11 @@ Rectangle {
                 pinned: conv.pinned === true,
                 muted: conv.muted === true,
                 // M13: 已退出但保留历史（只读，右键菜单只剩删除聊天记录）
-                leftGroup: conv.leftGroup === true
+                leftGroup: conv.leftGroup === true,
+                // M11C C2: 私聊对方的在线状态与最后活跃时间。本地缓存路径不带
+                // 这两个字段（瞬时状态不落库），由 NetworkManager 从服务端响应盖上
+                online: conv.online === true,
+                lastActiveAt: conv.lastActiveAt || ""
             }
             var pos = findIndexByConversationId(convId)
             if (pos >= 0) {

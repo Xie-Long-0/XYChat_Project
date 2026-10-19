@@ -49,6 +49,11 @@ struct ConversationInfo
     // 对于一对一会话，记录对方信息
     qint64 peerUserId = 0;
     QString peerUsername;
+    // C2: 对方最近一次活跃时间与"在线"判定（取自 sessions.last_active_at）。
+    // 在线为启发式：ping 无需认证、不刷新活跃时间，故空闲但已连接的客户端
+    // 不计为在线——见 ROADMAP §3 登记项
+    QString peerLastActiveAt;
+    bool peerOnline = false;
     QString lastMessage;
     qint64 lastMessageId = 0;
     QString lastMessageAt;

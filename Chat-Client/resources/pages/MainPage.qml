@@ -90,6 +90,20 @@ Rectangle {
     //（信号在同一调用栈内同步分发，不存在交错；用后即清，不跨调用留存）
     property string pendingTrackKey: ""
     property int pendingTrackConversationId: 0
+    // M11C C3: 宽屏三栏。群信息面板的"开合"是与展示形态解耦的逻辑状态：
+    // 宽屏常驻右栏（占布局），窄屏右缘抽屉（覆盖）。两者各持一份
+    // GroupInfoPanel，只填充当前生效的那份
+    readonly property bool wideLayout: mainPage.width >= Theme.wideLayoutBreakpoint
+    // 群信息面板"是否应当可见"——这是**意图**状态，只由 showGroupInfo /
+    // closeGroupInfoPanel，以及抽屉的 aboutToHide（用户按 Esc 或点关闭）写入。
+    // 刻意不从抽屉的 opened/position 反推：opened 要等打开动画收尾才置位，
+    // 与之耦合会让"恰好拖宽窗口"这类瞬态判断拿到假值，且关闭动画未收尾时再点开，
+    // 迟到的 closed 会把刚设上的状态覆盖掉（表现为"点了没反应"）
+    property bool groupInfoOpen: false
+    property int groupInfoConvId: 0
+    // 最近一次群信息响应：跨断点切换展示形态时用它重填另一份面板，
+    // 免得为换个容器再向服务端要一次
+    property var lastGroupInfo: null
 
     // P4.1: 传输横幅改为 Repeater over fileTransfer.tasks，多任务并发时每个任务
     // 独立显示“文件名 · 相位 进度% + 进度条 + 取消”。横幅置于内容区上方全宽
@@ -348,6 +362,38 @@ Rectangle {
                 visible: mainPage.activeViewKey === ""
             }
         }
+
+        // M11C C3: 宽屏常驻右栏。与抽屉共用 GroupInfoPanel，但占布局而非覆盖——
+        // 边聊边看时聊天区被压缩而不是被盖住；窄屏时整列不参与布局（visible=false）
+        Rectangle {
+            id: groupInfoColumn
+            // 供 UI 测试经对象树定位（与 emojiPopup 同一用法）
+            objectName: "groupInfoColumn"
+            visible: mainPage.wideLayout && mainPage.groupInfoOpen
+            Layout.fillHeight: true
+            Layout.preferredWidth: Theme.rightPanelWidth
+            color: Theme.windowBackground
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                width: 1
+                color: Theme.separatorColor
+            }
+
+            GroupInfoPanel {
+                id: dockedGroupInfoPanel
+                objectName: "dockedGroupInfoPanel"
+                anchors.fill: parent
+                myUserId: mainPage.myUserId
+                onCloseRequested: mainPage.closeGroupInfoPanel()
+                onInviteClicked: mainPage.openGroupInviteDialog()
+                onLeaveRequested: function(conversationId) { mainPage.showLeaveGroupChoice(conversationId) }
+                onKickRequested: function(conversationId, userId) { mainPage.kickGroupMemberRequested(conversationId, userId) }
+                onRefreshRequested: function(conversationId) { mainPage.getGroupInfoRequested(conversationId) }
+            }
+        }
     }
 
     // M12.4: 会话视图工厂。信号处理一律按视图自身状态（view.isGroup /
@@ -521,18 +567,20 @@ Rectangle {
         onLoadContactsRequested: { mainPage.loadContactsRequested() }
     }
 
-    // M11C C1: 群信息改由右侧抽屉承接（替代弹出对话框），非模态可边聊边看
+    // M11C C1: 群信息改由右侧抽屉承接（替代弹出对话框），非模态可边聊边看。
+    // C3 起抽屉只在窄屏使用——宽屏改由常驻右栏（groupInfoColumn）呈现同一份内容
     GroupInfoDrawer {
         id: groupInfoDrawer
         myUserId: mainPage.myUserId
-        onInviteClicked: {
-            inviteDialog.conversationId = groupInfoDrawer.convId
-            inviteDialog.open()
-        }
+        onInviteClicked: mainPage.openGroupInviteDialog()
         // M13: 退群改由二选一对话框承接（仅退出 / 退出并删除记录）
         onLeaveRequested: function(conversationId) { mainPage.showLeaveGroupChoice(conversationId) }
         onKickRequested: function(conversationId, userId) { mainPage.kickGroupMemberRequested(conversationId, userId) }
         onRefreshRequested: function(conversationId) { mainPage.getGroupInfoRequested(conversationId) }
+        // M11C C3: 用户自行关闭（Esc / 面板关闭按钮）时同步意图状态。用 aboutToHide
+        // 而非 closed：后者要等收起动画结束才发，期间若已重新点开就会被误清；宽屏下
+        // close() 只是"换成常驻右栏"的中间动作，不该清掉意图
+        onAboutToHide: if (!mainPage.wideLayout) mainPage.groupInfoOpen = false
     }
 
     InviteDialog {
@@ -924,6 +972,14 @@ Rectangle {
         }
     }
 
+    // M11C C2: 把会话列表带回的在线/最后活跃同步到视图（仅私聊有意义）。
+    // 单点收口，避免打开与刷新两条路径各写一份
+    function applyPeerPresence(view, conv) {
+        if (!view || !conv || view.isGroup) return
+        view.peerOnline = conv.online === true
+        view.peerLastActiveAt = conv.lastActiveAt || ""
+    }
+
     function openConversation(conv) {
         var convId = conv.conversationId || 0
         if (convId <= 0) return
@@ -948,14 +1004,19 @@ Rectangle {
             view.hasConversation = true
             // M13: 已退出的群会话打开即只读
             view.readOnly = conv.leftGroup === true
+            mainPage.applyPeerPresence(view, conv)
             // P2.3: 注入未读数，供首屏 setMessages 放置未读分隔线
             view.unreadCount = conv.unreadCount || 0
             loadMessagesRequested(convId, 0)
-        } else if (view.isGroup) {
-            // 复用视图不重载：只把列表带回来的最新成员数补上
-            view.groupMemberCount = conv.memberCount || view.groupMemberCount
-            // M13: 只读态同样按最新列表复位（重加入后应恢复可发送）
-            view.readOnly = conv.leftGroup === true
+        } else {
+            if (view.isGroup) {
+                // 复用视图不重载：只把列表带回来的最新成员数补上
+                view.groupMemberCount = conv.memberCount || view.groupMemberCount
+                // M13: 只读态同样按最新列表复位（重加入后应恢复可发送）
+                view.readOnly = conv.leftGroup === true
+            }
+            // M11C C2: 私聊复用视图同样刷新在线状态（切回时不该停在旧值）
+            mainPage.applyPeerPresence(view, conv)
         }
         currentConversationType = isGroup ? "group" : "private"
         currentPeerUserId = isGroup ? 0 : view.peerUserId
@@ -963,13 +1024,13 @@ Rectangle {
         currentGroupMemberCount = isGroup ? (view.groupMemberCount || 0) : 0
         convList.setSelectedByConversationId(convId)
         setActiveView(key, convId)
-        // M11C C1: 抽屉打开时跟随会话切换——目标是活跃在群则换载其群信息，
-        // 私聊或已退出的群没有群信息可看，直接收起
-        if (groupInfoDrawer.opened) {
+        // M11C C1/C3: 群信息面板开着时跟随会话切换——目标是活跃在群则换载其
+        // 群信息，私聊或已退出的群没有群信息可看，直接收起
+        if (mainPage.groupInfoOpen) {
             if (isGroup && conv.leftGroup !== true)
                 getGroupInfoRequested(convId)
             else
-                groupInfoDrawer.close()
+                mainPage.closeGroupInfoPanel()
         }
     }
 
@@ -994,9 +1055,9 @@ Rectangle {
         currentGroupMemberCount = 0
         convList.selectedIndex = -1
         setActiveView(key, 0)
-        // M11C C1: 待绑定私聊没有经过 openConversation，抽屉不会自动换载——
+        // M11C C1/C3: 待绑定私聊没有经过 openConversation，群信息面板不会自动换载——
         // 直接收起，避免继续展示并可操作上一个群的信息
-        groupInfoDrawer.close()
+        mainPage.closeGroupInfoPanel()
     }
 
     // M12.4: 发送确认（原 bindNewConversation + confirmMessage 合一）。先按幂等键
@@ -1116,6 +1177,10 @@ Rectangle {
                             view.chatTitle = conv.name || "未命名群组"
                             view.groupMemberCount = currentGroupMemberCount
                         }
+                    } else {
+                        // M11C C2: 私聊在线状态随列表刷新同步到已打开的视图
+                        var pv = viewForConversation(currentConversationId)
+                        if (pv) mainPage.applyPeerPresence(pv, conv)
                     }
                     break
                 }
@@ -1239,28 +1304,67 @@ Rectangle {
     }
 
     function showContacts(contacts) { createGroupDialog.showContacts(contacts) }
-    // M11C C1: 结果异步返回时用户可能已切走——只展示当前会话的群信息，
-    // 不为已离开的会话弹开抽屉；已退出（被移出）的群没有群信息入口，
-    // 迟到的响应不得把抽屉重新打开
+    // M11C C1/C3: 结果异步返回时用户可能已切走——只展示当前会话的群信息，
+    // 不为已离开的会话打开面板；已退出（被移出）的群没有群信息入口，
+    // 迟到的响应不得把它重新打开
     function showGroupInfo(info) {
         var convId = info.conversationId || 0
         if (convId !== mainPage.currentConversationId) return
         var idx = convList.findIndexByConversationId(convId)
         var conv = idx >= 0 ? convList.getConversation(idx) : null
         if (conv && conv.leftGroup === true) return
-        groupInfoDrawer.showInfo(info)
+        mainPage.lastGroupInfo = info
+        mainPage.groupInfoConvId = convId
+        mainPage.groupInfoOpen = true
+        if (mainPage.wideLayout) {
+            dockedGroupInfoPanel.showInfo(info)
+        } else {
+            groupInfoDrawer.showInfo(info)
+            groupInfoDrawer.open()
+        }
     }
 
-    // M11C C1: 群变更推送或本人邀请/移除成功后，抽屉原地刷新成员与群名
+    // M11C C3: 关闭群信息面板（抽屉 / 常驻右栏的关闭按钮、退群等路径共用）
+    function closeGroupInfoPanel() {
+        mainPage.groupInfoOpen = false
+        if (groupInfoDrawer.opened) groupInfoDrawer.close()
+    }
+
+    // M11C C3: 群信息面板的邀请入口——抽屉与常驻右栏共用一份实现，
+    // 目标会话取面板自身记录的 convId（不依赖抽屉是否开着）
+    function openGroupInviteDialog() {
+        if (mainPage.groupInfoConvId <= 0) return
+        inviteDialog.conversationId = mainPage.groupInfoConvId
+        inviteDialog.open()
+    }
+
+    // M11C C1: 群变更推送或本人邀请/移除成功后，面板原地刷新成员与群名
     function refreshGroupInfoIfOpen(conversationId) {
-        if (groupInfoDrawer.opened && groupInfoDrawer.convId === conversationId)
+        if (mainPage.groupInfoOpen && mainPage.groupInfoConvId === conversationId)
             getGroupInfoRequested(conversationId)
     }
 
-    // M11C C1: 退群/被移出/会话删除时收起对应的群信息抽屉
+    // M11C C1: 退群/被移出/会话删除时收起对应的群信息面板
     function closeGroupInfo(conversationId) {
-        if (groupInfoDrawer.opened && groupInfoDrawer.convId === conversationId)
-            groupInfoDrawer.close()
+        if (mainPage.groupInfoOpen && mainPage.groupInfoConvId === conversationId)
+            mainPage.closeGroupInfoPanel()
+    }
+
+    // M11C C3: 跨断点时把展示形态连同"是否开着"一起转移，并用缓存内容重填新容器。
+    // 只搬内容不搬开合状态，会让"拖宽后右栏空着"或"拖窄后抽屉自己弹出来"
+    onWideLayoutChanged: {
+        if (mainPage.wideLayout) {
+            // 窄 → 宽：收起抽屉（否则同屏出现两份群信息），改由常驻右栏承接。
+            // 判据用 position > 0 而非 opened——opened 要等打开动画收尾才置位，
+            // 用户刚点开就拖宽窗口时它会仍是 false，于是抽屉留在屏上
+            if (groupInfoDrawer.position > 0) groupInfoDrawer.close()
+            if (mainPage.groupInfoOpen && mainPage.lastGroupInfo)
+                dockedGroupInfoPanel.showInfo(mainPage.lastGroupInfo)
+        } else if (mainPage.groupInfoOpen && mainPage.lastGroupInfo) {
+            // 宽 → 窄：状态不变，交给抽屉呈现
+            groupInfoDrawer.showInfo(mainPage.lastGroupInfo)
+            groupInfoDrawer.open()
+        }
     }
 
     function resetUi() {
@@ -1278,7 +1382,10 @@ Rectangle {
         pendingTrackKey = ""
         pendingTrackConversationId = 0
         searchMode = "chat"
-        groupInfoDrawer.close()
+        // M11C C3: 群信息面板状态不跨账号残留（含成员名单缓存）
+        mainPage.closeGroupInfoPanel()
+        mainPage.groupInfoConvId = 0
+        mainPage.lastGroupInfo = null
         showEmptyState()
         convList.reset()
     }

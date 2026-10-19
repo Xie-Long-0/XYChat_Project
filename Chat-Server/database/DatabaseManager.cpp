@@ -23,6 +23,16 @@ QString databasePath()
     return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
         + "/XYChat-Server/data/db";
 }
+
+// C2: "在线"判定的活跃下限——最后活跃时间晚于此阈值即视为在线。取 120s 的依据：
+// 客户端心跳（30s）无需认证、不刷新 last_active_at，故该判定只反映"最近有真实请求"，
+// 空闲但已连接的客户端会显示为离线（已登记 ROADMAP §3）
+constexpr int kOnlineThresholdSeconds = 120;
+
+QString recentActivityFloor()
+{
+    return QString("datetime('now', '-%1 seconds')").arg(kOnlineThresholdSeconds);
+}
 } // namespace
 
 DatabaseManager::DatabaseManager(const QString &connectionName)
@@ -1368,9 +1378,16 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
     // 填充 peer / 群组信息
     for (auto &ci : result) {
         if (ci.type == "private") {
+            // C2: 一并回填对方的最后活跃时间与在线判定。在线与否交给 SQLite 判定
+            // （last_active_at 由 datetime('now') 写入，与 C++ 侧 ISODate 不同格式，
+            // 在 SQL 里比对可避免两侧格式漂移）
             QSqlQuery peerQ(db);
             peerQ.prepare(
-                "SELECT cm2.user_id, u.username FROM conversation_members cm2 "
+                "SELECT cm2.user_id, u.username, "
+                "  (SELECT MAX(last_active_at) FROM sessions s WHERE s.user_id = cm2.user_id), "
+                "  EXISTS(SELECT 1 FROM sessions s2 WHERE s2.user_id = cm2.user_id "
+                "         AND s2.last_active_at >= " + recentActivityFloor() + ") "
+                "FROM conversation_members cm2 "
                 "JOIN users u ON cm2.user_id = u.id "
                 "WHERE cm2.conversation_id = ? AND cm2.user_id != ?");
             peerQ.addBindValue(ci.id);
@@ -1378,6 +1395,8 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
             if (peerQ.exec() && peerQ.next()) {
                 ci.peerUserId = peerQ.value(0).toLongLong();
                 ci.peerUsername = peerQ.value(1).toString();
+                ci.peerLastActiveAt = peerQ.value(2).toString();
+                ci.peerOnline = peerQ.value(3).toInt() != 0;
             }
         } else if (ci.type == "group") {
             // M7a: 群会话回填成员数

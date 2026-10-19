@@ -112,6 +112,9 @@ private slots:
     void replyToMessageRoundTrips();
     void replyTargetMustBeInSameConversation();
 
+    // M11C C2: 会话列表回填对方最后活跃时间与在线状态
+    void conversationsBackfillPeerLastActiveAndOnline();
+
 private:
     DatabaseManager *m_db = nullptr;
     QString m_connectionName;
@@ -2226,6 +2229,71 @@ void TestDatabaseManager::sendMessageGuardsFileReadyStateAtomically()
 
     // 收尾：本用例留下的 uploading 行转终态，不影响其他用例的配额计数
     QVERIFY(m_db->markFileCancelled(pendingId));
+}
+
+// M11C C2: 私聊会话回填对方最后活跃时间与在线状态。在线为启发式（活跃时间
+// 是否落在阈值内），故用例同时锁定"陈旧活跃时间仍保留 lastActiveAt"这一半，
+// 避免把"离线"实现成"清空最后在线"而丢失展示信息
+void TestDatabaseManager::conversationsBackfillPeerLastActiveAndOnline()
+{
+    auto me = m_db->getUserByUsername("testuser");
+    auto peer = m_db->getUserByUsername("outsider");
+    QVERIFY(me.has_value());
+    QVERIFY(peer.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(me->id, peer->id);
+    QVERIFY(convId > 0);
+
+    auto findConv = [this](qint64 userId, qint64 targetConvId) {
+        const auto convs = m_db->getConversationsForUser(userId);
+        for (const auto &ci : convs) {
+            if (ci.id == targetConvId) {
+                return ci;
+            }
+        }
+        return ConversationInfo{};
+    };
+
+    // 对方尚无任何 session：无最后活跃时间，也不在线
+    const ConversationInfo none = findConv(me->id, convId);
+    QCOMPARE(none.type, QString("private"));
+    QVERIFY(none.peerLastActiveAt.isEmpty());
+    QVERIFY(!none.peerOnline);
+
+    // 对方登录（新建 session）→ 立刻活跃，视为在线
+    const qint64 peerSession = m_db->createSession(peer->id, "dev-c2", "hash-c2", "127.0.0.1");
+    QVERIFY(peerSession > 0);
+    const ConversationInfo online = findConv(me->id, convId);
+    QVERIFY(!online.peerLastActiveAt.isEmpty());
+    QVERIFY(online.peerOnline);
+
+    // 活跃时间陈旧（超出阈值）→ 不再在线，但最后活跃时间必须保留
+    QSqlQuery ageQ(QSqlDatabase::database(m_connectionName));
+    ageQ.prepare("UPDATE sessions SET last_active_at = datetime('now', '-10 minutes') "
+                 "WHERE id = ?");
+    ageQ.addBindValue(peerSession);
+    QVERIFY(ageQ.exec());
+    const ConversationInfo stale = findConv(me->id, convId);
+    QVERIFY(!stale.peerLastActiveAt.isEmpty());
+    QVERIFY(!stale.peerOnline);
+
+    // 阈值之内（100s 前，阈值 120s）→ 仍在线（阈值不该被实现成"仅当秒级同时"）
+    ageQ.prepare("UPDATE sessions SET last_active_at = datetime('now', '-100 seconds') "
+                 "WHERE id = ?");
+    ageQ.addBindValue(peerSession);
+    QVERIFY(ageQ.exec());
+    QVERIFY(findConv(me->id, convId).peerOnline);
+
+    // 群会话不适用 peer 概念，不得回填这两个字段
+    const qint64 groupId = m_db->createGroup(me->id, "C2 群", {peer->id});
+    QVERIFY(groupId > 0);
+    const ConversationInfo group = findConv(me->id, groupId);
+    QCOMPARE(group.type, QString("group"));
+    QVERIFY(group.peerLastActiveAt.isEmpty());
+    QVERIFY(!group.peerOnline);
+
+    // 收尾：删除本用例创建的 session，避免影响共享内存库上的其他用例
+    QVERIFY(m_db->deleteSession(peerSession));
 }
 
 QTEST_MAIN(TestDatabaseManager)

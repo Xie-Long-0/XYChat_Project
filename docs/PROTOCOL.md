@@ -391,8 +391,10 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 // 请求
 { "type": "get_conversations" }
 // 响应 data
-{ "conversations": [{ "conversationId": 1, "type": "private", "peerUserId": 2, "peerUsername": "bob", "lastMessage": "...", "unreadCount": 0 }] }
+{ "conversations": [{ "conversationId": 1, "type": "private", "peerUserId": 2, "peerUsername": "bob", "lastMessage": "...", "unreadCount": 0, "lastActiveAt": "2026-10-15 08:12:33", "online": true }] }
 ```
+
+**M11C C2 新增（private 会话）**：`lastActiveAt` 为对方最近一次活跃时间，`online` 为是否在线。二者取自既有 `sessions.last_active_at`（无迁移、无新表），**不随缓存持久化**（客户端拿到后只作瞬时展示）。`online` 是**启发式**：`last_active_at` 落在服务端阈值（120 秒）内即视为在线；由于心跳（ping）按设计无需认证、不刷新活跃时间，**空闲但已连接的客户端会显示为离线**。群会话不携带这两个字段（无 peer 概念）。
 
 #### 发送消息
 

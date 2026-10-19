@@ -2661,6 +2661,31 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
         if (merged.isEmpty() && !conversations.isEmpty()) {
             merged = conversations;
         }
+        // M11C C2: 最后活跃/在线是瞬时状态，刻意不进本地缓存——缓存里的"在线"
+        // 在下次启动时会变成上一次会话的陈旧值。此处按 conversationId 把服务端
+        // 的这两个字段盖到合并后的列表上，使缓存优先的展示路径也能拿到它
+        QHash<qint64, QJsonObject> presenceByConv;
+        for (const QJsonValue &value : std::as_const(conversations)) {
+            const QJsonObject conv = value.toObject();
+            if (conv.value("type").toString() != "private") {
+                continue;
+            }
+            presenceByConv.insert(conv.value("conversationId").toVariant().toLongLong(), conv);
+        }
+        if (!presenceByConv.isEmpty()) {
+            for (QJsonValueRef value : merged) {
+                const QJsonObject cached = value.toObject();
+                const auto it = presenceByConv.constFind(
+                    cached.value("conversationId").toVariant().toLongLong());
+                if (it == presenceByConv.constEnd()) {
+                    continue;
+                }
+                QJsonObject withPresence = cached;
+                withPresence["online"] = it->value("online");
+                withPresence["lastActiveAt"] = it->value("lastActiveAt");
+                value = withPresence;
+            }
+        }
         emit conversationsResult(merged);
     }
 }

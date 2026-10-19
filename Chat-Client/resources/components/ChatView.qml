@@ -20,6 +20,45 @@ Rectangle {
     // M13: 已退出/被移出群聊但本机保留历史——输入区替换为只读提示条，
     // 群信息入口与消息级操作（回复/编辑/删除/多选）一并收起
     property bool readOnly: false
+    // M11C C2: 私聊对方的在线状态与最后活跃时间。是否"在线"由服务端按活跃阈值
+    // 判定后随 get_conversations 下发；群聊无此概念（恒 false/空）
+    property bool peerOnline: false
+    property string peerLastActiveAt: ""
+
+    // M11C C2: 私聊头部第二行文案。刻意只用绝对时间（不给"X 分钟前"）：本值
+    // 只在会话列表刷新时更新，没有走时定时器，相对措辞会定住不动反而失真
+    readonly property string presenceText: {
+        if (isGroup || !hasConversation) return ""
+        if (peerOnline) return "在线"
+        var ts = parseServerUtc(peerLastActiveAt)
+        if (!ts) return ""
+        var now = new Date()
+        var hm = pad2(ts.getHours()) + ":" + pad2(ts.getMinutes())
+        if (sameLocalDay(ts, now)) return "最后在线 " + hm
+        if (sameLocalDay(ts, new Date(now.getTime() - 86400000)))
+            return "最后在线 昨天 " + hm
+        var md = pad2(ts.getMonth() + 1) + "-" + pad2(ts.getDate())
+        if (ts.getFullYear() === now.getFullYear()) return "最后在线 " + md + " " + hm
+        return "最后在线 " + ts.getFullYear() + "-" + md + " " + hm
+    }
+
+    // M11C C2: 服务端 last_active_at 取自 SQLite datetime('now')——UTC 且用空格
+    // 分隔（"YYYY-MM-DD HH:MM:SS"）。JS 的日期解析对空格形式按本地时区处理，
+    // 必须显式补 T/Z 才能当 UTC 解析，否则时差会直接体现成错误的"最后在线"
+    function parseServerUtc(raw) {
+        if (!raw || raw.length < 19) return null
+        var d = new Date(raw.substring(0, 10) + "T" + raw.substring(11, 19) + "Z")
+        return isNaN(d.getTime()) ? null : d
+    }
+
+    function sameLocalDay(a, b) {
+        return a.getFullYear() === b.getFullYear()
+            && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+    }
+
+    function pad2(n) {
+        return n < 10 ? "0" + n : "" + n
+    }
 
     // P2.3: 当前会话未读数（MainPage 打开会话时注入，用于放置未读分隔线）
     property int unreadCount: 0
@@ -197,6 +236,16 @@ Rectangle {
                     text: groupMemberCount + " 位成员"
                     font.pixelSize: Theme.fontSizeSmall - 1
                     color: Theme.textTertiary
+                }
+
+                // M11C C2: 私聊副标题——在线 / 最后在线 …。有人输入时让位给"正在输入"
+                Label {
+                    visible: !isGroup && chatView.typingText.length === 0
+                             && chatView.presenceText.length > 0
+                    text: chatView.presenceText
+                    font.pixelSize: Theme.fontSizeSmall - 1
+                    color: chatView.peerOnline ? Theme.primaryColor : Theme.textTertiary
+                    elide: Text.ElideRight
                 }
 
                 // P3.2: “正在输入…”副标题（私聊/群聊通用，主色区分）

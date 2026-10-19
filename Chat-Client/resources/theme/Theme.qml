@@ -135,6 +135,12 @@ QtObject {
     readonly property int conversationItemHeight: 72
     readonly property int messageMaxWidth: 480
     readonly property int inputHeight: 44
+    // M11C C3: 宽屏三栏
+    // 群信息面板宽（与 GroupInfoPanel.implicitWidth 同口径，常驻右栏与抽屉共用）
+    readonly property int rightPanelWidth: 340
+    // 三栏断点：左栏 + 群信息面板 + 至少 420px 聊天区（否则气泡被挤成竖条）。
+    // 低于该宽度时群信息改走右缘抽屉（覆盖式），不占布局
+    readonly property int wideLayoutBreakpoint: 1080
 
     // 动画时长
     readonly property int animationFast: 120
